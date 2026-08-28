@@ -33,6 +33,7 @@ use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::wacore_binary::JidExt;
 
 const CHAT_LIST_LIMIT: u32 = 500;
+const AVATAR_SYNC_LIMIT: u32 = 1_000;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Low-footprint WhatsApp companion daemon for Omarchy")]
@@ -60,6 +61,7 @@ struct Shared {
     avatar_revision: AtomicU64,
     app_state_failed: AtomicBool,
     logout_requested: AtomicBool,
+    avatar_sync: Mutex<()>,
     group_name_sync: Mutex<()>,
     media_recovery_requested: RwLock<HashSet<String>>,
     media_downloads: Mutex<HashSet<String>>,
@@ -1201,9 +1203,13 @@ async fn refresh_avatar(shared: Arc<Shared>, client: Arc<Client>, jid: Jid, forc
 }
 
 async fn sync_avatars(shared: Arc<Shared>, client: Arc<Client>) {
+    // Connected can precede the initial history import on a fresh link. Keep
+    // sync passes serialized so a pass queued by each history chunk observes
+    // the chats imported by the preceding pass without fetching duplicates.
+    let _sync_guard = shared.avatar_sync.lock().await;
     let jids = shared
         .database
-        .avatar_jids(500)
+        .avatar_jids(AVATAR_SYNC_LIMIT)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|raw| raw.parse::<Jid>().ok())
@@ -1970,6 +1976,7 @@ async fn main() -> Result<()> {
         avatar_revision: AtomicU64::new(0),
         app_state_failed: AtomicBool::new(false),
         logout_requested: AtomicBool::new(false),
+        avatar_sync: Mutex::new(()),
         group_name_sync: Mutex::new(()),
         media_recovery_requested: RwLock::new(HashSet::new()),
         media_downloads: Mutex::new(HashSet::new()),
@@ -2115,6 +2122,10 @@ async fn main() -> Result<()> {
                             let _ = shared
                                 .events
                                 .send(ServerFrame::event(ServerEvent::Unread { total }));
+                            tokio::spawn(sync_avatars(
+                                Arc::clone(&shared),
+                                Arc::clone(&client),
+                            ));
                             let names_shared = Arc::clone(&shared);
                             let names_client = Arc::clone(&client);
                             tokio::spawn(async move {
@@ -2844,6 +2855,7 @@ mod tests {
             avatar_revision: AtomicU64::new(0),
             app_state_failed: AtomicBool::new(false),
             logout_requested: AtomicBool::new(false),
+            avatar_sync: Mutex::new(()),
             group_name_sync: Mutex::new(()),
             media_recovery_requested: RwLock::new(HashSet::new()),
             media_downloads: Mutex::new(HashSet::new()),

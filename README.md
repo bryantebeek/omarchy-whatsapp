@@ -71,6 +71,8 @@ omarchy shell io.github.bryantebeek.whatsapp open
 At first launch, open WhatsApp on your phone, then **Linked devices → Link a
 device**, and scan the QR code shown in the app. Closing the app panel unloads
 that view; the Rust daemon stays connected so native notifications continue.
+Once linked history arrives, the daemon downloads missing profile photos for
+the synchronized conversation list; opening each conversation is not required.
 
 If another WhatsApp widget is already installed, disable it yourself after
 confirming this client works. The installer does not remove third-party plugins.

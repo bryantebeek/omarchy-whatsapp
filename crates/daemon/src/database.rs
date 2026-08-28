@@ -1535,16 +1535,18 @@ impl Database {
             .lock()
             .expect("history database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT jid FROM (
-                 SELECT jid, last_timestamp AS rank FROM chats
+            "WITH candidates AS (
+                 SELECT jid, last_timestamp AS rank, 0 AS priority FROM chats
                  WHERE jid != '0@s.whatsapp.net'
-                 UNION
-                 SELECT sender_jid AS jid, MAX(timestamp) AS rank FROM messages
+                 UNION ALL
+                 SELECT sender_jid AS jid, MAX(timestamp) AS rank, 1 AS priority FROM messages
                  WHERE from_me = 0 AND sender_jid != ''
                  GROUP BY sender_jid
              )
+             SELECT jid FROM candidates
              WHERE jid NOT LIKE '%@broadcast' AND jid NOT LIKE '%@newsletter'
-             ORDER BY rank DESC LIMIT ?1",
+             GROUP BY jid
+             ORDER BY MIN(priority), MAX(rank) DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([i64::from(limit.clamp(1, 1000))], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1619,6 +1621,35 @@ mod tests {
                 .unread_receipts("1@s.whatsapp.net")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn avatar_sync_prioritizes_conversations_before_group_senders() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        database
+            .insert_history_chat(&Chat {
+                jid: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                phone_number: None,
+                last_message: "Old chat".into(),
+                last_sender_name: "Ada".into(),
+                last_timestamp: 1,
+                unread: 0,
+                is_group: false,
+            })
+            .unwrap();
+        let mut group_message = message("recent", 10);
+        group_message.chat_jid = "2@g.us".into();
+        group_message.sender_jid = "3@s.whatsapp.net".into();
+        database
+            .insert_message(&group_message, "Garden Club", true, false)
+            .unwrap();
+
+        assert_eq!(
+            database.avatar_jids(2).unwrap(),
+            vec!["2@g.us".to_owned(), "1@s.whatsapp.net".to_owned()]
         );
     }
 
