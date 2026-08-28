@@ -2534,7 +2534,7 @@ Item {
                   ? "On your phone, open WhatsApp → Linked devices → Link a device"
                   : (root.service && root.service.connectionDetail
                     ? root.service.connectionDetail : "The background service is starting…")
-                color: root.muted
+                color: root.sidebarSecondary
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 wrapMode: Text.Wrap
@@ -2563,7 +2563,7 @@ Item {
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
                 text: "Your linked-device keys and recent text history stay on this computer."
-                color: root.muted
+                color: root.sidebarSecondary
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.Wrap
