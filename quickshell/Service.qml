@@ -53,7 +53,7 @@ Item {
   property var messagesRequestIds: ({})
   property var messagesRequestJids: ({})
   property var messagesQueuedRequests: ({})
-  property int messageSentSerial: 0
+  property int messageEventSerial: 0
   property string selectedChatJid: ""
   property bool panelVisible: false
   property bool panelFocused: false
@@ -489,7 +489,7 @@ Item {
       var message = frame.message || {}
       send("list_chats", { limit: 500 })
       if (String(message.chat_jid || "") === selectedChatJid) {
-        if (frame.event === "sent") messageSentSerial++
+        messageEventSerial++
         requestMessages(selectedChatJid, true)
       }
     } else if (frame.event === "unread") {

@@ -554,7 +554,7 @@ Item {
       root.preservedConversationContentY = messageList.contentY
       root.restoreConversationAfterMessages = true
     }
-    function onMessageSentSerialChanged() {
+    function onMessageEventSerialChanged() {
       root.scrollToBottomAfterMessages = true
     }
     function onMessagesResponseSerialChanged() {
