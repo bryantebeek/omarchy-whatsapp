@@ -1156,7 +1156,7 @@ Item {
                           anchors.verticalCenter: parent.verticalCenter
                           Text {
                             anchors.centerIn: parent
-                            visible: chatAvatar.status !== Image.Ready
+                            visible: !chatAvatar.hasRenderedAvatar
                             text: Model.initials(modelData.name, modelData.jid)
                             color: root.foreground
                             font.family: root.fontFamily
@@ -1172,11 +1172,18 @@ Item {
                           }
                           Image {
                             id: chatAvatar
+                            property bool hasRenderedAvatar: false
                             anchors.fill: parent
                             source: root.service ? root.service.avatarUrl(modelData.jid) : ""
                             asynchronous: true
                             cache: false
+                            retainWhileLoading: true
                             fillMode: Image.PreserveAspectCrop
+                            onSourceChanged: if (String(source) === "") hasRenderedAvatar = false
+                            onStatusChanged: {
+                              if (status === Image.Ready) hasRenderedAvatar = true
+                              else if (status === Image.Error) hasRenderedAvatar = false
+                            }
                             layer.enabled: true
                             layer.smooth: true
                             layer.effect: MultiEffect {
@@ -1358,8 +1365,7 @@ Item {
                           Math.max(1, Style.normalBorderWidth))
                         Text {
                           anchors.centerIn: parent
-                          visible: String(selectedAvatar.source) === ""
-                            || selectedAvatar.status === Image.Error
+                          visible: !selectedAvatar.hasRenderedAvatar
                           text: root.service && root.service.selectedChat
                             ? Model.initials(root.service.selectedChat.name,
                               root.service.selectedChat.jid) : "?"
@@ -1377,12 +1383,19 @@ Item {
                         }
                         Image {
                           id: selectedAvatar
+                          property bool hasRenderedAvatar: false
                           anchors.fill: parent
                           source: root.service && root.service.selectedChat
                             ? root.service.avatarUrl(root.service.selectedChat.jid) : ""
                           asynchronous: true
                           cache: false
+                          retainWhileLoading: true
                           fillMode: Image.PreserveAspectCrop
+                          onSourceChanged: if (String(source) === "") hasRenderedAvatar = false
+                          onStatusChanged: {
+                            if (status === Image.Ready) hasRenderedAvatar = true
+                            else if (status === Image.Error) hasRenderedAvatar = false
+                          }
                           layer.enabled: true
                           layer.smooth: true
                           layer.effect: MultiEffect {
@@ -1571,7 +1584,7 @@ Item {
                           Math.max(1, Style.normalBorderWidth))
                         Text {
                           anchors.centerIn: parent
-                          visible: senderAvatarImage.status !== Image.Ready
+                          visible: !senderAvatarImage.hasRenderedAvatar
                           text: Model.initials(modelData.sender_name, modelData.sender_jid)
                           color: root.foreground
                           font.family: root.fontFamily
@@ -1587,12 +1600,19 @@ Item {
                         }
                         Image {
                           id: senderAvatarImage
+                          property bool hasRenderedAvatar: false
                           anchors.fill: parent
                           source: root.service
                             ? root.service.avatarUrl(modelData.sender_jid) : ""
                           asynchronous: true
                           cache: false
+                          retainWhileLoading: true
                           fillMode: Image.PreserveAspectCrop
+                          onSourceChanged: if (String(source) === "") hasRenderedAvatar = false
+                          onStatusChanged: {
+                            if (status === Image.Ready) hasRenderedAvatar = true
+                            else if (status === Image.Error) hasRenderedAvatar = false
+                          }
                           layer.enabled: true
                           layer.smooth: true
                           layer.effect: MultiEffect {

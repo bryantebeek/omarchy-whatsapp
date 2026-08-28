@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, LazyLock, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::io::AsyncWriteExt;
@@ -34,6 +34,9 @@ use whatsapp_rust::wacore_binary::JidExt;
 
 const CHAT_LIST_LIMIT: u32 = 500;
 const AVATAR_SYNC_LIMIT: u32 = 1_000;
+static AVATAR_FINGERPRINTS: LazyLock<
+    StdMutex<HashMap<PathBuf, std::collections::BTreeMap<String, assets::AvatarFingerprint>>>,
+> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Low-footprint WhatsApp companion daemon for Omarchy")]
@@ -115,15 +118,11 @@ async fn clear_local_account_data(paths: &AppPaths, shared: &Shared) -> Result<(
     *shared.active_chat.write().await = None;
     shared.media_recovery_requested.write().await.clear();
     shared.media_downloads.lock().await.clear();
-    shared.avatar_revision.fetch_add(1, Ordering::Relaxed);
     broadcast_chats(shared);
     let _ = shared
         .events
         .send(ServerFrame::event(ServerEvent::Unread { total: 0 }));
-    let _ = shared.events.send(ServerFrame::event(ServerEvent::Avatars {
-        revision: shared.avatar_revision.load(Ordering::Relaxed),
-        jids: Vec::new(),
-    }));
+    shared.avatars_changed();
     Ok(())
 }
 
@@ -203,11 +202,42 @@ impl Shared {
     }
 
     fn avatars_changed(&self) {
+        let current = assets::avatar_fingerprints(&self.avatar_dir);
+        let mut snapshots = AVATAR_FINGERPRINTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = snapshots.entry(self.avatar_dir.clone()).or_default();
+        let mut changed_jids = current
+            .keys()
+            .chain(previous.keys())
+            .filter(|jid| current.get(*jid) != previous.get(*jid))
+            .cloned()
+            .collect::<Vec<_>>();
+        changed_jids.sort();
+        changed_jids.dedup();
+        *previous = current;
+        drop(snapshots);
+        if changed_jids.is_empty() {
+            return;
+        }
         let revision = self.avatar_revision.fetch_add(1, Ordering::Relaxed) + 1;
         let jids = assets::available_avatar_jids(&self.avatar_dir);
-        let _ = self
-            .events
-            .send(ServerFrame::event(ServerEvent::Avatars { revision, jids }));
+        let _ = self.events.send(ServerFrame::event(ServerEvent::Avatars {
+            revision,
+            jids,
+            changed_jids,
+        }));
+    }
+
+    fn avatar_snapshot(&self) -> Vec<String> {
+        let current = assets::avatar_fingerprints(&self.avatar_dir);
+        let jids = current.keys().cloned().collect();
+        AVATAR_FINGERPRINTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(self.avatar_dir.clone())
+            .or_insert(current);
+        jids
     }
 
     async fn state_event(&self) -> ServerEvent {
@@ -2807,7 +2837,8 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
         }
         Command::ListAvatars => Ok(ServerEvent::Avatars {
             revision: shared.avatar_revision.load(Ordering::Relaxed),
-            jids: assets::available_avatar_jids(&shared.avatar_dir),
+            jids: shared.avatar_snapshot(),
+            changed_jids: Vec::new(),
         }),
         Command::SetActiveChat { chat_jid } => {
             *shared.active_chat.write().await = match chat_jid {
@@ -2885,6 +2916,121 @@ mod tests {
 
         shared.write_pairing_qr(&ConnectionStatus::Connected);
         assert!(!shared.pairing_qr.exists());
+    }
+
+    #[tokio::test]
+    async fn clearing_account_data_publishes_the_removed_avatar_jids() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        assets::private_dir(&shared.media_dir).unwrap();
+        let jid = "1@s.whatsapp.net";
+        assets::write_private_bytes(&assets::avatar_path(&shared.avatar_dir, jid), b"avatar")
+            .unwrap();
+        let mut events = shared.events.subscribe();
+        shared.avatars_changed();
+        let _ = events.try_recv().unwrap();
+        let paths = AppPaths {
+            runtime_dir: directory.path().join("runtime"),
+            state_dir: directory.path().to_path_buf(),
+            socket: directory.path().join("runtime/daemon.sock"),
+            protocol_db: directory.path().join("session.db"),
+            history_db: directory.path().join("history.db"),
+        };
+
+        clear_local_account_data(&paths, &shared).await.unwrap();
+
+        let avatar_event = std::iter::from_fn(|| events.try_recv().ok())
+            .find(|frame| matches!(frame.event, ServerEvent::Avatars { .. }))
+            .unwrap();
+        assert_eq!(
+            avatar_event.event,
+            ServerEvent::Avatars {
+                revision: 2,
+                jids: Vec::new(),
+                changed_jids: vec![jid.into()],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_avatars_is_a_snapshot_without_changed_jids() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        let jid = "1@s.whatsapp.net";
+        assets::write_private_bytes(&assets::avatar_path(&shared.avatar_dir, jid), b"avatar")
+            .unwrap();
+
+        let event = handle_command(Command::ListAvatars, &shared).await.unwrap();
+
+        assert_eq!(
+            event,
+            ServerEvent::Avatars {
+                revision: 0,
+                jids: vec![jid.into()],
+                changed_jids: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn avatar_events_only_revise_the_files_that_changed() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        let mut events = shared.events.subscribe();
+        let first_jid = "1@s.whatsapp.net";
+        let second_jid = "2@s.whatsapp.net";
+
+        assets::write_private_bytes(
+            &assets::avatar_path(&shared.avatar_dir, first_jid),
+            b"first avatar",
+        )
+        .unwrap();
+        shared.avatars_changed();
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::Avatars {
+                revision: 1,
+                jids: vec![first_jid.into()],
+                changed_jids: vec![first_jid.into()],
+            }
+        );
+
+        assets::write_private_bytes(
+            &assets::avatar_path(&shared.avatar_dir, second_jid),
+            b"second avatar",
+        )
+        .unwrap();
+        shared.avatars_changed();
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::Avatars {
+                revision: 2,
+                jids: vec![first_jid.into(), second_jid.into()],
+                changed_jids: vec![second_jid.into()],
+            }
+        );
+
+        assets::write_private_bytes(
+            &assets::avatar_path(&shared.avatar_dir, first_jid),
+            b"replacement avatar",
+        )
+        .unwrap();
+        assert_eq!(shared.avatar_snapshot(), vec![first_jid, second_jid]);
+        shared.avatars_changed();
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::Avatars {
+                revision: 3,
+                jids: vec![first_jid.into(), second_jid.into()],
+                changed_jids: vec![first_jid.into()],
+            }
+        );
+
+        shared.avatars_changed();
+        assert!(events.try_recv().is_err());
     }
 
     #[test]

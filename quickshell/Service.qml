@@ -34,8 +34,8 @@ Item {
   property string connectionDetail: ""
   property double pairingExpiresAt: 0
   property int unreadTotal: 0
-  property int avatarRevision: 0
   property var avatarAvailable: ({})
+  property var avatarRevisions: ({})
   property int mediaRevision: 0
   property var mediaDownloadRequests: ({})
   property var mediaDownloadRequestIds: ({})
@@ -183,9 +183,10 @@ Item {
 
   function avatarUrl(jid) {
     if (!jid || String(jid) === "me") return ""
-    if (avatarAvailable[String(jid)] !== true) return ""
-    return "file://" + statePath + "/avatars/" + hexKey(jid)
-      + ".img?v=" + avatarRevision
+    var key = String(jid)
+    if (avatarAvailable[key] !== true) return ""
+    return "file://" + statePath + "/avatars/" + hexKey(key)
+      + ".img?v=" + Number(avatarRevisions[key] || 0)
   }
 
   function fileUrl(path) {
@@ -498,8 +499,14 @@ Item {
       var avatarJids = copyArray(frame.jids)
       for (var avatarIndex = 0; avatarIndex < avatarJids.length; avatarIndex++)
         available[String(avatarJids[avatarIndex])] = true
+      var revisions = Object.assign({}, avatarRevisions)
+      var changedAvatarJids = Array.isArray(frame.changed_jids)
+        ? copyArray(frame.changed_jids) : avatarJids
+      var revision = Number(frame.revision || 0)
+      for (var changedIndex = 0; changedIndex < changedAvatarJids.length; changedIndex++)
+        revisions[String(changedAvatarJids[changedIndex])] = revision
       avatarAvailable = available
-      avatarRevision = Number(frame.revision || avatarRevision + 1)
+      avatarRevisions = revisions
     } else if (frame.event === "error") {
       lastError = String(frame.message || "WhatsApp command failed")
       if (requestedGroupParticipantsJid === selectedChatJid) {

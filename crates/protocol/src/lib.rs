@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -208,6 +208,8 @@ pub enum ServerEvent {
     Avatars {
         revision: u64,
         jids: Vec<String>,
+        #[serde(default)]
+        changed_jids: Vec<String>,
     },
     Ack,
     Pong,
@@ -355,6 +357,22 @@ mod tests {
         let frame = ServerFrame::event(ServerEvent::Unread { total: 3 });
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn legacy_avatar_event_defaults_to_no_changed_jids() {
+        let frame = serde_json::from_str::<ServerFrame>(
+            r#"{"event":"avatars","revision":7,"jids":["1@s.whatsapp.net"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            frame.event,
+            ServerEvent::Avatars {
+                revision: 7,
+                jids: vec!["1@s.whatsapp.net".into()],
+                changed_jids: Vec::new(),
+            }
+        );
     }
 
     #[test]

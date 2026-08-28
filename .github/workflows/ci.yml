@@ -96,6 +96,8 @@ jobs:
           bash -n packaging/arch/PKGBUILD
       - name: Exercise daemon and IPC
         run: ./tests/smoke.sh
+      - name: Exercise install, update, and uninstall lifecycle
+        run: ./tests/deployment-lifecycle.sh
 
   supply-chain:
     name: Supply chain
