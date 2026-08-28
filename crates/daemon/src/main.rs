@@ -3,6 +3,7 @@
 mod assets;
 mod database;
 mod event_coverage;
+mod live_location;
 mod notification;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -29,8 +30,10 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{error, info, warn};
 use whatsapp_rust::prelude::*;
+use whatsapp_rust::types::jid::JidExt as SignalJidExt;
+use whatsapp_rust::wacore::request::InfoQuery;
 use whatsapp_rust::wacore::store::DevicePropsOverride;
-use whatsapp_rust::wacore_binary::JidExt;
+use whatsapp_rust::wacore_binary::{JidExt, NodeContent, SERVER_JID, builder::NodeBuilder};
 
 const CHAT_LIST_LIMIT: u32 = 500;
 const AVATAR_SYNC_LIMIT: u32 = 1_000;
@@ -324,6 +327,26 @@ impl Shared {
             return;
         }
         let base = context.message.get_base_message();
+        if let Some(distribution) = base
+            .fast_ratchet_key_sender_key_distribution_message
+            .as_option()
+            && let Some(payload) = distribution
+                .axolotl_sender_key_distribution_message
+                .as_deref()
+        {
+            match live_location::FastRatchetState::from_distribution(payload) {
+                Ok(state) => {
+                    let signal_address = info.source.sender.to_signal_address_string();
+                    if let Err(error) = self
+                        .database
+                        .store_fast_ratchet_state(&signal_address, &state)
+                    {
+                        warn!(%error, "could not persist live-location sender key");
+                    }
+                }
+                Err(error) => warn!(%error, "could not read live-location sender key"),
+            }
+        }
         let media = message_media(
             base,
             &self.media_dir,
@@ -427,6 +450,20 @@ impl Shared {
                         }
                     });
                 }
+                if matches!(
+                    message.media,
+                    Some(MessageMedia::Location { live: true, .. })
+                ) {
+                    let client = Arc::clone(&context.client);
+                    let target = info.source.chat.clone();
+                    let is_group = info.source.is_group;
+                    tokio::spawn(async move {
+                        if let Err(error) = subscribe_live_location(&client, target, is_group).await
+                        {
+                            warn!(%error, "could not subscribe to incoming live location");
+                        }
+                    });
+                }
             }
             Ok(false) => {
                 if let Some(media) = &message.media
@@ -440,6 +477,43 @@ impl Shared {
             }
             Err(error) => error!(%error, "could not persist incoming message"),
         }
+    }
+
+    async fn receive_live_location_update(self: &Arc<Self>, context: MessageContext) -> Result<()> {
+        let base = context.message.get_base_message();
+        if base.live_location_message.is_unset()
+            && !base
+                .location_message
+                .as_option()
+                .is_some_and(|location| location.is_live.unwrap_or(false))
+        {
+            bail!("fast-ratchet payload does not contain a live location");
+        }
+
+        let sender_jid =
+            canonical_contact_jid(self, &context.client, &context.info.source.sender).await;
+        let targets = self
+            .database
+            .active_live_locations_for_sender(&sender_jid, Utc::now().timestamp())?;
+        for target in targets {
+            let Some(media) = message_media(
+                base,
+                &self.media_dir,
+                &target.chat_jid,
+                &target.message_id,
+                context.info.timestamp.timestamp(),
+                target.duration_seconds,
+            ) else {
+                continue;
+            };
+            if self
+                .database
+                .update_message_media(&target.chat_jid, &target.message_id, &media)?
+            {
+                broadcast_messages(self, &target.chat_jid);
+            }
+        }
+        Ok(())
     }
 
     fn ingest_history(
@@ -736,9 +810,8 @@ fn cache_location_thumbnail(
 ) -> Option<String> {
     let bytes = bytes.filter(|bytes| bytes.starts_with(&[0xff, 0xd8, 0xff]))?;
     let path = assets::location_thumbnail_path(directory, chat_jid, message_id);
-    if !path.exists()
-        && let Err(error) = assets::write_private_bytes(&path, bytes)
-    {
+    let unchanged = std::fs::read(&path).is_ok_and(|existing| existing == **bytes);
+    if !unchanged && let Err(error) = assets::write_private_bytes(&path, bytes) {
         warn!(%error, "could not cache WhatsApp location thumbnail");
         return None;
     }
@@ -1579,14 +1652,32 @@ fn history_message(
         .or_else(|| base.get_caption())
         .map(str::to_owned)
         .or_else(|| media_text(base, ""))?;
-    let media = message_media(
-        base,
+    let final_location = wire.final_live_location.as_option();
+    let final_message = final_location.map(|location| wa::Message {
+        live_location_message: buffa::MessageField::some(location.clone()),
+        ..Default::default()
+    });
+    let media_source = final_message.as_ref().unwrap_or(base);
+    let mut media = message_media(
+        media_source,
         media_dir,
         chat_jid,
         &id,
         timestamp,
         wire.duration.unwrap_or(0),
     );
+    if final_location.is_some()
+        && let Some(MessageMedia::Location {
+            live, updated_at, ..
+        }) = &mut media
+    {
+        *live = false;
+        *updated_at = timestamp.saturating_add(i64::from(
+            final_location
+                .and_then(|location| location.time_offset)
+                .unwrap_or(0),
+        ));
+    }
     Some(Message {
         id,
         chat_jid: chat_jid.to_owned(),
@@ -1992,6 +2083,66 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
     }
 }
 
+async fn subscribe_live_location(client: &Client, target: Jid, is_group: bool) -> Result<()> {
+    let subscribe = if is_group {
+        NodeBuilder::new("subscribe")
+            .attr("participants", "true")
+            .build()
+    } else {
+        NodeBuilder::new("subscribe").build()
+    };
+    let server = SERVER_JID
+        .parse::<Jid>()
+        .context("parsing WhatsApp server JID")?;
+    client
+        .send_iq(
+            InfoQuery::get(
+                "location",
+                server,
+                Some(NodeContent::Nodes(vec![subscribe])),
+            )
+            .with_target(target)
+            .with_timeout(std::time::Duration::from_secs(20)),
+        )
+        .await
+        .context("subscribing to WhatsApp live location")?;
+    Ok(())
+}
+
+async fn restore_live_location_subscriptions(shared: Arc<Shared>, client: Arc<Client>) {
+    let targets = match shared
+        .database
+        .active_live_location_targets(Utc::now().timestamp())
+    {
+        Ok(targets) => targets,
+        Err(error) => {
+            warn!(%error, "could not list active live locations");
+            return;
+        }
+    };
+    for (target, is_group) in targets {
+        let Ok(target) = target.parse::<Jid>() else {
+            warn!("could not parse live-location subscription target");
+            continue;
+        };
+        if let Err(error) = subscribe_live_location(&client, target, is_group).await {
+            warn!(%error, "could not restore live-location subscription");
+        }
+    }
+}
+
+async fn maintain_live_location_subscriptions(shared: Arc<Shared>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(25));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let Some(client) = shared.client.read().await.clone() else {
+            continue;
+        };
+        restore_live_location_subscriptions(Arc::clone(&shared), client).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -2062,6 +2213,7 @@ async fn main() -> Result<()> {
     });
 
     tokio::spawn(backfill_video_previews(Arc::clone(&shared)));
+    tokio::spawn(maintain_live_location_subscriptions(Arc::clone(&shared)));
 
     let ipc_shared = Arc::clone(&shared);
     let mut ipc_task = tokio::spawn(async move { serve(listener, ipc_shared).await });
@@ -2093,6 +2245,7 @@ async fn main() -> Result<()> {
         let group_shared = Arc::clone(&shared);
         let app_event_shared = Arc::clone(&shared);
         let message_shared = Arc::clone(&shared);
+        let fast_ratchet_shared = Arc::clone(&shared);
 
         let bot = Bot::builder()
             .with_backend(store)
@@ -2100,6 +2253,10 @@ async fn main() -> Result<()> {
                 DevicePropsOverride::new()
                     .with_os("Linux")
                     .with_platform_type(wa::device_props::PlatformType::DESKTOP),
+            )
+            .with_enc_handler(
+                "frskmsg",
+                live_location::FastRatchetHandler::new(fast_ratchet_shared),
             )
             .on_qr_code(move |code, timeout| {
                 let shared = Arc::clone(&qr_shared);
@@ -2143,6 +2300,10 @@ async fn main() -> Result<()> {
                     }
                     tokio::spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
                     tokio::spawn(sync_avatars(Arc::clone(&shared), Arc::clone(&client)));
+                    tokio::spawn(restore_live_location_subscriptions(
+                        Arc::clone(&shared),
+                        Arc::clone(&client),
+                    ));
                     tokio::spawn(async move {
                         sync_missing_contact_names(Arc::clone(&shared), Arc::clone(&client)).await;
                         request_missing_contact_history(shared, client).await;
@@ -2202,6 +2363,10 @@ async fn main() -> Result<()> {
                                 .events
                                 .send(ServerFrame::event(ServerEvent::Unread { total }));
                             tokio::spawn(sync_avatars(
+                                Arc::clone(&shared),
+                                Arc::clone(&client),
+                            ));
+                            tokio::spawn(restore_live_location_subscriptions(
                                 Arc::clone(&shared),
                                 Arc::clone(&client),
                             ));
@@ -3597,6 +3762,52 @@ mod tests {
                 duration_seconds: 3_600,
             })
         );
+    }
+
+    #[test]
+    fn live_location_thumbnail_is_refreshed_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_dir = directory.path().join("media");
+        assets::private_dir(&media_dir).unwrap();
+        let live = |thumbnail: &[u8]| wa::Message {
+            live_location_message: MessageField::some(wa::message::LiveLocationMessage {
+                degrees_latitude: Some(52.37),
+                degrees_longitude: Some(4.89),
+                jpeg_thumbnail: Some(thumbnail.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let first = b"\xff\xd8\xfffirst";
+        let second = b"\xff\xd8\xffsecond";
+        let first_media = message_media(
+            &live(first),
+            &media_dir,
+            "1@s.whatsapp.net",
+            "live",
+            10,
+            3_600,
+        )
+        .unwrap();
+        let Some(path) = (match first_media {
+            MessageMedia::Location { thumbnail_path, .. } => thumbnail_path,
+            _ => None,
+        }) else {
+            panic!("expected live-location thumbnail")
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+
+        message_media(
+            &live(second),
+            &media_dir,
+            "1@s.whatsapp.net",
+            "live",
+            20,
+            3_600,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), second);
     }
 
     #[test]

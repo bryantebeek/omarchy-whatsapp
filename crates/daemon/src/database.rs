@@ -33,6 +33,13 @@ pub struct HistoryCursor {
     pub timestamp_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveLiveLocation {
+    pub chat_jid: String,
+    pub message_id: String,
+    pub duration_seconds: u32,
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)
@@ -117,6 +124,14 @@ impl Database {
                 chat_jid TEXT NOT NULL,
                 label_id TEXT NOT NULL,
                 PRIMARY KEY (chat_jid, label_id)
+            );
+            CREATE TABLE IF NOT EXISTS fast_ratchet_sender_keys (
+                sender_id   TEXT NOT NULL,
+                key_id      INTEGER NOT NULL,
+                iteration   INTEGER NOT NULL,
+                chain_keys  BLOB NOT NULL,
+                signing_key BLOB NOT NULL,
+                PRIMARY KEY (sender_id, key_id)
             );
             ",
         )?;
@@ -236,6 +251,7 @@ impl Database {
             DELETE FROM chats;
             DELETE FROM contacts;
             DELETE FROM labels;
+            DELETE FROM fast_ratchet_sender_keys;
             ",
         )?;
         transaction.commit()?;
@@ -1185,6 +1201,166 @@ impl Database {
         }
         transaction.commit()?;
         Ok(updated)
+    }
+
+    pub fn active_live_locations_for_sender(
+        &self,
+        sender_jid: &str,
+        now: i64,
+    ) -> Result<Vec<ActiveLiveLocation>> {
+        const MAX_LIVE_LOCATION_SECONDS: i64 = 8 * 60 * 60;
+
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT chat_jid, id, timestamp, media_json FROM messages
+             WHERE sender_jid = ?1
+               AND media_json LIKE '%\"kind\":\"location\"%'
+               AND media_json LIKE '%\"live\":true%'",
+        )?;
+        let rows = statement.query_map([sender_jid], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut locations = Vec::new();
+        for row in rows {
+            let (chat_jid, message_id, started_at, json) = row?;
+            let Ok(MessageMedia::Location {
+                live: true,
+                duration_seconds,
+                ..
+            }) = serde_json::from_str(&json)
+            else {
+                continue;
+            };
+            let lifetime = if duration_seconds == 0 {
+                MAX_LIVE_LOCATION_SECONDS
+            } else {
+                i64::from(duration_seconds)
+            };
+            if started_at.saturating_add(lifetime) >= now {
+                locations.push(ActiveLiveLocation {
+                    chat_jid,
+                    message_id,
+                    duration_seconds,
+                });
+            }
+        }
+        Ok(locations)
+    }
+
+    pub fn active_live_location_targets(&self, now: i64) -> Result<Vec<(String, bool)>> {
+        const MAX_LIVE_LOCATION_SECONDS: i64 = 8 * 60 * 60;
+
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT messages.chat_jid, chats.is_group, messages.timestamp, messages.media_json
+             FROM messages JOIN chats ON chats.jid = messages.chat_jid
+             WHERE messages.media_json LIKE '%\"kind\":\"location\"%'
+               AND messages.media_json LIKE '%\"live\":true%'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut targets = std::collections::BTreeSet::new();
+        for row in rows {
+            let (chat_jid, is_group, started_at, json) = row?;
+            let Ok(MessageMedia::Location {
+                live: true,
+                duration_seconds,
+                ..
+            }) = serde_json::from_str(&json)
+            else {
+                continue;
+            };
+            let lifetime = if duration_seconds == 0 {
+                MAX_LIVE_LOCATION_SECONDS
+            } else {
+                i64::from(duration_seconds)
+            };
+            if started_at.saturating_add(lifetime) >= now {
+                targets.insert((chat_jid, is_group));
+            }
+        }
+        Ok(targets.into_iter().collect())
+    }
+
+    pub fn store_fast_ratchet_state(
+        &self,
+        sender_id: &str,
+        state: &crate::live_location::FastRatchetState,
+    ) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        connection.execute(
+            "INSERT INTO fast_ratchet_sender_keys
+                (sender_id, key_id, iteration, chain_keys, signing_key)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(sender_id, key_id) DO UPDATE SET
+                iteration = excluded.iteration,
+                chain_keys = excluded.chain_keys,
+                signing_key = excluded.signing_key
+             WHERE excluded.iteration >= fast_ratchet_sender_keys.iteration",
+            params![
+                sender_id,
+                i64::from(state.sender_key_id),
+                i64::from(state.iteration),
+                state.encode_chain_keys(),
+                &state.signing_key,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn fast_ratchet_state(
+        &self,
+        sender_id: &str,
+        key_id: u32,
+    ) -> Result<Option<crate::live_location::FastRatchetState>> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        let row = connection
+            .query_row(
+                "SELECT iteration, chain_keys, signing_key
+                 FROM fast_ratchet_sender_keys
+                 WHERE sender_id = ?1 AND key_id = ?2",
+                params![sender_id, i64::from(key_id)],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(iteration, chain_keys, signing_key)| {
+            crate::live_location::FastRatchetState::from_database(
+                key_id,
+                u32::try_from(iteration).context("stored fast-ratchet iteration")?,
+                &chain_keys,
+                signing_key,
+            )
+        })
+        .transpose()
     }
 
     pub fn store_media_download(
@@ -2257,6 +2433,61 @@ mod tests {
                 timestamp_ms: live.timestamp * 1_000,
             })
         );
+    }
+
+    #[test]
+    fn active_live_locations_are_bounded_and_grouped_by_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut live = message("live", 100);
+        live.text = "[Live location]".into();
+        live.media = Some(MessageMedia::Location {
+            latitude_e7: 523_701_600,
+            longitude_e7: 48_953_000,
+            accuracy_m: 8,
+            name: String::new(),
+            address: String::new(),
+            thumbnail_path: None,
+            live: true,
+            updated_at: 100,
+            duration_seconds: 3_600,
+        });
+        database.insert_message(&live, "Ada", false, false).unwrap();
+
+        assert_eq!(
+            database
+                .active_live_locations_for_sender(&live.sender_jid, 200)
+                .unwrap(),
+            vec![ActiveLiveLocation {
+                chat_jid: live.chat_jid.clone(),
+                message_id: live.id.clone(),
+                duration_seconds: 3_600,
+            }]
+        );
+        assert_eq!(
+            database.active_live_location_targets(200).unwrap(),
+            vec![(live.chat_jid.clone(), false)]
+        );
+        assert!(
+            database
+                .active_live_locations_for_sender(&live.sender_jid, 3_701)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fast_ratchet_state_round_trips_through_private_history_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let state = crate::live_location::FastRatchetState {
+            sender_key_id: 42,
+            iteration: 7,
+            chain_keys: std::array::from_fn(|index| [u8::try_from(index).unwrap(); 32]),
+            signing_key: vec![5; 33],
+        };
+        database.store_fast_ratchet_state("1.0", &state).unwrap();
+        assert_eq!(database.fast_ratchet_state("1.0", 42).unwrap(), Some(state));
     }
 
     #[test]

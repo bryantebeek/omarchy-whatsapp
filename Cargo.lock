@@ -406,6 +406,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-oid"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -623,6 +629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer",
+ "const-oid",
  "crypto-common",
  "ctutils",
 ]
@@ -1202,16 +1209,23 @@ dependencies = [
 name = "omarchy-whatsappd"
 version = "0.3.0"
 dependencies = [
+ "aes",
  "anyhow",
+ "async-trait",
  "buffa",
+ "cbc",
  "chrono",
  "clap",
  "flate2",
  "futures",
+ "hkdf",
+ "hmac",
  "omarchy-whatsapp-protocol",
  "qrcode",
+ "rand",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -2091,8 +2105,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "wacore"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6139a98fece24956f1d6bf164c82c5daefb43834813d96a879b41e010707c2c2"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "aes",
  "anyhow",
@@ -2139,8 +2152,7 @@ dependencies = [
 [[package]]
 name = "wacore-appstate"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5afb5372c68d1cda49b7e86a81a01302b7c71b78e8555178c7cf3be01f09ecc3"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "anyhow",
  "buffa",
@@ -2161,8 +2173,7 @@ dependencies = [
 [[package]]
 name = "wacore-binary"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e56452f93ac1e6167a6ebafec23971fe1ca9332b27cc887520f4a6753956fde"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "bytes",
  "compact_str",
@@ -2179,8 +2190,7 @@ dependencies = [
 [[package]]
 name = "wacore-derive"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53cba66b01df4bef777c3d131af434dea0f3c8a7da2e42d7fb74e11fd65fb094"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2190,8 +2200,7 @@ dependencies = [
 [[package]]
 name = "wacore-libsignal"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbf8e90eebdf77703305089c1dfe672dddf203e0238e8f47163f76e7f9d5c713"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "aes",
  "async-lock",
@@ -2222,8 +2231,7 @@ dependencies = [
 [[package]]
 name = "wacore-noise"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a15b03c1e5e4bbf20d2d875c96649aaff82d149f025ae3a1421a1b6a9c426114"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "anyhow",
  "buffa",
@@ -2241,8 +2249,7 @@ dependencies = [
 [[package]]
 name = "waproto"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd19a927d4781e92382a478d234f74baeacb4822ceeb45c665bb9cb321622c35"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "buffa",
  "buffa-build",
@@ -2316,8 +2323,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cb354c32641cfe832bf5c5767a016762234c5efd1b4ce979e2b3e32175d96bc"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2354,8 +2360,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee70216db150b33c1c7cb01dc81e37f70b3edf8c24cebcd75a7ade5c011720d1"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "async-trait",
  "buffa",
@@ -2375,8 +2380,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-tokio-transport"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02ae442f8a6e747c777225ce1808f2ce5311963cf2dccb17a1f304c749f01832"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2396,8 +2400,7 @@ dependencies = [
 [[package]]
 name = "whatsapp-rust-ureq-http-client"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ebb64db9f84faa5eddb851ba7f44566363523bbdb88d5772fcc7d168e177797"
+source = "git+https://github.com/bryantebeek/whatsapp-rust?rev=ababb2f41e5abd5a9d90003e943f1b5b0606b882#ababb2f41e5abd5a9d90003e943f1b5b0606b882"
 dependencies = [
  "anyhow",
  "async-trait",

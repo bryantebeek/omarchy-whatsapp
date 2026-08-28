@@ -2191,7 +2191,7 @@ Item {
                                 messageDelegate.mediaData.updated_at
                                 || modelData.timestamp || 0)
                               var duration = Number(
-                                messageDelegate.mediaData.duration_seconds || 3600)
+                                messageDelegate.mediaData.duration_seconds || 0)
                               return started > 0 ? started + duration : 0
                             }
                             visible: messageDelegate.mediaData
@@ -2205,7 +2205,11 @@ Item {
                             Image {
                               anchors.fill: parent
                               source: visible && root.service
-                                ? root.service.fileUrl(messageDelegate.mediaData.thumbnail_path) : ""
+                                && messageDelegate.mediaData.thumbnail_path
+                                ? root.service.fileUrl(
+                                  messageDelegate.mediaData.thumbnail_path)
+                                  + "?revision=" + String(
+                                    messageDelegate.mediaData.updated_at || 0) : ""
                               asynchronous: true
                               cache: false
                               fillMode: Image.PreserveAspectCrop
@@ -2294,12 +2298,14 @@ Item {
                               id: liveRemainingLabel
                               visible: messageDelegate.mediaData
                                 && messageDelegate.mediaData.live === true
-                                && locationCard.liveUntil > 0
                               anchors.right: parent.right
                               anchors.bottom: parent.bottom
                               anchors.margins: Style.space(10)
-                              text: visible
-                                ? root.remainingTimeLabel(locationCard.liveUntil) : ""
+                              text: !visible ? ""
+                                : locationCard.liveUntil > 0
+                                  ? root.remainingTimeLabel(locationCard.liveUntil)
+                                  : "Updated " + Model.messageTime(
+                                    messageDelegate.mediaData.updated_at)
                               color: root.foreground
                               font.family: root.fontFamily
                               font.pixelSize: Style.font.caption

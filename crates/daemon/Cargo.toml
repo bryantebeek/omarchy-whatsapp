@@ -9,15 +9,21 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+aes.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 buffa.workspace = true
+cbc.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
 omarchy-whatsapp-protocol = { version = "0.3.0", path = "../protocol" }
 qrcode.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
@@ -27,4 +33,5 @@ whatsapp-rust.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true
+rand.workspace = true
 tempfile.workspace = true
