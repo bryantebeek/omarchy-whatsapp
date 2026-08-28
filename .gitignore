@@ -1,7 +1,74 @@
+# Build and test output
 /target/
+/coverage/
+*.profraw
+*.profdata
+
+# Editor and operating-system files
 /.idea/
 /.vscode/
-/quickshell/.width-test.qml
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local environment and credential files
+.env
+.env.*
+!.env.example
+!.env.sample
+.envrc
+/.direnv/
+.netrc
+.npmrc
+.pypirc
+/.cargo/credentials
+/.cargo/credentials.toml
+credentials*.json
+secrets*.json
+service-account*.json
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# WhatsApp account, history, and runtime state
 *.db
-*.db-shm
-*.db-wal
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.sock
+/state/
+/runtime/
+/cache/
+/.cache/
+/.config/
+/.local/
+/omarchy-whatsapp/
+/media/
+/avatars/
+/downloads/
+/pairing.svg
+/ui-preferences.json
+/omarchy-menu.jsonc
+
+# Logs, crash dumps, and temporary files
+*.log
+*.tmp
+*.bak
+*.orig
+core
+core.*
+
+# Local Quickshell development artifacts
+/quickshell/.width-test.qml
