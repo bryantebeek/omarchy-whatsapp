@@ -77,7 +77,7 @@ while IFS= read -r diff_line; do
     -*)
       ;;
   esac
-done < <(git -C "$repo_dir" diff --no-color --unified=0 \
+done < <(git -C "$repo_dir" diff --no-color --ignore-all-space --unified=0 \
   --src-prefix=a/ --dst-prefix=b/ \
   "$base_ref" -- '*.rs')
 

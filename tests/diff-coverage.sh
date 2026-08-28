@@ -35,4 +35,11 @@ if COVERAGE_REPO_DIR="$fixture_dir" \
   exit 1
 fi
 
+git -C "$fixture_dir" reset --hard --quiet HEAD
+printf '%s\n' 'pub  fn  existing( )  { }' >"$fixture_dir/crates/demo/src/lib.rs"
+printf 'SF:%s\nDA:1,0\nend_of_record\n' \
+  "$fixture_dir/crates/demo/src/lib.rs" >"$lcov_file"
+COVERAGE_REPO_DIR="$fixture_dir" \
+  "$repo_dir/scripts/check-diff-coverage.sh" "$lcov_file" HEAD >/dev/null
+
 echo "Diff coverage regression test passed."
