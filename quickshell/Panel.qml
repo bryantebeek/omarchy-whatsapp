@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as QQC
 import QtQuick.Effects
+import QtMultimedia
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -22,6 +23,11 @@ Item {
   property int handledMessagesNavigationSerial: 0
   property int conversationScrollSerial: 0
   property bool scrollToBottomAfterMessages: false
+  property bool restoreConversationAfterMessages: false
+  property real preservedConversationContentY: 0
+  property var activeInlineVideoCard: null
+  property bool activeInlineVideoGif: false
+  property real currentTimestamp: Date.now() / 1000
   property var licenseEntries: []
   property string licenseLoadError: ""
   readonly property bool unreadOnly: service && service.unreadOnly === true
@@ -148,6 +154,27 @@ Item {
     return matches
   }
 
+  function groupConversationSubtitle() {
+    if (!service || !service.selectedChat
+        || service.selectedChat.is_group !== true) return ""
+    if (service.groupParticipantsChatJid !== service.selectedChatJid)
+      return "Loading participants…"
+    if (service.groupParticipantsError) return "Participants unavailable"
+    var participants = Array.isArray(service.groupParticipants)
+      ? service.groupParticipants : []
+    if (!participants.length) return "Participants unavailable"
+    var labels = []
+    var shown = Math.min(4, participants.length)
+    for (var i = 0; i < shown; i++) {
+      var participant = participants[i] || {}
+      labels.push(participant.is_me === true
+        ? "You" : Model.friendlyName(participant.name, participant.jid))
+    }
+    var remaining = participants.length - shown
+    return labels.join(", ") + (remaining > 0
+      ? " + " + remaining + (remaining === 1 ? " other" : " others") : "")
+  }
+
   function licenseKindLabel(kind) {
     if (kind === "project") return "Application"
     if (kind === "asset") return "Bundled asset"
@@ -166,6 +193,10 @@ Item {
       service.setPanelState(true, true)
     }
     Qt.callLater(function() {
+      Quickshell.execDetached([
+        "hyprctl", "dispatch",
+        "hl.dsp.focus({ window = \"title:^WhatsApp$\" })"
+      ])
       root.revealSelectedChat()
       root.prepareCurrentConversation()
       focusScope.forceActiveFocus()
@@ -174,6 +205,8 @@ Item {
   }
 
   function close() {
+    stopInlineVideo()
+    scrollToBottomAnimation.stop()
     opened = false
     controlHeld = false
     controlActivatorKey = 0
@@ -246,6 +279,23 @@ Item {
     return true
   }
 
+  function chooseRelativeChat(offset) {
+    if (!filteredChats.length) return false
+    var selectedIndex = -1
+    var selectedJid = service ? String(service.selectedChatJid || "") : ""
+    for (var i = 0; i < filteredChats.length; i++) {
+      if (String(filteredChats[i].jid || "") === selectedJid) {
+        selectedIndex = i
+        break
+      }
+    }
+    var index = selectedIndex < 0
+      ? (offset < 0 ? filteredChats.length - 1 : 0)
+      : (selectedIndex + offset + filteredChats.length) % filteredChats.length
+    chooseChat(filteredChats[index].jid)
+    return true
+  }
+
   function revealSelectedChat() {
     if (!service || !service.selectedChatJid || !chatList) return
     for (var i = 0; i < filteredChats.length; i++) {
@@ -273,11 +323,74 @@ Item {
     scheduleConversationScroll("bottom", "")
   }
 
+  function stopInlineVideo(card) {
+    if (card && activeInlineVideoCard !== card) return
+    inlineVideoPlayer.stop()
+    inlineVideoPlayer.source = ""
+    activeInlineVideoCard = null
+    activeInlineVideoGif = false
+  }
+
+  function toggleInlineVideo(card) {
+    if (!card || !card.downloaded || !card.mediaPath) return
+    if (activeInlineVideoCard === card) {
+      if (inlineVideoPlayer.playbackState === MediaPlayer.PlayingState)
+        inlineVideoPlayer.pause()
+      else
+        inlineVideoPlayer.play()
+      return
+    }
+    stopInlineVideo()
+    activeInlineVideoCard = card
+    activeInlineVideoGif = card.isGif
+    inlineVideoPlayer.source = "file://" + card.mediaPath
+    inlineVideoPlayer.play()
+  }
+
   function messageIndex(messageId) {
     if (!service || !messageId) return -1
     for (var i = 0; i < service.messages.length; i++)
       if (String(service.messages[i].id || "") === String(messageId)) return i
     return -1
+  }
+
+  function alignConversationViewportToBottom(serial, remainingPasses) {
+    if (serial !== conversationScrollSerial || !messageList) return
+    messageList.forceLayout()
+    messageList.positionViewAtEnd()
+    var heightRatio = Number(messageList.visibleArea.heightRatio || 0)
+    var gapRatio = 1 - Number(messageList.visibleArea.yPosition || 0)
+      - heightRatio
+    if (heightRatio > 0 && gapRatio > 0)
+      messageList.contentY += gapRatio * messageList.height / heightRatio
+    if (remainingPasses > 0) {
+      var nextPass = remainingPasses - 1
+      Qt.callLater(function() {
+        root.alignConversationViewportToBottom(serial, nextPass)
+      })
+    }
+  }
+
+  function animateConversationViewportToBottom() {
+    if (!messageList || !messageList.count) return
+    conversationScrollSerial++
+    restoreConversationAfterMessages = false
+    scrollToBottomAnimation.stop()
+    messageList.cancelFlick()
+    messageList.forceLayout()
+    var heightRatio = Number(messageList.visibleArea.heightRatio || 0)
+    var gapRatio = 1 - Number(messageList.visibleArea.yPosition || 0)
+      - heightRatio
+    if (heightRatio <= 0 || gapRatio <= 0) {
+      scheduleConversationScroll("bottom", "")
+      return
+    }
+    var distance = gapRatio * messageList.height / heightRatio
+    scrollToBottomAnimation.from = messageList.contentY
+    scrollToBottomAnimation.to = messageList.contentY + distance
+    scrollToBottomAnimation.duration = Math.min(420,
+      Math.max(180, 160 + Math.sqrt(distance) * 8))
+    scrollToBottomAnimation.start()
   }
 
   function positionConversationScroll(mode, messageId, serial) {
@@ -290,7 +403,7 @@ Item {
         if (index >= 0) messageList.positionViewAtIndex(index, ListView.Beginning)
         else messageList.positionViewAtBeginning()
       } else {
-        messageList.positionViewAtEnd()
+        alignConversationViewportToBottom(serial, 2)
       }
     }
     conversationReady = true
@@ -305,6 +418,17 @@ Item {
     })
   }
 
+  function scheduleConversationPositionRestore() {
+    var serial = ++conversationScrollSerial
+    Qt.callLater(function() {
+      if (serial !== root.conversationScrollSerial
+          || !root.restoreConversationAfterMessages || !messageList) return
+      messageList.forceLayout()
+      messageList.contentY = root.preservedConversationContentY
+      root.restoreConversationAfterMessages = false
+    })
+  }
+
   function prepareCurrentConversation() {
     if (conversationReady || !service
         || service.messagesChatJid !== service.selectedChatJid) return
@@ -315,13 +439,73 @@ Item {
       firstUnreadId)
   }
 
+  function remainingTimeLabel(untilTimestamp) {
+    var minutes = Math.max(0, Math.ceil(
+      (Number(untilTimestamp || 0) - currentTimestamp) / 60))
+    if (!minutes) return "Ended"
+    if (minutes < 60)
+      return minutes + (minutes === 1 ? " minute left" : " minutes left")
+    var hours = Math.floor(minutes / 60)
+    var remainder = minutes % 60
+    var label = hours + (hours === 1 ? " hour" : " hours")
+    if (remainder)
+      label += " " + remainder
+        + (remainder === 1 ? " minute" : " minutes")
+    return label + " left"
+  }
+
+  Timer {
+    interval: 30000
+    repeat: true
+    running: root.opened
+    triggeredOnStart: true
+    onTriggered: root.currentTimestamp = Date.now() / 1000
+  }
+
+  AudioOutput {
+    id: inlineVideoAudio
+    muted: root.activeInlineVideoGif
+  }
+
+  MediaPlayer {
+    id: inlineVideoPlayer
+    audioOutput: inlineVideoAudio
+    videoOutput: root.activeInlineVideoCard
+      ? root.activeInlineVideoCard.videoSurface : null
+    loops: root.activeInlineVideoGif ? MediaPlayer.Infinite : MediaPlayer.Once
+
+    onMediaStatusChanged: {
+      if (mediaStatus === MediaPlayer.EndOfMedia
+          && !root.activeInlineVideoGif) root.stopInlineVideo()
+    }
+  }
+
+  NumberAnimation {
+    id: scrollToBottomAnimation
+
+    target: messageList
+    property: "contentY"
+    easing.type: Easing.OutCubic
+    onFinished: root.scheduleConversationScroll("bottom", "")
+  }
+
   Connections {
     target: root.service
     function onSelectedChatJidChanged() {
+      root.stopInlineVideo()
+      scrollToBottomAnimation.stop()
       root.conversationScrollSerial++
       root.conversationReady = false
       root.scrollToBottomAfterMessages = false
+      root.restoreConversationAfterMessages = false
       Qt.callLater(root.revealSelectedChat)
+    }
+    function onMessagesWillChange(preservePosition) {
+      root.stopInlineVideo()
+      if (!preservePosition || !messageList || !root.conversationReady
+          || root.restoreConversationAfterMessages) return
+      root.preservedConversationContentY = messageList.contentY
+      root.restoreConversationAfterMessages = true
     }
     function onMessageSentSerialChanged() {
       root.scrollToBottomAfterMessages = true
@@ -334,14 +518,18 @@ Item {
       if (serial !== root.handledMessagesNavigationSerial) {
         root.handledMessagesNavigationSerial = serial
         root.scrollToBottomAfterMessages = false
+        root.restoreConversationAfterMessages = false
         var firstUnreadId = String(root.service.messagesFirstUnreadId || "")
         root.scheduleConversationScroll(firstUnreadId ? "unread" : "bottom",
           firstUnreadId)
       } else if (root.scrollToBottomAfterMessages) {
         root.scrollToBottomAfterMessages = false
+        root.restoreConversationAfterMessages = false
         root.scheduleConversationScroll("bottom", "")
       } else if (!root.conversationReady) {
         root.prepareCurrentConversation()
+      } else if (root.restoreConversationAfterMessages) {
+        root.scheduleConversationPositionRestore()
       }
     }
   }
@@ -379,6 +567,17 @@ Item {
           return
         }
         if (!(event.modifiers & Qt.ControlModifier)) return
+        if (event.key === Qt.Key_Down) {
+          root.animateConversationViewportToBottom()
+          event.accepted = true
+          return
+        }
+        if (event.key === Qt.Key_BracketLeft
+            || event.key === Qt.Key_BracketRight) {
+          root.chooseRelativeChat(event.key === Qt.Key_BracketLeft ? -1 : 1)
+          event.accepted = true
+          return
+        }
         var shortcutSlot = root.chatShortcutSlot(event.key)
         if (shortcutSlot >= 0 && root.chooseChatShortcut(shortcutSlot)) {
           event.accepted = true
@@ -1122,13 +1321,18 @@ Item {
                             && conversationSubtitle.text !== ""
                           text: !root.service || !root.service.selectedChat
                             ? "" : root.service.selectedChat.is_group
-                              ? "Group conversation"
+                              ? root.groupConversationSubtitle()
                               : Model.contactPhoneNumber(
                                 root.service.selectedChat.phone_number,
                                 root.service.selectedChat.jid)
                           color: root.foreground
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.caption
+                          width: Math.min(implicitWidth,
+                            conversationHeader.width - Style.space(100))
+                          maximumLineCount: 1
+                          wrapMode: Text.NoWrap
+                          elide: Text.ElideRight
                           font.underline: conversationPhoneMouse.containsMouse
 
                           MouseArea {
@@ -1188,6 +1392,7 @@ Item {
                         ? reactionsData.length : 0
                       readonly property bool hasStructuredMedia: mediaData
                         && (mediaData.kind === "image"
+                          || mediaData.kind === "video"
                           || mediaData.kind === "document"
                           || mediaData.kind === "location")
                       readonly property bool hasMediaCaption: mediaData
@@ -1255,7 +1460,10 @@ Item {
                           ? messageFooterTime.implicitHeight + Style.space(3) : 0)
                         + Style.space(4)
 
-                      ListView.onPooled: reactionPicker.close()
+                      ListView.onPooled: {
+                        root.stopInlineVideo(mediaPreviewCard)
+                        reactionPicker.close()
+                      }
                       ListView.onReused: reactionPicker.close()
 
                       CrispBorderSurface {
@@ -1325,12 +1533,37 @@ Item {
                         font.bold: true
                       }
 
-                      Rectangle {
+                      CrispBorderSurface {
                         id: bubble
-                        readonly property real horizontalPadding: Style.space(22)
+                        readonly property bool borderOnlyMedia:
+                          messageDelegate.mediaData
+                          && (messageDelegate.mediaData.kind === "image"
+                            || messageDelegate.mediaData.kind === "video"
+                            || messageDelegate.mediaData.kind === "location")
+                        readonly property color mediaBorderColor: {
+                          var base = Style.normalBorderFor(
+                            root.foreground, root.accent)
+                          return Qt.rgba(base.r, base.g, base.b, base.a * 0.55)
+                        }
+                        readonly property real horizontalPadding: borderOnlyMedia
+                          ? borderLeft + borderRight : Style.space(22)
                         readonly property real maximumWidth: messageList.width * 0.72
+                        readonly property real maximumMediaWidth:
+                          Math.min(maximumWidth, Style.space(340))
+                            - horizontalPadding
+                        readonly property real videoAspectRatio:
+                          Number(messageDelegate.mediaData
+                            ? messageDelegate.mediaData.width || 1 : 1)
+                            / Math.max(1, Number(messageDelegate.mediaData
+                              ? messageDelegate.mediaData.height || 1 : 1))
+                        readonly property real videoPreviewWidth: Math.max(
+                          Style.space(40), Math.min(maximumMediaWidth,
+                            Style.space(280) * videoAspectRatio))
 
-                        width: messageDelegate.hasStructuredMedia
+                        width: messageDelegate.mediaData
+                          && messageDelegate.mediaData.kind === "video"
+                          ? videoPreviewWidth + horizontalPadding
+                          : messageDelegate.hasStructuredMedia
                           ? Math.min(maximumWidth, Style.space(340))
                           : Math.min(maximumWidth,
                             Math.max(Style.space(36),
@@ -1338,22 +1571,32 @@ Item {
                               messageDelegate.showSenderLabel
                                 ? senderWidthProbe.implicitWidth
                                   + horizontalPadding : 0))
-                        height: messageColumn.implicitHeight + Style.space(16)
+                        height: messageColumn.implicitHeight
+                          + (borderOnlyMedia
+                            ? borderTop + borderBottom : Style.space(16))
                         x: modelData.from_me
                           ? messageDelegate.width - width - Style.space(18)
                           : (messageDelegate.showSenderAvatar
                             ? Style.space(56) : Style.space(18))
-                        radius: Style.cornerRadius + Style.space(6)
-                        color: modelData.from_me
-                          ? Style.selectedFillFor(root.foreground, root.accent)
-                          : Style.normalFillFor(root.foreground, root.accent)
+                        radius: borderOnlyMedia
+                          ? 0 : Style.cornerRadius + Style.space(6)
+                        color: borderOnlyMedia ? "transparent"
+                          : (modelData.from_me
+                            ? Style.selectedFillFor(root.foreground, root.accent)
+                            : Style.normalFillFor(root.foreground, root.accent))
+        sourceBorderSpec: borderOnlyMedia
+            ? Border.flat(mediaBorderColor,
+                          1)
+            : Border.none()
 
                         Column {
                           id: messageColumn
                           anchors.left: parent.left
                           anchors.right: parent.right
-                          anchors.leftMargin: Style.space(11)
-                          anchors.rightMargin: Style.space(11)
+                          anchors.leftMargin: bubble.borderOnlyMedia
+                            ? bubble.borderLeft : Style.space(11)
+                          anchors.rightMargin: bubble.borderOnlyMedia
+                            ? bubble.borderRight : Style.space(11)
                           anchors.verticalCenter: parent.verticalCenter
                           spacing: Style.space(3)
                           Text {
@@ -1414,49 +1657,139 @@ Item {
                             }
                           }
                           Item {
-                            id: imageCard
+                            id: mediaPreviewCard
+                            property alias videoSurface: inlineVideoOutput
+                            readonly property bool isVideo: messageDelegate.mediaData
+                              && messageDelegate.mediaData.kind === "video"
+                            readonly property bool isGif: isVideo
+                              && messageDelegate.mediaData.gif_playback === true
+                            readonly property bool downloaded: messageDelegate.mediaData
+                              ? messageDelegate.mediaData.downloaded === true : false
+                            readonly property string mediaPath: messageDelegate.mediaData
+                              ? String(messageDelegate.mediaData.path || "") : ""
+                            readonly property string thumbnailPath: messageDelegate.mediaData
+                              ? String(messageDelegate.mediaData.thumbnail_path || "") : ""
+                            readonly property string displayPath: isVideo
+                              ? thumbnailPath
+                              : (downloaded ? mediaPath : (thumbnailPath || mediaPath))
+                            readonly property bool inlineActive:
+                              root.activeInlineVideoCard === mediaPreviewCard
+                            readonly property bool inlinePlaying: inlineActive
+                              && inlineVideoPlayer.playbackState === MediaPlayer.PlayingState
                             visible: messageDelegate.mediaData
-                              && messageDelegate.mediaData.kind === "image"
+                              && (messageDelegate.mediaData.kind === "image"
+                                || messageDelegate.mediaData.kind === "video")
                             width: parent.width
-                            height: visible ? Math.max(Style.space(110), Math.min(
-                              Style.space(280), width * Number(
-                                messageDelegate.mediaData.height || 1)
-                                / Math.max(1, Number(messageDelegate.mediaData.width || 1)))) : 0
+                            height: visible
+                              ? (isVideo ? width / bubble.videoAspectRatio
+                                : Math.max(Style.space(110), Math.min(
+                                  Style.space(280), width * Number(
+                                    messageDelegate.mediaData.height || 1)
+                                    / Math.max(1, Number(
+                                      messageDelegate.mediaData.width || 1)))))
+                              : 0
 
                             Image {
+                              id: mediaPreviewImage
                               anchors.fill: parent
-                              source: messageDelegate.mediaData
-                                && imageCard.visible && root.service
-                                ? root.service.fileUrl(
-                                  messageDelegate.mediaData.downloaded === true
-                                    ? messageDelegate.mediaData.path
-                                    : (messageDelegate.mediaData.thumbnail_path
-                                      || messageDelegate.mediaData.path)) : ""
+                              visible: !mediaPreviewCard.inlineActive
+                              source: mediaPreviewCard.visible && root.service
+                                ? root.service.fileUrl(mediaPreviewCard.displayPath) : ""
                               asynchronous: true
                               cache: false
                               fillMode: Image.PreserveAspectFit
                             }
 
+                            VideoOutput {
+                              id: inlineVideoOutput
+                              anchors.fill: parent
+                              visible: mediaPreviewCard.inlineActive
+                              fillMode: VideoOutput.PreserveAspectFit
+                              endOfStreamPolicy: VideoOutput.KeepLastFrame
+                            }
+
+                            HoverHandler {
+                              id: mediaPreviewHover
+                            }
+
+                            MouseArea {
+                              anchors.fill: parent
+                              enabled: mediaPreviewCard.isVideo
+                                && mediaPreviewCard.downloaded
+                              cursorShape: enabled
+                                ? Qt.PointingHandCursor : Qt.ArrowCursor
+                              onClicked:
+                                root.toggleInlineVideo(mediaPreviewCard)
+                            }
+
+                            Text {
+                              anchors.centerIn: parent
+                              visible: mediaPreviewCard.isVideo
+                                && !mediaPreviewCard.inlineActive
+                                && mediaPreviewImage.status !== Image.Ready
+                              text: "󰕧"
+                              color: root.muted
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.displayLarge
+                            }
+
                             CrispButton {
                               readonly property bool downloading: visible
                                 && root.service
-                                && root.service.imageDownloading(modelData)
+                                && root.service.mediaDownloading(modelData)
 
                               anchors.centerIn: parent
                               visible: messageDelegate.mediaData
-                                && imageCard.visible
-                                && messageDelegate.mediaData.downloaded !== true
+                                && mediaPreviewCard.visible
+                                && (mediaPreviewCard.isVideo
+                                  || !mediaPreviewCard.downloaded)
+                              opacity: mediaPreviewCard.isVideo
+                                && mediaPreviewCard.downloaded
+                                ? (mediaPreviewHover.hovered ? 1 : 0) : 1
                               width: Style.space(40)
                               height: Style.space(40)
-                              iconText: downloading ? "󰔟" : "󰇚"
+                              iconSize: mediaPreviewCard.isVideo
+                                && mediaPreviewCard.downloaded
+                                ? Style.font.icon * 1.5 : Style.font.icon
+                              iconText: downloading ? "󰔟"
+                                : (mediaPreviewCard.isVideo
+                                  && mediaPreviewCard.downloaded
+                                  ? (mediaPreviewCard.inlinePlaying ? "󰏤" : "󰐊")
+                                  : "󰇚")
                               tooltipText: downloading
-                                ? "Downloading full image"
-                                : "Download full image"
+                                ? "Downloading media"
+                                : (mediaPreviewCard.isVideo
+                                  ? (mediaPreviewCard.downloaded
+                                    ? (mediaPreviewCard.inlinePlaying
+                                      ? (mediaPreviewCard.isGif ? "Pause GIF" : "Pause video")
+                                      : (mediaPreviewCard.isGif ? "Play GIF" : "Play video"))
+                                    : (mediaPreviewCard.isGif ? "Download GIF" : "Download video"))
+                                  : "Download full image")
                               foreground: root.foreground
                               accent: root.accent
                               enabled: visible && root.service && !downloading
-                              onClicked: root.service.downloadImage(modelData)
+                                && (!mediaPreviewCard.isVideo
+                                  || !mediaPreviewCard.downloaded
+                                  || mediaPreviewHover.hovered)
+
+                              Behavior on opacity {
+                                NumberAnimation {
+                                  duration: 140
+                                  easing.type: Easing.OutCubic
+                                }
+                              }
+
+                              onClicked: {
+                                if (mediaPreviewCard.isVideo
+                                    && mediaPreviewCard.downloaded)
+                                  root.toggleInlineVideo(mediaPreviewCard)
+                                else
+                                  root.service.downloadMedia(modelData)
+                              }
                             }
+
+                            Component.onDestruction:
+                              root.stopInlineVideo(mediaPreviewCard)
                           }
                           Item {
                             id: documentCard
@@ -1540,18 +1873,28 @@ Item {
                                 messageDelegate.mediaData.file_name)
                             }
                           }
-                          CrispBorderSurface {
+                          Rectangle {
                             id: locationCard
+                            readonly property real liveUntil: {
+                              if (!messageDelegate.mediaData
+                                  || messageDelegate.mediaData.live !== true) return 0
+                              var exact = Number(
+                                messageDelegate.mediaData.live_until || 0)
+                              if (exact > 0) return exact
+                              var started = Number(
+                                messageDelegate.mediaData.updated_at
+                                || modelData.timestamp || 0)
+                              var duration = Number(
+                                messageDelegate.mediaData.duration_seconds || 3600)
+                              return started > 0 ? started + duration : 0
+                            }
                             visible: messageDelegate.mediaData
                               && messageDelegate.mediaData.kind === "location"
                             width: parent.width
                             height: visible ? Style.space(150) : 0
-                            radius: Style.cornerRadius
+                            radius: 0
                             clip: true
-                            color: Style.hoverFillFor(root.foreground, root.accent)
-                            sourceBorderSpec: Border.flat(
-                              Style.normalBorderFor(root.foreground, root.accent),
-                              Math.max(1, Style.normalBorderWidth))
+                            color: Style.normalFillFor(root.foreground, root.accent)
 
                             Image {
                               anchors.fill: parent
@@ -1560,51 +1903,134 @@ Item {
                               asynchronous: true
                               cache: false
                               fillMode: Image.PreserveAspectCrop
-                              opacity: status === Image.Ready ? 0.42 : 0
+                              smooth: true
+                              mipmap: true
+                              opacity: status === Image.Ready ? 1 : 0
                             }
-                            Column {
+
+                            Rectangle {
                               anchors.left: parent.left
                               anchors.right: parent.right
                               anchors.bottom: parent.bottom
-                              anchors.margins: Style.space(10)
-                              spacing: Style.space(2)
-                              Text {
-                                width: parent.width
-                                text: messageDelegate.mediaData
-                                  && messageDelegate.mediaData.live
-                                  ? "󰍹  Live location" : "󰍎  Location"
-                                color: root.foreground
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.body
-                                font.bold: true
-                              }
-                              Text {
-                                width: parent.width
-                                text: String(messageDelegate.mediaData
-                                  ? (messageDelegate.mediaData.name
-                                  || messageDelegate.mediaData.address)
-                                  || "Open in map"
-                                  : "Open in map")
-                                color: root.foreground
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.caption
-                                elide: Text.ElideRight
-                              }
-                              Text {
-                                width: parent.width
-                                text: Number(messageDelegate.mediaData
-                                  ? messageDelegate.mediaData.accuracy_m || 0 : 0) > 0
-                                  ? "Accuracy ±" + Number(messageDelegate.mediaData.accuracy_m) + " m"
-                                  : "OpenStreetMap"
-                                color: root.muted
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.caption
+                              height: Style.space(72)
+                              gradient: Gradient {
+                                GradientStop {
+                                  position: 0
+                                  color: "transparent"
+                                }
+                                GradientStop {
+                                  position: 1
+                                  color: Qt.rgba(root.background.r,
+                                    root.background.g, root.background.b, 0.9)
+                                }
                               }
                             }
+
+                            HoverHandler {
+                              id: locationHover
+                            }
+
+                            Row {
+                              anchors.left: parent.left
+                              anchors.bottom: parent.bottom
+                              anchors.margins: Style.space(10)
+                              spacing: Style.space(7)
+                              width: Math.max(0, parent.width - Style.space(20)
+                                - (liveRemainingLabel.visible
+                                  ? liveRemainingLabel.width + Style.space(10) : 0))
+
+                              Text {
+                                anchors.bottom: parent.bottom
+                                text: "󰍎"
+                                color: root.foreground
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.icon
+                              }
+
+                              Column {
+                                anchors.bottom: parent.bottom
+                                width: parent.width - Style.space(7)
+                                  - Style.font.icon
+                                spacing: Style.space(1)
+
+                                Text {
+                                  width: parent.width
+                                  text: String(messageDelegate.mediaData
+                                    ? (messageDelegate.mediaData.name
+                                      || messageDelegate.mediaData.address)
+                                      || (messageDelegate.mediaData.live
+                                        ? "Live location" : "Location")
+                                    : "Location")
+                                  color: root.foreground
+                                  font.family: root.fontFamily
+                                  font.pixelSize: Style.font.body
+                                  font.bold: true
+                                  elide: Text.ElideRight
+                                }
+                                Text {
+                                  visible: messageDelegate.mediaData
+                                    && String(messageDelegate.mediaData.name
+                                      || "").length > 0
+                                    && String(messageDelegate.mediaData.address
+                                      || "").length > 0
+                                  width: parent.width
+                                  text: visible
+                                    ? String(messageDelegate.mediaData.address) : ""
+                                  color: root.muted
+                                  font.family: root.fontFamily
+                                  font.pixelSize: Style.font.caption
+                                  elide: Text.ElideRight
+                                }
+                              }
+                            }
+
+                            Text {
+                              id: liveRemainingLabel
+                              visible: messageDelegate.mediaData
+                                && messageDelegate.mediaData.live === true
+                                && locationCard.liveUntil > 0
+                              anchors.right: parent.right
+                              anchors.bottom: parent.bottom
+                              anchors.margins: Style.space(10)
+                              text: visible
+                                ? root.remainingTimeLabel(locationCard.liveUntil) : ""
+                              color: root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                              font.bold: true
+                            }
+
                             MouseArea {
                               anchors.fill: parent
                               cursorShape: Qt.PointingHandCursor
+                              z: 1
                               onClicked: if (root.service) root.service.openMap(
+                                messageDelegate.mediaData.latitude_e7,
+                                messageDelegate.mediaData.longitude_e7)
+                            }
+
+                            CrispButton {
+                              anchors.centerIn: parent
+                              visible: locationCard.visible
+                              opacity: locationHover.hovered ? 1 : 0
+                              width: Style.space(40)
+                              height: Style.space(40)
+                              iconSize: Style.font.icon * 1.5
+                              iconText: "󰏌"
+                              tooltipText: "Open map"
+                              foreground: root.foreground
+                              accent: root.accent
+                              enabled: locationHover.hovered && root.service
+                              z: 2
+
+                              Behavior on opacity {
+                                NumberAnimation {
+                                  duration: 140
+                                  easing.type: Easing.OutCubic
+                                }
+                              }
+
+                              onClicked: root.service.openMap(
                                 messageDelegate.mediaData.latitude_e7,
                                 messageDelegate.mediaData.longitude_e7)
                             }
@@ -1947,6 +2373,42 @@ Item {
                         foreground: root.foreground
                         onClicked: root.submitMessage()
                       }
+                    }
+                  }
+                }
+
+                CrispButton {
+                  id: scrollToBottomButton
+                  readonly property bool relevant: root.conversationReady
+                    && messageList.count > 0
+                    && messageList.visibleArea.yPosition
+                      + messageList.visibleArea.heightRatio < 0.9999
+
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  anchors.bottom: parent.bottom
+                  anchors.bottomMargin: composerRow.height + Style.space(14)
+                  z: 1
+                  visible: relevant || opacity > 0
+                  enabled: relevant
+                  opacity: relevant ? 1 : 0
+                  width: Style.space(30)
+                  height: width
+                  radius: width / 2
+                  horizontalPadding: 0
+                  verticalPadding: 0
+                  iconText: "󰁅"
+                  tooltipText: "Scroll to latest message"
+                  foreground: root.foreground
+                  background: root.background
+                  accent: root.accent
+                  bordered: true
+                  focusable: true
+                  onClicked: root.animateConversationViewportToBottom()
+
+                  Behavior on opacity {
+                    NumberAnimation {
+                      duration: 140
+                      easing.type: Easing.OutCubic
                     }
                   }
                 }

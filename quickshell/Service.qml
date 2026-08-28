@@ -37,9 +37,13 @@ Item {
   property int avatarRevision: 0
   property var avatarAvailable: ({})
   property int mediaRevision: 0
-  property var imageDownloadRequests: ({})
-  property var imageDownloadRequestIds: ({})
+  property var mediaDownloadRequests: ({})
+  property var mediaDownloadRequestIds: ({})
   property var chats: []
+  property var groupParticipants: []
+  property string groupParticipantsChatJid: ""
+  property string groupParticipantsError: ""
+  property var groupParticipantRequestJids: ({})
   property var messages: []
   property string messagesChatJid: ""
   property string messagesFirstUnreadId: ""
@@ -63,6 +67,8 @@ Item {
   property int uiPreferencesRevision: 0
   property int uiPreferencesSavingRevision: 0
 
+  signal messagesWillChange(bool preservePosition)
+
   readonly property string qrImageUrl: pairingExpiresAt > 0
     ? "file://" + qrPath + "?v=" + pairingExpiresAt : ""
   readonly property var selectedChat: {
@@ -73,6 +79,49 @@ Item {
 
   function copyArray(value) {
     return Array.isArray(value) ? value.slice() : []
+  }
+
+  function groupParticipantRequestPending(jid) {
+    var value = String(jid || "")
+    for (var requestId in groupParticipantRequestJids)
+      if (String(groupParticipantRequestJids[requestId] || "") === value)
+        return true
+    return false
+  }
+
+  function requestGroupParticipants(jid) {
+    var value = String(jid || "")
+    if (!value || groupParticipantRequestPending(value)) return false
+    var requestId = send("get_group_participants", { chat_jid: value })
+    if (!requestId) return false
+    var requestJids = Object.assign({}, groupParticipantRequestJids)
+    requestJids[String(requestId)] = value
+    groupParticipantRequestJids = requestJids
+    groupParticipants = []
+    groupParticipantsChatJid = ""
+    groupParticipantsError = ""
+    return true
+  }
+
+  function finishGroupParticipantsRequest(frame) {
+    if (!frame || frame.id === undefined || frame.id === null) return ""
+    var requestId = String(frame.id)
+    var jid = String(groupParticipantRequestJids[requestId] || "")
+    if (!jid) return ""
+    var requestJids = Object.assign({}, groupParticipantRequestJids)
+    delete requestJids[requestId]
+    groupParticipantRequestJids = requestJids
+    return jid
+  }
+
+  function refreshSelectedGroupParticipants() {
+    if (!selectedChat || selectedChat.is_group !== true) {
+      groupParticipants = []
+      groupParticipantsChatJid = ""
+      groupParticipantsError = ""
+      return false
+    }
+    return requestGroupParticipants(selectedChatJid)
   }
 
   function loadUiPreferences(raw) {
@@ -248,44 +297,48 @@ Item {
     return shouldRefresh ? jid : ""
   }
 
-  function imageDownloadKey(message) {
+  function mediaDownloadKey(message) {
     if (!message) return ""
     return String(message.chat_jid || "") + "\n" + String(message.id || "")
   }
 
-  function imageDownloading(message) {
-    return imageDownloadRequests[imageDownloadKey(message)] === true
+  function mediaDownloading(message) {
+    return mediaDownloadRequests[mediaDownloadKey(message)] === true
   }
 
-  function downloadImage(message) {
-    if (!message || !message.chat_jid || !message.id || imageDownloading(message))
+  function downloadMedia(message) {
+    if (!message || !message.chat_jid || !message.id || mediaDownloading(message))
       return false
-    var requestId = send("download_image", {
+    var kind = String(message.media ? message.media.kind || "" : "")
+    var command = kind === "image" ? "download_image"
+      : (kind === "video" ? "download_video" : "")
+    if (!command) return false
+    var requestId = send(command, {
       chat_jid: String(message.chat_jid),
       message_id: String(message.id)
     })
     if (!requestId) return false
-    var key = imageDownloadKey(message)
-    var requests = Object.assign({}, imageDownloadRequests)
-    var requestIds = Object.assign({}, imageDownloadRequestIds)
+    var key = mediaDownloadKey(message)
+    var requests = Object.assign({}, mediaDownloadRequests)
+    var requestIds = Object.assign({}, mediaDownloadRequestIds)
     requests[key] = true
     requestIds[String(requestId)] = key
-    imageDownloadRequests = requests
-    imageDownloadRequestIds = requestIds
+    mediaDownloadRequests = requests
+    mediaDownloadRequestIds = requestIds
     return true
   }
 
-  function finishImageDownloadRequest(frame) {
+  function finishMediaDownloadRequest(frame) {
     if (!frame || frame.id === undefined || frame.id === null) return
     var id = String(frame.id)
-    var key = imageDownloadRequestIds[id]
+    var key = mediaDownloadRequestIds[id]
     if (!key) return
-    var requests = Object.assign({}, imageDownloadRequests)
-    var requestIds = Object.assign({}, imageDownloadRequestIds)
+    var requests = Object.assign({}, mediaDownloadRequests)
+    var requestIds = Object.assign({}, mediaDownloadRequestIds)
     delete requests[key]
     delete requestIds[id]
-    imageDownloadRequests = requests
-    imageDownloadRequestIds = requestIds
+    mediaDownloadRequests = requests
+    mediaDownloadRequestIds = requestIds
   }
 
   function refreshMetadata() {
@@ -296,7 +349,10 @@ Item {
 
   function refresh() {
     refreshMetadata()
-    if (selectedChatJid) requestMessages(selectedChatJid)
+    if (selectedChatJid) {
+      requestMessages(selectedChatJid)
+      refreshSelectedGroupParticipants()
+    }
   }
 
   function selectChat(jid) {
@@ -305,12 +361,16 @@ Item {
     var changed = value !== selectedChatJid
     if (changed) {
       selectedChatJid = value
+      groupParticipants = []
+      groupParticipantsChatJid = ""
+      groupParticipantsError = ""
       messagesChatJid = ""
       messagesFirstUnreadId = ""
       messagesNavigationSerial++
       messages = []
     }
     if (changed || messagesChatJid !== value) requestMessages(value)
+    if (changed) refreshSelectedGroupParticipants()
     send("mark_read", { chat_jid: value })
     requestAvatar(value)
     updateActiveChat()
@@ -374,7 +434,12 @@ Item {
     try { frame = JSON.parse(String(line || "")) }
     catch (error) { return }
     if (!frame || !frame.event) return
-    finishImageDownloadRequest(frame)
+    var frameId = frame.id === undefined || frame.id === null
+      ? "" : String(frame.id)
+    var requestedMessagesJid = frameId
+      ? String(messagesRequestJids[frameId] || "") : ""
+    var requestedGroupParticipantsJid = finishGroupParticipantsRequest(frame)
+    finishMediaDownloadRequest(frame)
     var queuedMessagesJid = finishMessagesRequest(frame)
     lastError = ""
     if (frame.event === "hello") {
@@ -386,8 +451,19 @@ Item {
       scheduleLauncherSync()
       if (!selectedChatJid && chats.length && panelVisible)
         selectChat(chats[0].jid)
+      else if (selectedChatJid && groupParticipantsChatJid !== selectedChatJid
+          && !groupParticipantRequestPending(selectedChatJid))
+        refreshSelectedGroupParticipants()
+    } else if (frame.event === "group_participants") {
+      if (String(frame.chat_jid || "") === selectedChatJid) {
+        groupParticipants = copyArray(frame.participants)
+        groupParticipantsChatJid = String(frame.chat_jid || "")
+        groupParticipantsError = ""
+      }
     } else if (frame.event === "messages") {
       if (String(frame.chat_jid || "") === selectedChatJid) {
+        messagesWillChange(requestedMessagesJid === ""
+          && messagesChatJid === selectedChatJid && messages.length > 0)
         messagesResponseHasFollowup = queuedMessagesJid === selectedChatJid
         messagesChatJid = String(frame.chat_jid || "")
         messagesFirstUnreadId = String(frame.first_unread_message_id || "")
@@ -421,6 +497,11 @@ Item {
       avatarRevision = Number(frame.revision || avatarRevision + 1)
     } else if (frame.event === "error") {
       lastError = String(frame.message || "WhatsApp command failed")
+      if (requestedGroupParticipantsJid === selectedChatJid) {
+        groupParticipants = []
+        groupParticipantsChatJid = selectedChatJid
+        groupParticipantsError = lastError
+      }
     }
     if (queuedMessagesJid && queuedMessagesJid === selectedChatJid)
       requestMessages(queuedMessagesJid)
@@ -442,6 +523,7 @@ Item {
       onConnectionStateChanged: {
         root.connected = connected
         if (connected) {
+          root.groupParticipantRequestJids = ({})
           root.messagesRequestIds = ({})
           root.messagesRequestJids = ({})
           root.messagesQueuedRequests = ({})

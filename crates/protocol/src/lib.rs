@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -32,6 +32,13 @@ pub struct Chat {
     pub last_timestamp: i64,
     pub unread: u32,
     pub is_group: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatParticipant {
+    pub jid: String,
+    pub name: String,
+    pub is_me: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +76,17 @@ pub enum MessageMedia {
         width: u32,
         height: u32,
     },
+    Video {
+        path: String,
+        thumbnail_path: String,
+        #[serde(default)]
+        downloaded: bool,
+        mime_type: String,
+        width: u32,
+        height: u32,
+        duration_seconds: u32,
+        gif_playback: bool,
+    },
     Document {
         path: String,
         file_name: String,
@@ -85,6 +103,8 @@ pub enum MessageMedia {
         thumbnail_path: Option<String>,
         live: bool,
         updated_at: i64,
+        #[serde(default)]
+        duration_seconds: u32,
     },
 }
 
@@ -99,11 +119,18 @@ pub enum Command {
         chat_jid: String,
         limit: u32,
     },
+    GetGroupParticipants {
+        chat_jid: String,
+    },
     SendMessage {
         chat_jid: String,
         text: String,
     },
     DownloadImage {
+        chat_jid: String,
+        message_id: String,
+    },
+    DownloadVideo {
         chat_jid: String,
         message_id: String,
     },
@@ -159,6 +186,10 @@ pub enum ServerEvent {
         messages: Vec<Message>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         first_unread_message_id: Option<String>,
+    },
+    GroupParticipants {
+        chat_jid: String,
+        participants: Vec<ChatParticipant>,
     },
     Message {
         message: Message,
@@ -264,6 +295,35 @@ mod tests {
     }
 
     #[test]
+    fn group_participants_round_trip_is_stable() {
+        let request = ClientFrame::new(
+            Some(9),
+            Command::GetGroupParticipants {
+                chat_jid: "123-456@g.us".into(),
+            },
+        );
+        let request_json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ClientFrame>(&request_json).unwrap(),
+            request
+        );
+
+        let response = ServerFrame::event(ServerEvent::GroupParticipants {
+            chat_jid: "123-456@g.us".into(),
+            participants: vec![ChatParticipant {
+                jid: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                is_me: false,
+            }],
+        });
+        let response_json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ServerFrame>(&response_json).unwrap(),
+            response
+        );
+    }
+
+    #[test]
     fn event_round_trip_is_stable() {
         let frame = ServerFrame::event(ServerEvent::Unread { total: 3 });
         let json = serde_json::to_string(&frame).unwrap();
@@ -339,5 +399,43 @@ mod tests {
         };
         let json = serde_json::to_string(&media).unwrap();
         assert_eq!(serde_json::from_str::<MessageMedia>(&json).unwrap(), media);
+    }
+
+    #[test]
+    fn video_media_round_trip_is_stable() {
+        let media = MessageMedia::Video {
+            path: "/private/cache/clip.video.mp4".into(),
+            thumbnail_path: "/private/cache/clip.video-thumbnail.jpg".into(),
+            downloaded: false,
+            mime_type: "video/mp4".into(),
+            width: 1920,
+            height: 1080,
+            duration_seconds: 12,
+            gif_playback: false,
+        };
+        let json = serde_json::to_string(&media).unwrap();
+        assert_eq!(serde_json::from_str::<MessageMedia>(&json).unwrap(), media);
+    }
+
+    #[test]
+    fn legacy_live_location_defaults_to_an_unknown_duration() {
+        let media = serde_json::from_str::<MessageMedia>(
+            r#"{"kind":"location","latitude_e7":523701600,"longitude_e7":48953000,"accuracy_m":8,"name":"","address":"","thumbnail_path":null,"live":true,"updated_at":42}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            media,
+            MessageMedia::Location {
+                latitude_e7: 523_701_600,
+                longitude_e7: 48_953_000,
+                accuracy_m: 8,
+                name: String::new(),
+                address: String::new(),
+                thumbnail_path: None,
+                live: true,
+                updated_at: 42,
+                duration_seconds: 0,
+            }
+        );
     }
 }

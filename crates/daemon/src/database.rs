@@ -27,6 +27,7 @@ pub struct UnreadReceipt {
 pub struct HistoryCursor {
     pub chat_jid: String,
     pub message_id: String,
+    pub sender_jid: String,
     pub from_me: bool,
     pub timestamp_ms: i64,
 }
@@ -373,7 +374,10 @@ impl Database {
             .expect("history database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT chats.jid, chats.name, chats.phone_number, chats.last_message,
-                    chats.last_timestamp, chats.unread, chats.is_group
+                    chats.last_timestamp,
+                    CASE WHEN COALESCE(chat_settings.archived, 0) = 0
+                         THEN chats.unread ELSE 0 END,
+                    chats.is_group
              FROM chats
              LEFT JOIN chat_settings ON chat_settings.jid = chats.jid
              WHERE chats.jid != '0@s.whatsapp.net'
@@ -600,18 +604,32 @@ impl Database {
                 let mut media = row
                     .get::<_, Option<String>>(7)?
                     .and_then(|json| serde_json::from_str(&json).ok());
-                if let Some(MessageMedia::Image {
-                    path,
-                    thumbnail_path,
-                    downloaded,
-                    ..
-                }) = &mut media
-                {
-                    // New image records always have a dedicated thumbnail
-                    // path. An empty path identifies an ambiguous legacy row,
-                    // which history recovery will upgrade before presenting
-                    // its old cache file as a completed download.
-                    *downloaded = !thumbnail_path.is_empty() && Path::new(path).is_file();
+                match &mut media {
+                    Some(MessageMedia::Image {
+                        path,
+                        thumbnail_path,
+                        downloaded,
+                        ..
+                    }) => {
+                        // An empty thumbnail path identifies an ambiguous early
+                        // image row whose preview may still occupy `path`.
+                        *downloaded = !thumbnail_path.is_empty() && Path::new(path).is_file();
+                        if !thumbnail_path.is_empty() && !Path::new(thumbnail_path).is_file() {
+                            thumbnail_path.clear();
+                        }
+                    }
+                    Some(MessageMedia::Video {
+                        path,
+                        thumbnail_path,
+                        downloaded,
+                        ..
+                    }) => {
+                        *downloaded = Path::new(path).is_file();
+                        if !thumbnail_path.is_empty() && !Path::new(thumbnail_path).is_file() {
+                            thumbnail_path.clear();
+                        }
+                    }
+                    _ => {}
                 }
                 Ok(Message {
                     id: row.get(0)?,
@@ -699,9 +717,14 @@ impl Database {
             .lock()
             .expect("history database mutex poisoned");
         connection
-            .query_row("SELECT COALESCE(SUM(unread), 0) FROM chats", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(SUM(chats.unread), 0)
+                 FROM chats
+                 LEFT JOIN chat_settings ON chat_settings.jid = chats.jid
+                 WHERE COALESCE(chat_settings.archived, 0) = 0",
+                [],
+                |row| row.get(0),
+            )
             .map_err(Into::into)
     }
 
@@ -1014,20 +1037,73 @@ impl Database {
         message_id: &str,
         media: &MessageMedia,
     ) -> Result<bool> {
-        let json = serde_json::to_string(media)?;
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .expect("history database mutex poisoned");
-        Ok(connection.execute(
-            "UPDATE messages SET media_json = ?3
+        let mut merged_media = media.clone();
+        if let MessageMedia::Location {
+            thumbnail_path,
+            duration_seconds,
+            ..
+        } = &mut merged_media
+            && let Some(previous_json) = connection
+                .query_row(
+                    "SELECT media_json FROM messages WHERE chat_jid = ?1 AND id = ?2",
+                    params![chat_jid, message_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+            && let Ok(MessageMedia::Location {
+                thumbnail_path: previous_thumbnail,
+                duration_seconds: previous_duration,
+                ..
+            }) = serde_json::from_str(&previous_json)
+        {
+            if thumbnail_path.is_none() {
+                *thumbnail_path = previous_thumbnail;
+            }
+            if *duration_seconds == 0 {
+                *duration_seconds = previous_duration;
+            }
+        }
+        let json = serde_json::to_string(&merged_media)?;
+        let gif_placeholder = matches!(
+            merged_media,
+            MessageMedia::Video {
+                gif_playback: true,
+                ..
+            }
+        )
+        .then_some("[GIF]");
+        let transaction = connection.transaction()?;
+        let updated = transaction.execute(
+            "UPDATE messages SET
+                media_json = ?3,
+                text = CASE
+                    WHEN ?4 IS NOT NULL AND text = '[Video]' THEN ?4
+                    ELSE text END
              WHERE chat_jid = ?1 AND id = ?2
-               AND COALESCE(media_json, '') != ?3",
-            params![chat_jid, message_id, json],
-        )? > 0)
+               AND (COALESCE(media_json, '') != ?3
+                    OR (?4 IS NOT NULL AND text = '[Video]'))",
+            params![chat_jid, message_id, json, gif_placeholder],
+        )? > 0;
+        if let Some(placeholder) = gif_placeholder {
+            transaction.execute(
+                "UPDATE chats SET last_message = ?3
+                 WHERE jid = ?1 AND last_message = '[Video]'
+                   AND ?2 = (SELECT id FROM messages
+                             WHERE chat_jid = ?1
+                             ORDER BY timestamp DESC LIMIT 1)",
+                params![chat_jid, message_id, placeholder],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(updated)
     }
 
-    pub fn store_image_download(
+    pub fn store_media_download(
         &self,
         chat_jid: &str,
         message_id: &str,
@@ -1045,7 +1121,7 @@ impl Database {
         )? > 0)
     }
 
-    pub fn image_download(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
+    pub fn media_download(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
         let connection = self
             .connection
             .lock()
@@ -1058,6 +1134,22 @@ impl Database {
             )
             .optional()?;
         Ok(payload.flatten())
+    }
+
+    pub fn message_media_kind(&self, chat_jid: &str, message_id: &str) -> Result<Option<String>> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        let kind = connection
+            .query_row(
+                "SELECT json_extract(media_json, '$.kind') FROM messages
+                 WHERE chat_jid = ?1 AND id = ?2",
+                params![chat_jid, message_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(kind.flatten())
     }
 
     pub fn update_label(
@@ -1298,7 +1390,7 @@ impl Database {
             .lock()
             .expect("history database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT c.jid, m.id, m.from_me, m.timestamp
+            "SELECT c.jid, m.id, m.sender_jid, m.from_me, m.timestamp
              FROM chats c
              JOIN messages m ON m.rowid = (
                  SELECT oldest.rowid FROM messages oldest
@@ -1313,11 +1405,12 @@ impl Database {
         let rows = statement.query_map(
             params![i64::from(limit.clamp(1, 100)), CHAT_NAME_UNKNOWN],
             |row| {
-                let timestamp: i64 = row.get(3)?;
+                let timestamp: i64 = row.get(4)?;
                 Ok(HistoryCursor {
                     chat_jid: row.get(0)?,
                     message_id: row.get(1)?,
-                    from_me: row.get(2)?,
+                    sender_jid: row.get(2)?,
+                    from_me: row.get(3)?,
                     timestamp_ms: timestamp.saturating_mul(1_000),
                 })
             },
@@ -1331,36 +1424,29 @@ impl Database {
             .connection
             .lock()
             .expect("history database mutex poisoned");
-        let needs_recovery = connection
-            .query_row(
-                "SELECT 1 FROM messages
-                 WHERE chat_jid = ?1 AND (
-                   (media_json IS NULL
-                    AND text IN ('[Image]', '[Document]', '[Location]', '[Live location]'))
-                   OR (media_json LIKE '%\"kind\":\"image\"%'
-                       AND (media_download IS NULL
-                            OR media_json NOT LIKE '%\"thumbnail_path\"%'))
-                 )
-                 LIMIT 1",
-                [chat_jid],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !needs_recovery {
-            return Ok(None);
-        }
         connection
             .query_row(
-                "SELECT id, from_me, timestamp FROM messages
-                 WHERE chat_jid = ?1 ORDER BY timestamp DESC LIMIT 1",
+                "SELECT id, sender_jid, from_me, timestamp FROM messages
+                 WHERE chat_jid = ?1 AND (
+                   (media_json IS NULL
+                    AND text IN ('[Image]', '[Video]', '[Document]', '[Location]', '[Live location]'))
+                   OR ((media_json LIKE '%\"kind\":\"image\"%'
+                        OR media_json LIKE '%\"kind\":\"video\"%')
+                       AND (media_download IS NULL
+                            OR media_json NOT LIKE '%\"thumbnail_path\"%'))
+                   OR (media_json LIKE '%\"kind\":\"location\"%'
+                       AND media_json LIKE '%\"live\":true%'
+                       AND COALESCE(json_extract(media_json, '$.duration_seconds'), 0) = 0)
+                 )
+                 ORDER BY timestamp DESC LIMIT 1",
                 [chat_jid],
                 |row| {
-                    let timestamp: i64 = row.get(2)?;
+                    let timestamp: i64 = row.get(3)?;
                     Ok(HistoryCursor {
                         chat_jid: chat_jid.to_owned(),
                         message_id: row.get(0)?,
-                        from_me: row.get(1)?,
+                        sender_jid: row.get(1)?,
+                        from_me: row.get(2)?,
                         timestamp_ms: timestamp.saturating_mul(1_000),
                     })
                 },
@@ -1380,15 +1466,16 @@ impl Database {
             .expect("history database mutex poisoned");
         connection
             .query_row(
-                "SELECT id, from_me, timestamp FROM messages
+                "SELECT id, sender_jid, from_me, timestamp FROM messages
                  WHERE chat_jid = ?1 AND id = ?2",
                 params![chat_jid, message_id],
                 |row| {
-                    let timestamp: i64 = row.get(2)?;
+                    let timestamp: i64 = row.get(3)?;
                     Ok(HistoryCursor {
                         chat_jid: chat_jid.to_owned(),
                         message_id: row.get(0)?,
-                        from_me: row.get(1)?,
+                        sender_jid: row.get(1)?,
+                        from_me: row.get(2)?,
                         timestamp_ms: timestamp.saturating_mul(1_000),
                     })
                 },
@@ -1491,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_image_download_metadata_round_trips() {
+    fn nullable_media_download_metadata_round_trips() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(&directory.path().join("history.db")).unwrap();
         database
@@ -1500,20 +1587,112 @@ mod tests {
 
         assert_eq!(
             database
-                .image_download("1@s.whatsapp.net", "image")
+                .media_download("1@s.whatsapp.net", "image")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            database
+                .message_media_kind("1@s.whatsapp.net", "image")
                 .unwrap(),
             None
         );
         assert!(
             database
-                .store_image_download("1@s.whatsapp.net", "image", b"download metadata")
+                .store_media_download("1@s.whatsapp.net", "image", b"download metadata")
                 .unwrap()
         );
         assert_eq!(
             database
-                .image_download("1@s.whatsapp.net", "image")
+                .media_download("1@s.whatsapp.net", "image")
                 .unwrap(),
             Some(b"download metadata".to_vec())
+        );
+        let video_path = directory.path().join("clip.video.mp4");
+        let missing_thumbnail = directory.path().join("missing-thumbnail.jpg");
+        fs::write(&video_path, b"video").unwrap();
+        database
+            .update_message_media(
+                "1@s.whatsapp.net",
+                "image",
+                &MessageMedia::Video {
+                    path: video_path.to_string_lossy().into_owned(),
+                    thumbnail_path: missing_thumbnail.to_string_lossy().into_owned(),
+                    downloaded: false,
+                    mime_type: "video/mp4".into(),
+                    width: 640,
+                    height: 480,
+                    duration_seconds: 10,
+                    gif_playback: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .message_media_kind("1@s.whatsapp.net", "image")
+                .unwrap()
+                .as_deref(),
+            Some("video")
+        );
+        let Some(MessageMedia::Video {
+            downloaded,
+            thumbnail_path,
+            ..
+        }) = database.messages("1@s.whatsapp.net", 10).unwrap()[0]
+            .media
+            .clone()
+        else {
+            panic!("expected stored video")
+        };
+        assert!(downloaded);
+        assert!(thumbnail_path.is_empty());
+    }
+
+    #[test]
+    fn recovered_gif_relabels_legacy_video_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut gif = message("gif", 1);
+        gif.text = "[Video]".into();
+        database.insert_message(&gif, "Ada", false, false).unwrap();
+        database
+            .insert_message(&message("newer-text", 2), "Ada", false, false)
+            .unwrap();
+        assert_eq!(
+            database.media_recovery_cursor("1@s.whatsapp.net").unwrap(),
+            Some(HistoryCursor {
+                chat_jid: "1@s.whatsapp.net".into(),
+                message_id: "gif".into(),
+                sender_jid: "1@s.whatsapp.net".into(),
+                from_me: false,
+                timestamp_ms: 1_000,
+            })
+        );
+
+        database
+            .update_message_media(
+                "1@s.whatsapp.net",
+                "gif",
+                &MessageMedia::Video {
+                    path: "/cache/clip.video.mp4".into(),
+                    thumbnail_path: "/cache/clip.video-thumbnail.jpg".into(),
+                    downloaded: false,
+                    mime_type: "video/mp4".into(),
+                    width: 640,
+                    height: 480,
+                    duration_seconds: 3,
+                    gif_playback: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            database.messages("1@s.whatsapp.net", 10).unwrap()[0].text,
+            "[GIF]"
+        );
+        assert_eq!(
+            database.list_chats(10).unwrap()[0].last_message,
+            "message newer-text"
         );
     }
 
@@ -1688,7 +1867,7 @@ mod tests {
         assert_eq!(chats[0].phone_number.as_deref(), Some("31612345678"));
         assert_eq!(chats[0].last_message, "message recent");
         assert_eq!(chats[0].last_timestamp, 20);
-        assert_eq!(chats[0].unread, 1);
+        assert_eq!(chats[0].unread, 0);
 
         let stored = database.messages(phone_jid, 10).unwrap();
         assert_eq!(
@@ -1816,6 +1995,7 @@ mod tests {
             vec![HistoryCursor {
                 chat_jid: "1@s.whatsapp.net".into(),
                 message_id: "oldest".into(),
+                sender_jid: "1@s.whatsapp.net".into(),
                 from_me: false,
                 timestamp_ms: 10_000,
             }]
@@ -1863,6 +2043,37 @@ mod tests {
     }
 
     #[test]
+    fn live_location_without_duration_exposes_a_recovery_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut live = message("live", 10);
+        live.text = "[Live location]".into();
+        live.media = Some(MessageMedia::Location {
+            latitude_e7: 523_701_600,
+            longitude_e7: 48_953_000,
+            accuracy_m: 8,
+            name: String::new(),
+            address: String::new(),
+            thumbnail_path: None,
+            live: true,
+            updated_at: 10,
+            duration_seconds: 0,
+        });
+        database.insert_message(&live, "Ada", false, false).unwrap();
+
+        assert_eq!(
+            database.media_recovery_cursor(&live.chat_jid).unwrap(),
+            Some(HistoryCursor {
+                chat_jid: live.chat_jid,
+                message_id: live.id,
+                sender_jid: live.sender_jid,
+                from_me: live.from_me,
+                timestamp_ms: live.timestamp * 1_000,
+            })
+        );
+    }
+
+    #[test]
     fn event_state_and_media_updates_round_trip() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(&directory.path().join("history.db")).unwrap();
@@ -1876,6 +2087,7 @@ mod tests {
             thumbnail_path: None,
             live: true,
             updated_at: 10,
+            duration_seconds: 3_600,
         });
         database.insert_message(&rich, "Ada", false, true).unwrap();
         assert_eq!(database.messages(&rich.chat_jid, 10).unwrap()[0], rich);
@@ -1885,6 +2097,12 @@ mod tests {
         database.apply_read_state(&rich.chat_jid, false).unwrap();
         assert_eq!(database.unread_total().unwrap(), 1);
         database.apply_pin(&rich.chat_jid, true).unwrap();
+        database.apply_archive(&rich.chat_jid, true).unwrap();
+        assert_eq!(database.unread_total().unwrap(), 0);
+        assert_eq!(database.list_chats(10).unwrap()[0].unread, 0);
+        database.apply_archive(&rich.chat_jid, false).unwrap();
+        assert_eq!(database.unread_total().unwrap(), 1);
+        assert_eq!(database.list_chats(10).unwrap()[0].unread, 1);
         database.apply_archive(&rich.chat_jid, true).unwrap();
         database.apply_mute(&rich.chat_jid, true, i64::MAX).unwrap();
         assert!(database.is_muted(&rich.chat_jid, 20).unwrap());
@@ -1898,6 +2116,7 @@ mod tests {
             thumbnail_path: None,
             live: true,
             updated_at: 20,
+            duration_seconds: 3_600,
         };
         assert!(
             database
@@ -1907,6 +2126,12 @@ mod tests {
         assert_eq!(
             database.messages(&rich.chat_jid, 10).unwrap()[0].media,
             Some(replacement)
+        );
+        assert!(
+            database
+                .media_recovery_cursor(&rich.chat_jid)
+                .unwrap()
+                .is_none()
         );
         database.clear_chat(&rich.chat_jid, 20).unwrap();
         assert!(database.messages(&rich.chat_jid, 10).unwrap().is_empty());

@@ -1,5 +1,5 @@
 pkgname=omarchy-whatsapp-git
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='Low-footprint native WhatsApp linked-device client for Omarchy'
 arch=('x86_64')
@@ -14,7 +14,7 @@ sha256sums=('SKIP')
 
 pkgver() {
   cd "$pkgname"
-  printf '0.2.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  printf '0.3.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 build() {

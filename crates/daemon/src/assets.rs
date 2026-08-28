@@ -2,11 +2,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::warn;
 use whatsapp_rust::prelude::{Client, Jid, wa};
 
 pub const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_VIDEO_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_DOCUMENT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_AVATAR_BYTES: usize = 1024 * 1024;
 const MAX_AVATAR_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -75,6 +78,186 @@ pub fn message_image_thumbnail_path(directory: &Path, chat_jid: &str, message_id
     ))
 }
 
+fn video_extension(mime_type: Option<&str>) -> &'static str {
+    match mime_type.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "video/mp4" => ".mp4",
+        "video/quicktime" => ".mov",
+        "video/webm" => ".webm",
+        "video/3gpp" => ".3gp",
+        _ => "",
+    }
+}
+
+pub fn message_video_path(
+    directory: &Path,
+    chat_jid: &str,
+    message_id: &str,
+    mime_type: Option<&str>,
+) -> PathBuf {
+    directory.join(format!(
+        "{}-{}.video{}",
+        hex_key(chat_jid),
+        hex_key(message_id),
+        video_extension(mime_type)
+    ))
+}
+
+pub fn message_video_thumbnail_path(directory: &Path, chat_jid: &str, message_id: &str) -> PathBuf {
+    directory.join(format!(
+        "{}-{}.video-thumbnail.jpg",
+        hex_key(chat_jid),
+        hex_key(message_id)
+    ))
+}
+
+fn cached_video_thumbnail_path(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let suffix = [
+        ".video.mp4",
+        ".video.mov",
+        ".video.webm",
+        ".video.3gp",
+        ".video",
+    ]
+    .into_iter()
+    .find(|suffix| name.ends_with(suffix))?;
+    Some(path.with_file_name(format!(
+        "{}.video-thumbnail.jpg",
+        &name[..name.len() - suffix.len()]
+    )))
+}
+
+fn jpeg_file_is_valid(path: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if metadata.len() < 3 || metadata.len() > MAX_IMAGE_BYTES {
+        return false;
+    }
+    let mut header = [0u8; 3];
+    file.read_exact(&mut header).is_ok() && header == [0xff, 0xd8, 0xff]
+}
+
+pub fn ensure_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Result<bool> {
+    if jpeg_file_is_valid(thumbnail_path) {
+        return Ok(false);
+    }
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let temporary = thumbnail_path.with_extension(format!("part-{}.jpg", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-ss",
+            "0.1",
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=w='min(1280,iw)':h=-2",
+            "-q:v",
+            "4",
+        ])
+        .arg(&temporary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting ffmpeg to create a video preview")?;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&temporary);
+            bail!("timed out creating a video preview");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    if !status.success() || !jpeg_file_is_valid(&temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        bail!("ffmpeg did not create a valid video preview");
+    }
+
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    if thumbnail_path.exists() {
+        std::fs::remove_file(thumbnail_path)?;
+    }
+    std::fs::rename(&temporary, thumbnail_path)?;
+    if let Some(directory) = thumbnail_path.parent() {
+        prune_media_cache(directory, thumbnail_path);
+    }
+    Ok(true)
+}
+
+pub fn backfill_message_video_thumbnails(directory: &Path) -> Result<usize> {
+    let mut generated = 0;
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        let Some(thumbnail_path) = cached_video_thumbnail_path(&path) else {
+            continue;
+        };
+        match ensure_message_video_thumbnail(&path, &thumbnail_path) {
+            Ok(true) => generated += 1,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(%error, video = %path.display(), "could not generate video preview")
+            }
+        }
+    }
+    Ok(generated)
+}
+
+fn cache_media_thumbnail(
+    directory: &Path,
+    path: &Path,
+    thumbnail_path: &Path,
+    thumbnail: Option<&Vec<u8>>,
+    declared_full_length: Option<u64>,
+) -> Result<()> {
+    let thumbnail = thumbnail.filter(|bytes| bytes.starts_with(&[0xff, 0xd8, 0xff]));
+
+    // Early image builds wrote previews to the final media path. The declared
+    // plaintext length also makes this safe for future media migrations where
+    // a recovered history record omits its embedded preview.
+    let existing_is_preview = std::fs::metadata(path).is_ok_and(|metadata| {
+        thumbnail.is_some_and(|bytes| metadata.len() == bytes.len() as u64)
+            || declared_full_length.is_some_and(|length| length > 0 && metadata.len() != length)
+    });
+    if existing_is_preview {
+        if !thumbnail_path.exists() {
+            std::fs::rename(path, thumbnail_path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+    } else if !thumbnail_path.exists()
+        && let Some(thumbnail) = thumbnail
+    {
+        write_private_bytes(thumbnail_path, thumbnail)?;
+    }
+    prune_media_cache(directory, thumbnail_path);
+    Ok(())
+}
+
 pub fn cache_message_image_thumbnail(
     directory: &Path,
     chat_jid: &str,
@@ -84,28 +267,33 @@ pub fn cache_message_image_thumbnail(
 ) -> Result<PathBuf> {
     let path = message_image_path(directory, chat_jid, message_id);
     let thumbnail_path = message_image_thumbnail_path(directory, chat_jid, message_id);
-    let thumbnail = thumbnail.filter(|bytes| bytes.starts_with(&[0xff, 0xd8, 0xff]));
+    cache_media_thumbnail(
+        directory,
+        &path,
+        &thumbnail_path,
+        thumbnail,
+        declared_full_length,
+    )?;
+    Ok(thumbnail_path)
+}
 
-    // Early builds wrote the embedded thumbnail to the full-image path. Move
-    // that payload aside so it cannot be mistaken for a completed download.
-    // Recovered history can omit jpeg_thumbnail, so WhatsApp's declared
-    // plaintext length is also used to recognize a tiny legacy preview.
-    let existing_is_preview = std::fs::metadata(&path).is_ok_and(|metadata| {
-        thumbnail.is_some_and(|bytes| metadata.len() == bytes.len() as u64)
-            || declared_full_length.is_some_and(|length| length > 0 && metadata.len() != length)
-    });
-    if existing_is_preview {
-        if !thumbnail_path.exists() {
-            std::fs::rename(&path, &thumbnail_path)?;
-        } else {
-            std::fs::remove_file(&path)?;
-        }
-    } else if !thumbnail_path.exists()
-        && let Some(thumbnail) = thumbnail
-    {
-        write_private_bytes(&thumbnail_path, thumbnail)?;
-    }
-    prune_media_cache(directory, &thumbnail_path);
+pub fn cache_message_video_thumbnail(
+    directory: &Path,
+    chat_jid: &str,
+    message_id: &str,
+    mime_type: Option<&str>,
+    thumbnail: Option<&Vec<u8>>,
+    declared_full_length: Option<u64>,
+) -> Result<PathBuf> {
+    let path = message_video_path(directory, chat_jid, message_id, mime_type);
+    let thumbnail_path = message_video_thumbnail_path(directory, chat_jid, message_id);
+    cache_media_thumbnail(
+        directory,
+        &path,
+        &thumbnail_path,
+        thumbnail,
+        declared_full_length,
+    )?;
     Ok(thumbnail_path)
 }
 
@@ -149,11 +337,17 @@ pub fn remove_message_media(directory: &Path, chat_jid: &str, message_id: &str) 
     let _ = std::fs::remove_file(message_image_thumbnail_path(
         directory, chat_jid, message_id,
     ));
+    let _ = std::fs::remove_file(message_video_thumbnail_path(
+        directory, chat_jid, message_id,
+    ));
     let _ = std::fs::remove_file(location_thumbnail_path(directory, chat_jid, message_id));
-    let prefix = format!("{}-{}.document", hex_key(chat_jid), hex_key(message_id));
+    let document_prefix = format!("{}-{}.document", hex_key(chat_jid), hex_key(message_id));
+    let video_prefix = format!("{}-{}.video", hex_key(chat_jid), hex_key(message_id));
     if let Ok(entries) = std::fs::read_dir(directory) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&document_prefix) || name.starts_with(&video_prefix) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -238,6 +432,12 @@ fn image_bytes_are_safe(bytes: &[u8]) -> bool {
         || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
         || bytes.starts_with(b"GIF87a")
         || bytes.starts_with(b"GIF89a")
+}
+
+fn video_bytes_are_safe(bytes: &[u8]) -> bool {
+    bytes.get(4..8) == Some(b"ftyp")
+        || bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
+        || bytes.starts_with(&[0x00, 0x00, 0x01, 0xba])
 }
 
 pub fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -398,6 +598,56 @@ pub async fn download_message_image(
     }
 }
 
+pub async fn download_message_video(
+    client: Arc<Client>,
+    video: wa::message::VideoMessage,
+    path: PathBuf,
+) -> Result<bool> {
+    let declared = video.file_length.unwrap_or(0);
+    if declared == 0 || declared > MAX_VIDEO_BYTES {
+        bail!("video declares an invalid size of {declared} bytes");
+    }
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == declared) {
+        return Ok(false);
+    }
+    let temporary = path.with_extension(format!("part-{}", std::process::id()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let result = client.download_to_writer(&video, file).await;
+    match result {
+        Ok(mut file) => {
+            let length = file.metadata()?.len();
+            if length != declared || length > MAX_VIDEO_BYTES {
+                let _ = std::fs::remove_file(&temporary);
+                bail!("downloaded video has invalid size {length}");
+            }
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::Start(0))?;
+            let mut header = [0u8; 16];
+            let count = file.read(&mut header)?;
+            if !video_bytes_are_safe(&header[..count]) {
+                let _ = std::fs::remove_file(&temporary);
+                bail!("downloaded media is not a supported video");
+            }
+            drop(file);
+            std::fs::rename(&temporary, &path)?;
+            if let Some(directory) = path.parent() {
+                prune_directory(directory, MAX_MEDIA_CACHE_BYTES, &path);
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(anyhow!(error)).context("downloading WhatsApp video")
+        }
+    }
+}
+
 pub async fn download_message_document(
     client: Arc<Client>,
     document: wa::message::DocumentMessage,
@@ -465,6 +715,19 @@ mod tests {
             unsafe_name.file_name().unwrap(),
             "31323340672e7573-6d657373616765.document"
         );
+        let video = message_video_path(directory, "123@g.us", "clip", Some("video/mp4"));
+        assert_eq!(
+            video.file_name().unwrap(),
+            "31323340672e7573-636c6970.video.mp4"
+        );
+        assert_eq!(
+            cached_video_thumbnail_path(&video)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "31323340672e7573-636c6970.video-thumbnail.jpg"
+        );
+        assert!(cached_video_thumbnail_path(Path::new("/tmp/cache/not-video.mp4")).is_none());
     }
 
     #[test]
@@ -474,6 +737,9 @@ mod tests {
         assert!(!image_bytes_are_safe(
             b"<svg xmlns='http://www.w3.org/2000/svg'>"
         ));
+        assert!(video_bytes_are_safe(b"\0\0\0\x18ftypisom"));
+        assert!(video_bytes_are_safe(b"\x1a\x45\xdf\xa3webm"));
+        assert!(!video_bytes_are_safe(b"<html>not a video"));
     }
 
     #[test]
