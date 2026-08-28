@@ -24,7 +24,7 @@ use std::sync::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{error, info, warn};
 use whatsapp_rust::prelude::*;
@@ -58,6 +58,7 @@ struct Shared {
     media_dir: PathBuf,
     avatar_revision: AtomicU64,
     app_state_failed: AtomicBool,
+    group_name_sync: Mutex<()>,
     media_recovery_requested: RwLock<HashSet<String>>,
 }
 
@@ -235,10 +236,17 @@ impl Shared {
         };
         let focused = self.active_chat.read().await.as_deref() == Some(chat_jid.as_str());
         let unread = !message.from_me && !focused;
-        match self
-            .database
-            .insert_message(&message, &chat_name, info.source.is_group, unread)
+        let insert_result =
+            self.database
+                .insert_message(&message, &chat_name, info.source.is_group, unread);
+        if insert_result.is_ok()
+            && info.source.is_group
+            && chat_name != chat_jid
+            && let Err(error) = self.database.update_group_name(&chat_jid, &chat_name)
         {
+            warn!(%error, %chat_jid, "could not persist incoming group subject");
+        }
+        match insert_result {
             Ok(true) => {
                 let _ = self.events.send(ServerFrame::event(ServerEvent::Message {
                     message: message.clone(),
@@ -873,6 +881,7 @@ fn ingest_contact_name(shared: &Shared, update: &whatsapp_rust::types::events::C
 }
 
 async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
+    let _guard = shared.group_name_sync.lock().await;
     match client.groups().get_participating().await {
         Ok(groups) => {
             let mut updated = 0usize;
@@ -898,13 +907,26 @@ async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
                 let Ok(jid) = raw_jid.parse::<Jid>() else {
                     continue;
                 };
-                if let Ok(metadata) = client.groups().get_metadata(&jid).await
-                    && shared
-                        .database
-                        .update_group_name(&raw_jid, &metadata.subject)
-                        .unwrap_or(false)
-                {
-                    updated += 1;
+                match client.groups().get_metadata(&jid).await {
+                    Ok(metadata) => {
+                        if nonempty(&metadata.subject).is_none() {
+                            warn!(%jid, "WhatsApp returned an empty group subject");
+                        } else {
+                            match shared
+                                .database
+                                .update_group_name(&raw_jid, &metadata.subject)
+                            {
+                                Ok(true) => updated += 1,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    warn!(%error, %jid, "could not persist recovered WhatsApp group subject")
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, %jid, "could not recover WhatsApp group subject")
+                    }
                 }
             }
             if updated > 0 {
@@ -1532,6 +1554,7 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
         Event::OfflineSyncCompleted(details) => {
             info!(count = details.count, "WhatsApp offline sync completed");
             broadcast_snapshot(&shared);
+            tokio::spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
         }
         Event::DirtyState(details) => {
             info!(kind = ?details.dirty_type, "WhatsApp requested derived-state refresh");
@@ -1711,6 +1734,7 @@ async fn main() -> Result<()> {
         media_dir,
         avatar_revision: AtomicU64::new(0),
         app_state_failed: AtomicBool::new(false),
+        group_name_sync: Mutex::new(()),
         media_recovery_requested: RwLock::new(HashSet::new()),
     });
 
@@ -2100,6 +2124,13 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             let chat_name = shared
                 .database
                 .chat_name(&message.chat_jid)?
+                .or_else(|| {
+                    shared
+                        .database
+                        .contact_name(&message.chat_jid)
+                        .ok()
+                        .flatten()
+                })
                 .unwrap_or_else(|| message.chat_jid.clone());
             shared
                 .database
@@ -2263,6 +2294,7 @@ mod tests {
             media_dir: directory.path().join("media"),
             avatar_revision: AtomicU64::new(0),
             app_state_failed: AtomicBool::new(false),
+            group_name_sync: Mutex::new(()),
             media_recovery_requested: RwLock::new(HashSet::new()),
         }
     }

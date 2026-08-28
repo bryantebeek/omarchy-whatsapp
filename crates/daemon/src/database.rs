@@ -2,8 +2,15 @@ use anyhow::{Context, Result};
 use omarchy_whatsapp_protocol::{Chat, Message, MessageMedia, Reaction};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
+
+const CHAT_NAME_UNKNOWN: i64 = 0;
+const CHAT_NAME_HISTORY: i64 = 10;
+const CHAT_NAME_MESSAGE: i64 = 20;
+const CHAT_NAME_GROUP_METADATA: i64 = 30;
+const CHAT_NAME_ADDRESS_BOOK: i64 = 40;
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -35,6 +42,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS chats (
                 jid            TEXT PRIMARY KEY,
                 name           TEXT NOT NULL,
+                name_source    INTEGER NOT NULL DEFAULT 0,
                 phone_number   TEXT,
                 last_message   TEXT NOT NULL DEFAULT '',
                 last_timestamp INTEGER NOT NULL DEFAULT 0,
@@ -129,6 +137,10 @@ impl Database {
         let _ = connection.execute("ALTER TABLE messages ADD COLUMN media_json TEXT", []);
         let _ = connection.execute("ALTER TABLE chats ADD COLUMN phone_number TEXT", []);
         let _ = connection.execute(
+            "ALTER TABLE chats ADD COLUMN name_source INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute(
             "ALTER TABLE chat_settings ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
             [],
         );
@@ -136,6 +148,29 @@ impl Database {
             "ALTER TABLE chat_settings ADD COLUMN cleared_at INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // A JID is an identifier, never a chat name. Legacy databases stored
+        // it in `name` as a rendering fallback, which made later syncs unable
+        // to distinguish missing metadata from a real title.
+        connection.execute(
+            "UPDATE chats SET name = '', name_source = ?1
+             WHERE TRIM(name) = '' OR name = jid",
+            [CHAT_NAME_UNKNOWN],
+        )?;
+        connection.execute(
+            "UPDATE chats SET name_source = ?1
+             WHERE name_source = ?2 AND name != ''",
+            params![CHAT_NAME_HISTORY, CHAT_NAME_UNKNOWN],
+        )?;
+        connection.execute(
+            "UPDATE chats SET
+                name = contacts.name,
+                name_source = CASE contacts.source WHEN 1 THEN ?1 ELSE ?2 END
+             FROM contacts
+             WHERE chats.jid = contacts.jid AND chats.is_group = 0
+               AND (chats.name_source = ?3 OR chats.name = contacts.name)",
+            params![CHAT_NAME_ADDRESS_BOOK, CHAT_NAME_MESSAGE, CHAT_NAME_UNKNOWN],
+        )?;
+        Self::restore_legacy_chat_names(&connection, path);
         // Early builds represented protocol/control envelopes and unknown
         // add-ons as user-visible placeholder bubbles. They contain no
         // recoverable user content and must not survive after renderability is
@@ -165,6 +200,39 @@ impl Database {
         })
     }
 
+    fn restore_legacy_chat_names(connection: &Connection, database_path: &Path) {
+        let Some(state_dir) = database_path.parent() else {
+            return;
+        };
+        let Ok(contents) = fs::read(state_dir.join("store.json")) else {
+            return;
+        };
+        let Ok(store) = serde_json::from_slice::<serde_json::Value>(&contents) else {
+            return;
+        };
+        let Some(chats) = store.get("chats").and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        for chat in chats {
+            let Some(jid) = chat.get("jid").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(name) = chat
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && *name != "Group" && *name != jid)
+            else {
+                continue;
+            };
+            let _ = connection.execute(
+                "UPDATE chats SET name = ?2, name_source = ?3
+                 WHERE jid = ?1 AND name_source = ?4",
+                params![jid, name, CHAT_NAME_HISTORY, CHAT_NAME_UNKNOWN],
+            );
+        }
+    }
+
     pub fn insert_message(
         &self,
         message: &Message,
@@ -192,6 +260,14 @@ impl Database {
         increment_unread: bool,
         from_history: bool,
     ) -> Result<bool> {
+        let candidate = chat_name.trim();
+        let (candidate, name_source) = if candidate.is_empty() || candidate == message.chat_jid {
+            ("", CHAT_NAME_UNKNOWN)
+        } else if from_history {
+            (candidate, CHAT_NAME_HISTORY)
+        } else {
+            (candidate, CHAT_NAME_MESSAGE)
+        };
         let mut connection = self
             .connection
             .lock()
@@ -226,10 +302,10 @@ impl Database {
             )?;
         }
         transaction.execute(
-            "INSERT INTO chats (jid, name, last_message, last_timestamp, unread, is_group)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO chats
+             (jid, name, name_source, last_message, last_timestamp, unread, is_group)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(jid) DO UPDATE SET
-                name = CASE WHEN excluded.name = '' THEN chats.name ELSE excluded.name END,
                 last_message = CASE
                     WHEN excluded.last_timestamp >= chats.last_timestamp
                     THEN excluded.last_message ELSE chats.last_message END,
@@ -237,7 +313,8 @@ impl Database {
                 is_group = excluded.is_group",
             params![
                 message.chat_jid,
-                chat_name,
+                candidate,
+                name_source,
                 message.text,
                 message.timestamp,
                 0,
@@ -365,6 +442,12 @@ impl Database {
     }
 
     pub fn insert_history_chat(&self, chat: &Chat) -> Result<()> {
+        let candidate = chat.name.trim();
+        let (candidate, name_source) = if candidate.is_empty() || candidate == chat.jid {
+            ("", CHAT_NAME_UNKNOWN)
+        } else {
+            (candidate, CHAT_NAME_HISTORY)
+        };
         let mut connection = self
             .connection
             .lock()
@@ -383,20 +466,25 @@ impl Database {
             return Ok(());
         }
         transaction.execute(
-            "INSERT INTO chats (jid, name, last_message, last_timestamp, unread, is_group)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO chats
+             (jid, name, name_source, last_message, last_timestamp, unread, is_group)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(jid) DO UPDATE SET
-                name = CASE WHEN chats.name = chats.jid AND excluded.name != ''
-                            THEN excluded.name ELSE chats.name END,
+                name = CASE
+                    WHEN chats.name_source = ?8 AND excluded.name_source > ?8
+                    THEN excluded.name ELSE chats.name END,
+                name_source = MAX(chats.name_source, excluded.name_source),
                 last_timestamp = MAX(chats.last_timestamp, excluded.last_timestamp),
                 is_group = excluded.is_group",
             params![
                 chat.jid,
-                chat.name,
+                candidate,
+                name_source,
                 chat.last_message,
                 chat.last_timestamp,
                 chat.unread,
                 chat.is_group,
+                CHAT_NAME_UNKNOWN,
             ],
         )?;
         transaction.execute(
@@ -445,9 +533,15 @@ impl Database {
                 source = excluded.source",
             params![jid, name.trim(), source],
         )?;
+        let chat_name_source = if source > 0 {
+            CHAT_NAME_ADDRESS_BOOK
+        } else {
+            CHAT_NAME_MESSAGE
+        };
         transaction.execute(
-            "UPDATE chats SET name = ?2 WHERE jid = ?1 AND is_group = 0",
-            params![jid, name.trim()],
+            "UPDATE chats SET name = ?2, name_source = ?3
+             WHERE jid = ?1 AND is_group = 0 AND name_source <= ?3",
+            params![jid, name.trim(), chat_name_source],
         )?;
         transaction.execute(
             "UPDATE messages SET sender_name = ?2 WHERE sender_jid = ?1",
@@ -466,8 +560,10 @@ impl Database {
             .lock()
             .expect("history database mutex poisoned");
         Ok(connection.execute(
-            "UPDATE chats SET name = ?2 WHERE jid = ?1 AND is_group = 1 AND name != ?2",
-            params![jid, name.trim()],
+            "UPDATE chats SET name = ?2, name_source = ?3
+             WHERE jid = ?1 AND is_group = 1
+               AND (name != ?2 OR name_source != ?3)",
+            params![jid, name.trim(), CHAT_NAME_GROUP_METADATA],
         )? > 0)
     }
 
@@ -1004,13 +1100,14 @@ impl Database {
         transaction.execute("DELETE FROM reactions WHERE reactor_jid = ?1", [old_jid])?;
         transaction.execute(
             "INSERT INTO chats
-             (jid, name, phone_number, last_message, last_timestamp, unread, is_group)
-             SELECT ?2, name, phone_number, last_message, last_timestamp, unread, is_group
+             (jid, name, name_source, phone_number, last_message, last_timestamp, unread, is_group)
+             SELECT ?2, name, name_source, phone_number, last_message, last_timestamp, unread, is_group
              FROM chats WHERE jid = ?1
              ON CONFLICT(jid) DO UPDATE SET
                 name = CASE
-                    WHEN chats.name = chats.jid OR chats.name = '' THEN excluded.name
+                    WHEN excluded.name_source > chats.name_source THEN excluded.name
                     ELSE chats.name END,
+                name_source = MAX(chats.name_source, excluded.name_source),
                 phone_number = COALESCE(chats.phone_number, excluded.phone_number),
                 last_message = CASE
                     WHEN excluded.last_timestamp >= chats.last_timestamp
@@ -1091,10 +1188,13 @@ impl Database {
         )?;
         transaction.execute("DELETE FROM chat_settings WHERE jid = ?1", [old_jid])?;
         transaction.execute(
-            "UPDATE chats SET name = (SELECT name FROM contacts WHERE jid = ?1)
+            "UPDATE chats SET
+                name = (SELECT name FROM contacts WHERE jid = ?1),
+                name_source = (SELECT CASE source WHEN 1 THEN ?2 ELSE ?3 END
+                               FROM contacts WHERE jid = ?1)
              WHERE jid = ?1 AND is_group = 0
                AND EXISTS (SELECT 1 FROM contacts WHERE jid = ?1)",
-            [new_jid],
+            params![new_jid, CHAT_NAME_ADDRESS_BOOK, CHAT_NAME_MESSAGE],
         )?;
         transaction.execute(
             "UPDATE messages SET sender_name = (SELECT name FROM contacts WHERE jid = ?1)
@@ -1114,9 +1214,11 @@ impl Database {
             .lock()
             .expect("history database mutex poisoned");
         connection
-            .query_row("SELECT name FROM chats WHERE jid = ?1", [chat_jid], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT name FROM chats WHERE jid = ?1 AND name_source > ?2 AND name != ''",
+                params![chat_jid, CHAT_NAME_UNKNOWN],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(Into::into)
     }
@@ -1128,13 +1230,14 @@ impl Database {
             .expect("history database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT jid FROM chats
-             WHERE is_group = ?1 AND name = jid
-             ORDER BY last_timestamp DESC LIMIT ?2",
+             WHERE is_group = ?1
+               AND (name_source = ?2 OR TRIM(name) = '' OR name = jid)
+             ORDER BY last_timestamp DESC LIMIT ?3",
         )?;
-        let rows = statement
-            .query_map(params![is_group, i64::from(limit.clamp(1, 500))], |row| {
-                row.get(0)
-            })?;
+        let rows = statement.query_map(
+            params![is_group, CHAT_NAME_UNKNOWN, i64::from(limit.clamp(1, 500))],
+            |row| row.get(0),
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -1152,19 +1255,23 @@ impl Database {
                  WHERE oldest.chat_jid = c.jid
                  ORDER BY oldest.timestamp ASC LIMIT 1
              )
-             WHERE c.is_group = 0 AND c.name = c.jid
+             WHERE c.is_group = 0
+               AND (c.name_source = ?2 OR TRIM(c.name) = '' OR c.name = c.jid)
                AND c.jid != '0@s.whatsapp.net'
              ORDER BY c.last_timestamp DESC LIMIT ?1",
         )?;
-        let rows = statement.query_map([i64::from(limit.clamp(1, 100))], |row| {
-            let timestamp: i64 = row.get(3)?;
-            Ok(HistoryCursor {
-                chat_jid: row.get(0)?,
-                message_id: row.get(1)?,
-                from_me: row.get(2)?,
-                timestamp_ms: timestamp.saturating_mul(1_000),
-            })
-        })?;
+        let rows = statement.query_map(
+            params![i64::from(limit.clamp(1, 100)), CHAT_NAME_UNKNOWN],
+            |row| {
+                let timestamp: i64 = row.get(3)?;
+                Ok(HistoryCursor {
+                    chat_jid: row.get(0)?,
+                    message_id: row.get(1)?,
+                    from_me: row.get(2)?,
+                    timestamp_ms: timestamp.saturating_mul(1_000),
+                })
+            },
+        )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -1527,6 +1634,60 @@ mod tests {
         );
         assert_eq!(database.list_chats(10).unwrap()[0].name, "Friends");
         assert!(database.unresolved_chat_jids(true, 10).unwrap().is_empty());
+
+        let mut replayed = message("history", 2);
+        replayed.chat_jid = "123-456@g.us".into();
+        database
+            .insert_history_chat(&Chat {
+                jid: replayed.chat_jid.clone(),
+                name: replayed.chat_jid.clone(),
+                phone_number: None,
+                last_message: replayed.text.clone(),
+                last_timestamp: replayed.timestamp,
+                unread: 0,
+                is_group: true,
+            })
+            .unwrap();
+        database
+            .insert_history_message(&replayed, "123-456@g.us", true)
+            .unwrap();
+        assert_eq!(database.list_chats(10).unwrap()[0].name, "Friends");
+
+        assert!(
+            database
+                .update_group_name("123-456@g.us", "Renamed friends")
+                .unwrap()
+        );
+        assert_eq!(database.list_chats(10).unwrap()[0].name, "Renamed friends");
+    }
+
+    #[test]
+    fn legacy_store_recovers_an_unresolved_name_without_allowing_replay_to_downgrade_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        {
+            let database = Database::open(&path).unwrap();
+            let mut group_message = message("one", 1);
+            group_message.chat_jid = "123-456@g.us".into();
+            database
+                .insert_message(&group_message, "123-456@g.us", true, false)
+                .unwrap();
+            assert_eq!(database.list_chats(10).unwrap()[0].name, "");
+        }
+        fs::write(
+            directory.path().join("store.json"),
+            r#"{"chats":[{"jid":"123-456@g.us","name":"Friends"}]}"#,
+        )
+        .unwrap();
+
+        let database = Database::open(&path).unwrap();
+        assert_eq!(database.list_chats(10).unwrap()[0].name, "Friends");
+        let mut replayed = message("history", 2);
+        replayed.chat_jid = "123-456@g.us".into();
+        database
+            .insert_history_message(&replayed, "123-456@g.us", true)
+            .unwrap();
+        assert_eq!(database.list_chats(10).unwrap()[0].name, "Friends");
     }
 
     #[test]
