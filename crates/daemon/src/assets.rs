@@ -67,6 +67,48 @@ pub fn message_image_path(directory: &Path, chat_jid: &str, message_id: &str) ->
     directory.join(format!("{}-{}.img", hex_key(chat_jid), hex_key(message_id)))
 }
 
+pub fn message_image_thumbnail_path(directory: &Path, chat_jid: &str, message_id: &str) -> PathBuf {
+    directory.join(format!(
+        "{}-{}.thumbnail.jpg",
+        hex_key(chat_jid),
+        hex_key(message_id)
+    ))
+}
+
+pub fn cache_message_image_thumbnail(
+    directory: &Path,
+    chat_jid: &str,
+    message_id: &str,
+    thumbnail: Option<&Vec<u8>>,
+    declared_full_length: Option<u64>,
+) -> Result<PathBuf> {
+    let path = message_image_path(directory, chat_jid, message_id);
+    let thumbnail_path = message_image_thumbnail_path(directory, chat_jid, message_id);
+    let thumbnail = thumbnail.filter(|bytes| bytes.starts_with(&[0xff, 0xd8, 0xff]));
+
+    // Early builds wrote the embedded thumbnail to the full-image path. Move
+    // that payload aside so it cannot be mistaken for a completed download.
+    // Recovered history can omit jpeg_thumbnail, so WhatsApp's declared
+    // plaintext length is also used to recognize a tiny legacy preview.
+    let existing_is_preview = std::fs::metadata(&path).is_ok_and(|metadata| {
+        thumbnail.is_some_and(|bytes| metadata.len() == bytes.len() as u64)
+            || declared_full_length.is_some_and(|length| length > 0 && metadata.len() != length)
+    });
+    if existing_is_preview {
+        if !thumbnail_path.exists() {
+            std::fs::rename(&path, &thumbnail_path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    } else if !thumbnail_path.exists()
+        && let Some(thumbnail) = thumbnail
+    {
+        write_private_bytes(&thumbnail_path, thumbnail)?;
+    }
+    prune_media_cache(directory, &thumbnail_path);
+    Ok(thumbnail_path)
+}
+
 fn safe_document_extension(file_name: &str) -> Option<String> {
     let extension = Path::new(file_name).extension()?.to_str()?;
     (!extension.is_empty()
@@ -104,6 +146,9 @@ pub fn location_thumbnail_path(directory: &Path, chat_jid: &str, message_id: &st
 
 pub fn remove_message_media(directory: &Path, chat_jid: &str, message_id: &str) {
     let _ = std::fs::remove_file(message_image_path(directory, chat_jid, message_id));
+    let _ = std::fs::remove_file(message_image_thumbnail_path(
+        directory, chat_jid, message_id,
+    ));
     let _ = std::fs::remove_file(location_thumbnail_path(directory, chat_jid, message_id));
     let prefix = format!("{}-{}.document", hex_key(chat_jid), hex_key(message_id));
     if let Ok(entries) = std::fs::read_dir(directory) {
@@ -308,12 +353,12 @@ pub async fn download_message_image(
     image: wa::message::ImageMessage,
     path: PathBuf,
 ) -> Result<bool> {
-    if path.exists() {
-        return Ok(false);
-    }
     let declared = image.file_length.unwrap_or(0);
     if declared == 0 || declared > MAX_IMAGE_BYTES {
         bail!("image declares an invalid size of {declared} bytes");
+    }
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == declared) {
+        return Ok(false);
     }
     let temporary = path.with_extension(format!("part-{}", std::process::id()));
     let file = OpenOptions::new()
@@ -429,6 +474,23 @@ mod tests {
         assert!(!image_bytes_are_safe(
             b"<svg xmlns='http://www.w3.org/2000/svg'>"
         ));
+    }
+
+    #[test]
+    fn legacy_thumbnail_is_moved_out_of_the_full_image_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("media");
+        private_dir(&media).unwrap();
+        let thumbnail = b"\xff\xd8\xffsmall-preview".to_vec();
+        let full_path = message_image_path(&media, "1@s.whatsapp.net", "photo");
+        write_private_bytes(&full_path, &thumbnail).unwrap();
+
+        let thumbnail_path =
+            cache_message_image_thumbnail(&media, "1@s.whatsapp.net", "photo", None, Some(10_000))
+                .unwrap();
+
+        assert!(!full_path.exists());
+        assert_eq!(std::fs::read(thumbnail_path).unwrap(), thumbnail);
     }
 
     #[test]

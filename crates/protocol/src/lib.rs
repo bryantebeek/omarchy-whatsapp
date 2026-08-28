@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -61,6 +61,10 @@ pub struct Reaction {
 pub enum MessageMedia {
     Image {
         path: String,
+        #[serde(default)]
+        thumbnail_path: String,
+        #[serde(default)]
+        downloaded: bool,
         mime_type: String,
         width: u32,
         height: u32,
@@ -98,6 +102,10 @@ pub enum Command {
     SendMessage {
         chat_jid: String,
         text: String,
+    },
+    DownloadImage {
+        chat_jid: String,
+        message_id: String,
     },
     React {
         chat_jid: String,
@@ -285,6 +293,8 @@ mod tests {
             from_me: false,
             media: Some(MessageMedia::Image {
                 path: "/private/cache/image-1.img".into(),
+                thumbnail_path: "/private/cache/image-1.thumbnail.jpg".into(),
+                downloaded: false,
                 mime_type: "image/jpeg".into(),
                 width: 640,
                 height: 480,
@@ -297,6 +307,25 @@ mod tests {
         };
         let json = serde_json::to_string(&message).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);
+    }
+
+    #[test]
+    fn legacy_image_media_defaults_to_an_undownloaded_preview() {
+        let media = serde_json::from_str::<MessageMedia>(
+            r#"{"kind":"image","path":"/cache/legacy.img","mime_type":"image/jpeg","width":71,"height":48}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            media,
+            MessageMedia::Image {
+                path: "/cache/legacy.img".into(),
+                thumbnail_path: String::new(),
+                downloaded: false,
+                mime_type: "image/jpeg".into(),
+                width: 71,
+                height: 48,
+            }
+        );
     }
 
     #[test]

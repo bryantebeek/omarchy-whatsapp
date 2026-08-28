@@ -6,6 +6,7 @@ mod event_coverage;
 mod notification;
 
 use anyhow::{Context, Result, anyhow, bail};
+use buffa::Message as _;
 use chrono::Utc;
 use clap::Parser;
 use database::Database;
@@ -60,13 +61,15 @@ struct Shared {
     app_state_failed: AtomicBool,
     group_name_sync: Mutex<()>,
     media_recovery_requested: RwLock<HashSet<String>>,
+    image_downloads: Mutex<HashSet<String>>,
 }
 
 #[derive(Clone)]
 enum PendingMedia {
     Image {
         image: wa::message::ImageMessage,
-        path: PathBuf,
+        chat_jid: String,
+        message_id: String,
     },
     Document {
         document: wa::message::DocumentMessage,
@@ -239,6 +242,14 @@ impl Shared {
         let insert_result =
             self.database
                 .insert_message(&message, &chat_name, info.source.is_group, unread);
+        if let Some(image) = base.image_message.as_option()
+            && let Err(error) =
+                self.database
+                    .store_image_download(&chat_jid, &info.id, &image.encode_to_vec())
+        {
+            warn!(%error, %chat_jid, message_id = %info.id,
+                "could not persist WhatsApp image download metadata");
+        }
         if insert_result.is_ok()
             && info.source.is_group
             && chat_name != chat_jid
@@ -263,21 +274,6 @@ impl Shared {
                         .unwrap_or(false)
                 {
                     notification::send(&message, &chat_name, info.source.is_group);
-                }
-                if let Some(image) = base.image_message.as_option().cloned() {
-                    let shared = Arc::clone(self);
-                    let client = Arc::clone(&context.client);
-                    let path = assets::message_image_path(&self.media_dir, &chat_jid, &info.id);
-                    let media_chat_jid = chat_jid.clone();
-                    tokio::spawn(async move {
-                        match assets::download_message_image(client, image, path).await {
-                            Ok(true) => broadcast_messages(&shared, &media_chat_jid),
-                            Ok(false) => {}
-                            Err(error) => {
-                                warn!(%error, chat_jid = %media_chat_jid, "could not cache WhatsApp image")
-                            }
-                        }
-                    });
                 }
                 if let Some(document) = base.document_message.as_option().cloned() {
                     let shared = Arc::clone(self);
@@ -319,6 +315,7 @@ impl Shared {
         lazy: &whatsapp_rust::types::events::LazyHistorySync,
     ) -> Result<Vec<PendingMedia>> {
         let mut pending_media = Vec::new();
+        let mut pending_documents = 0;
         let mut stream = lazy.stream();
         while let Some(conversation) = stream.next_conversation()? {
             let chat_jid = normalize_jid(&conversation.id);
@@ -352,23 +349,21 @@ impl Shared {
                         return None;
                     }
                     let result = history_message(&chat_jid, &chat_name, wire, &self.media_dir);
-                    if pending_media.len() < 128
-                        && let Some(base) = wire
-                            .message
-                            .as_option()
-                            .map(|message| message.get_base_message())
+                    if let Some(base) = wire
+                        .message
+                        .as_option()
+                        .map(|message| message.get_base_message())
                         && let Some(message) = &result
                     {
                         if let Some(image) = base.image_message.as_option().cloned() {
                             pending_media.push(PendingMedia::Image {
-                                path: assets::message_image_path(
-                                    &self.media_dir,
-                                    &chat_jid,
-                                    &message.id,
-                                ),
                                 image,
+                                chat_jid: chat_jid.clone(),
+                                message_id: message.id.clone(),
                             });
-                        } else if let Some(document) = base.document_message.as_option().cloned() {
+                        } else if pending_documents < 128
+                            && let Some(document) = base.document_message.as_option().cloned()
+                        {
                             let path = assets::message_document_path(
                                 &self.media_dir,
                                 &chat_jid,
@@ -376,6 +371,7 @@ impl Shared {
                                 document.file_name.as_deref().unwrap_or_default(),
                             );
                             pending_media.push(PendingMedia::Document { document, path });
+                            pending_documents += 1;
                         }
                     }
                     result
@@ -598,16 +594,29 @@ fn message_media(
 ) -> Option<MessageMedia> {
     if let Some(image) = message.image_message.as_option() {
         let path = assets::message_image_path(directory, chat_jid, message_id);
-        if !path.exists()
-            && let Some(thumbnail) = image.jpeg_thumbnail.as_ref()
-            && thumbnail.starts_with(&[0xff, 0xd8, 0xff])
-            && let Err(error) = assets::write_private_bytes(&path, thumbnail)
-        {
+        let thumbnail_path = assets::cache_message_image_thumbnail(
+            directory,
+            chat_jid,
+            message_id,
+            image.jpeg_thumbnail.as_ref(),
+            image.file_length,
+        )
+        .unwrap_or_else(|error| {
             warn!(%error, "could not cache WhatsApp image thumbnail");
-        }
-        assets::prune_media_cache(directory, &path);
+            assets::message_image_thumbnail_path(directory, chat_jid, message_id)
+        });
+        assets::prune_media_cache(
+            directory,
+            if path.exists() {
+                &path
+            } else {
+                &thumbnail_path
+            },
+        );
         return Some(MessageMedia::Image {
             path: path.to_string_lossy().into_owned(),
+            thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+            downloaded: path.exists(),
             mime_type: image
                 .mimetype
                 .clone()
@@ -1038,11 +1047,18 @@ async fn download_pending_media(
 ) {
     let downloaded = futures::stream::iter(media.into_iter().map(|pending| {
         let client = Arc::clone(&client);
+        let shared = Arc::clone(&shared);
         async move {
             match pending {
-                PendingMedia::Image { image, path } => {
-                    assets::download_message_image(client, image, path).await
-                }
+                PendingMedia::Image {
+                    image,
+                    chat_jid,
+                    message_id,
+                } => shared.database.store_image_download(
+                    &chat_jid,
+                    &message_id,
+                    &image.encode_to_vec(),
+                ),
                 PendingMedia::Document { document, path } => {
                     assets::download_message_document(client, document, path).await
                 }
@@ -1736,6 +1752,7 @@ async fn main() -> Result<()> {
         app_state_failed: AtomicBool::new(false),
         group_name_sync: Mutex::new(()),
         media_recovery_requested: RwLock::new(HashSet::new()),
+        image_downloads: Mutex::new(HashSet::new()),
     });
 
     let ipc_shared = Arc::clone(&shared);
@@ -2049,6 +2066,44 @@ async fn canonical_requested_jid(shared: &Shared, raw: &str) -> String {
     }
 }
 
+async fn image_download_payload(
+    shared: &Arc<Shared>,
+    client: &Arc<Client>,
+    chat_jid: &str,
+    message_id: &str,
+) -> Result<Vec<u8>> {
+    if let Some(payload) = shared.database.image_download(chat_jid, message_id)? {
+        return Ok(payload);
+    }
+
+    let cursor = shared
+        .database
+        .message_history_cursor(chat_jid, message_id)?
+        .ok_or_else(|| anyhow!("image message is no longer in local history"))?;
+    let jid: Jid = chat_jid.parse().context("invalid image chat JID")?;
+    client
+        .fetch_message_history(
+            &jid,
+            &cursor.message_id,
+            cursor.from_me,
+            cursor.timestamp_ms,
+            3,
+        )
+        .await
+        .context("requesting image download metadata")?;
+
+    // History responses arrive through the normal event pipeline. Give that
+    // pipeline a short bounded window to persist the exact media keys before
+    // reporting that an old image is unavailable.
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Some(payload) = shared.database.image_download(chat_jid, message_id)? {
+            return Ok(payload);
+        }
+    }
+    bail!("WhatsApp did not return download details for this image")
+}
+
 async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<ServerEvent> {
     match command {
         Command::GetState => Ok(shared.state_event().await),
@@ -2139,6 +2194,70 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 message: message.clone(),
             }));
             Ok(ServerEvent::Sent { message })
+        }
+        Command::DownloadImage {
+            chat_jid,
+            message_id,
+        } => {
+            if message_id.is_empty() || message_id.len() > 512 {
+                bail!("invalid image message ID");
+            }
+            let client = shared
+                .client
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+            let chat_jid = canonical_requested_jid(shared, &chat_jid).await;
+            let key = format!("{chat_jid}\0{message_id}");
+            {
+                let mut downloads = shared.image_downloads.lock().await;
+                if !downloads.insert(key.clone()) {
+                    bail!("this image is already downloading");
+                }
+            }
+
+            let result = async {
+                let payload =
+                    image_download_payload(shared, &client, &chat_jid, &message_id).await?;
+                let image = wa::message::ImageMessage::decode_from_slice(&payload)
+                    .context("reading image download metadata")?;
+                let path = assets::message_image_path(&shared.media_dir, &chat_jid, &message_id);
+                let thumbnail_path = assets::cache_message_image_thumbnail(
+                    &shared.media_dir,
+                    &chat_jid,
+                    &message_id,
+                    image.jpeg_thumbnail.as_ref(),
+                    image.file_length,
+                )?;
+                shared.database.update_message_media(
+                    &chat_jid,
+                    &message_id,
+                    &MessageMedia::Image {
+                        path: path.to_string_lossy().into_owned(),
+                        thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+                        downloaded: path.exists(),
+                        mime_type: image
+                            .mimetype
+                            .clone()
+                            .unwrap_or_else(|| "image/jpeg".to_owned()),
+                        width: image.width.unwrap_or(0),
+                        height: image.height.unwrap_or(0),
+                    },
+                )?;
+                assets::download_message_image(client, image, path).await?;
+                Result::<()>::Ok(())
+            }
+            .await;
+            shared.image_downloads.lock().await.remove(&key);
+            result?;
+
+            broadcast_messages(shared, &chat_jid);
+            Ok(ServerEvent::Messages {
+                messages: shared.database.messages(&chat_jid, 300)?,
+                first_unread_message_id: shared.database.first_unread_message_id(&chat_jid)?,
+                chat_jid,
+            })
         }
         Command::React {
             chat_jid,
@@ -2274,7 +2393,7 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buffa::{Message as _, MessageField};
+    use buffa::MessageField;
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
 
@@ -2296,6 +2415,7 @@ mod tests {
             app_state_failed: AtomicBool::new(false),
             group_name_sync: Mutex::new(()),
             media_recovery_requested: RwLock::new(HashSet::new()),
+            image_downloads: Mutex::new(HashSet::new()),
         }
     }
 
@@ -2403,6 +2523,8 @@ mod tests {
             .expect("image media");
         let MessageMedia::Image {
             path,
+            thumbnail_path,
+            downloaded,
             mime_type,
             width,
             height,
@@ -2414,9 +2536,18 @@ mod tests {
             (mime_type.as_str(), width, height),
             ("image/jpeg", 640, 480)
         );
-        assert_eq!(std::fs::read(&path).unwrap(), b"\xff\xd8\xffthumbnail");
+        assert!(!downloaded);
+        assert!(!Path::new(&path).exists());
         assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            std::fs::read(&thumbnail_path).unwrap(),
+            b"\xff\xd8\xffthumbnail"
+        );
+        assert_eq!(
+            std::fs::metadata(thumbnail_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
 

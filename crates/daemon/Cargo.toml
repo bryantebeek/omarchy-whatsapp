@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+buffa.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
@@ -22,6 +23,5 @@ ureq.workspace = true
 whatsapp-rust.workspace = true
 
 [dev-dependencies]
-buffa.workspace = true
 flate2.workspace = true
 tempfile.workspace = true

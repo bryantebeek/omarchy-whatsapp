@@ -60,7 +60,8 @@ impl Database {
                 read        INTEGER NOT NULL DEFAULT 0,
                 starred     INTEGER NOT NULL DEFAULT 0,
                 receipt     INTEGER NOT NULL DEFAULT 0,
-                media_json  TEXT,
+                media_json      TEXT,
+                media_download  BLOB,
                 PRIMARY KEY (chat_jid, id),
                 FOREIGN KEY (chat_jid) REFERENCES chats(jid) ON DELETE CASCADE
             );
@@ -135,6 +136,7 @@ impl Database {
             [],
         );
         let _ = connection.execute("ALTER TABLE messages ADD COLUMN media_json TEXT", []);
+        let _ = connection.execute("ALTER TABLE messages ADD COLUMN media_download BLOB", []);
         let _ = connection.execute("ALTER TABLE chats ADD COLUMN phone_number TEXT", []);
         let _ = connection.execute(
             "ALTER TABLE chats ADD COLUMN name_source INTEGER NOT NULL DEFAULT 0",
@@ -595,6 +597,22 @@ impl Database {
         )?;
         let rows =
             statement.query_map(params![chat_jid, i64::from(limit.clamp(1, 1000))], |row| {
+                let mut media = row
+                    .get::<_, Option<String>>(7)?
+                    .and_then(|json| serde_json::from_str(&json).ok());
+                if let Some(MessageMedia::Image {
+                    path,
+                    thumbnail_path,
+                    downloaded,
+                    ..
+                }) = &mut media
+                {
+                    // New image records always have a dedicated thumbnail
+                    // path. An empty path identifies an ambiguous legacy row,
+                    // which history recovery will upgrade before presenting
+                    // its old cache file as a completed download.
+                    *downloaded = !thumbnail_path.is_empty() && Path::new(path).is_file();
+                }
                 Ok(Message {
                     id: row.get(0)?,
                     chat_jid: row.get(1)?,
@@ -603,9 +621,7 @@ impl Database {
                     text: row.get(4)?,
                     timestamp: row.get(5)?,
                     from_me: row.get(6)?,
-                    media: row
-                        .get::<_, Option<String>>(7)?
-                        .and_then(|json| serde_json::from_str(&json).ok()),
+                    media,
                     reactions: Vec::new(),
                 })
             })?;
@@ -1011,6 +1027,39 @@ impl Database {
         )? > 0)
     }
 
+    pub fn store_image_download(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+        payload: &[u8],
+    ) -> Result<bool> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        Ok(connection.execute(
+            "UPDATE messages SET media_download = ?3
+             WHERE chat_jid = ?1 AND id = ?2
+               AND (media_download IS NULL OR media_download != ?3)",
+            params![chat_jid, message_id, payload],
+        )? > 0)
+    }
+
+    pub fn image_download(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        let payload = connection
+            .query_row(
+                "SELECT media_download FROM messages WHERE chat_jid = ?1 AND id = ?2",
+                params![chat_jid, message_id],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?;
+        Ok(payload.flatten())
+    }
+
     pub fn update_label(
         &self,
         id: &str,
@@ -1120,15 +1169,16 @@ impl Database {
         transaction.execute(
             "INSERT INTO messages
              (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me,
-              read, starred, receipt, media_json)
+              read, starred, receipt, media_json, media_download)
              SELECT ?2, id, sender_jid, sender_name, text, timestamp, from_me,
-                    read, starred, receipt, media_json
+                    read, starred, receipt, media_json, media_download
              FROM messages WHERE chat_jid = ?1
              ON CONFLICT(chat_jid, id) DO UPDATE SET
                 read = MAX(messages.read, excluded.read),
                 starred = MAX(messages.starred, excluded.starred),
                 receipt = MAX(messages.receipt, excluded.receipt),
-                media_json = COALESCE(messages.media_json, excluded.media_json)",
+                media_json = COALESCE(messages.media_json, excluded.media_json),
+                media_download = COALESCE(messages.media_download, excluded.media_download)",
             params![old_jid, new_jid],
         )?;
         transaction.execute("DELETE FROM messages WHERE chat_jid = ?1", [old_jid])?;
@@ -1284,8 +1334,13 @@ impl Database {
         let needs_recovery = connection
             .query_row(
                 "SELECT 1 FROM messages
-                 WHERE chat_jid = ?1 AND media_json IS NULL
-                   AND text IN ('[Image]', '[Document]', '[Location]', '[Live location]')
+                 WHERE chat_jid = ?1 AND (
+                   (media_json IS NULL
+                    AND text IN ('[Image]', '[Document]', '[Location]', '[Live location]'))
+                   OR (media_json LIKE '%\"kind\":\"image\"%'
+                       AND (media_download IS NULL
+                            OR media_json NOT LIKE '%\"thumbnail_path\"%'))
+                 )
                  LIMIT 1",
                 [chat_jid],
                 |_| Ok(()),
@@ -1300,6 +1355,34 @@ impl Database {
                 "SELECT id, from_me, timestamp FROM messages
                  WHERE chat_jid = ?1 ORDER BY timestamp DESC LIMIT 1",
                 [chat_jid],
+                |row| {
+                    let timestamp: i64 = row.get(2)?;
+                    Ok(HistoryCursor {
+                        chat_jid: chat_jid.to_owned(),
+                        message_id: row.get(0)?,
+                        from_me: row.get(1)?,
+                        timestamp_ms: timestamp.saturating_mul(1_000),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn message_history_cursor(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+    ) -> Result<Option<HistoryCursor>> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        connection
+            .query_row(
+                "SELECT id, from_me, timestamp FROM messages
+                 WHERE chat_jid = ?1 AND id = ?2",
+                params![chat_jid, message_id],
                 |row| {
                     let timestamp: i64 = row.get(2)?;
                     Ok(HistoryCursor {
@@ -1404,6 +1487,33 @@ mod tests {
                 .unread_receipts("1@s.whatsapp.net")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn nullable_image_download_metadata_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        database
+            .insert_message(&message("image", 1), "Ada", false, false)
+            .unwrap();
+
+        assert_eq!(
+            database
+                .image_download("1@s.whatsapp.net", "image")
+                .unwrap(),
+            None
+        );
+        assert!(
+            database
+                .store_image_download("1@s.whatsapp.net", "image", b"download metadata")
+                .unwrap()
+        );
+        assert_eq!(
+            database
+                .image_download("1@s.whatsapp.net", "image")
+                .unwrap(),
+            Some(b"download metadata".to_vec())
         );
     }
 

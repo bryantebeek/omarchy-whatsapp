@@ -18,10 +18,10 @@ Item {
   property bool controlHeld: false
   property int controlActivatorKey: 0
   property bool newChatVisible: false
+  property bool conversationReady: false
   property int handledMessagesNavigationSerial: 0
-  property string pendingConversationScrollMode: ""
-  property string pendingConversationScrollMessageId: ""
-  property int pendingConversationScrollAttempts: 0
+  property int conversationScrollSerial: 0
+  property bool scrollToBottomAfterMessages: false
   property var licenseEntries: []
   property string licenseLoadError: ""
   readonly property bool unreadOnly: service && service.unreadOnly === true
@@ -159,14 +159,15 @@ Item {
     try { payload = JSON.parse(payloadJson || "{}") || {} } catch (error) {}
     opened = true
     if (service) {
-      service.refresh()
-      if (payload.chatJid) service.selectChat(String(payload.chatJid))
-      else if (service.selectedChatJid)
-        service.selectChat(String(service.selectedChatJid))
+      service.refreshMetadata()
+      var targetJid = payload.chatJid
+        ? String(payload.chatJid) : String(service.selectedChatJid || "")
+      if (targetJid) service.selectChat(targetJid)
       service.setPanelState(true, true)
     }
     Qt.callLater(function() {
       root.revealSelectedChat()
+      root.prepareCurrentConversation()
       focusScope.forceActiveFocus()
       if (service && service.selectedChatJid) composer.forceActiveFocus()
     })
@@ -279,62 +280,69 @@ Item {
     return -1
   }
 
-  function positionConversationScroll() {
-    if (!messageList || !messageList.count || !pendingConversationScrollMode) return
-    messageList.forceLayout()
-    if (pendingConversationScrollMode === "unread") {
-      var index = messageIndex(pendingConversationScrollMessageId)
-      if (index >= 0) messageList.positionViewAtIndex(index, ListView.Beginning)
-      else messageList.positionViewAtBeginning()
-    } else {
-      messageList.positionViewAtEnd()
+  function positionConversationScroll(mode, messageId, serial) {
+    if (serial !== conversationScrollSerial
+        || !messageList) return
+    if (messageList.count) {
+      messageList.forceLayout()
+      if (mode === "unread") {
+        var index = messageIndex(messageId)
+        if (index >= 0) messageList.positionViewAtIndex(index, ListView.Beginning)
+        else messageList.positionViewAtBeginning()
+      } else {
+        messageList.positionViewAtEnd()
+      }
     }
-  }
-
-  function applyConversationScroll() {
-    positionConversationScroll()
-    pendingConversationScrollAttempts++
-    if (pendingConversationScrollAttempts < 40) return
-    messageScrollSettleTimer.stop()
-    pendingConversationScrollMode = ""
-    pendingConversationScrollMessageId = ""
+    conversationReady = true
   }
 
   function scheduleConversationScroll(mode, messageId) {
-    pendingConversationScrollMode = String(mode || "bottom")
-    pendingConversationScrollMessageId = String(messageId || "")
-    pendingConversationScrollAttempts = 0
-    messageScrollSettleTimer.restart()
-    Qt.callLater(root.positionConversationScroll)
+    var scrollMode = String(mode || "bottom")
+    var scrollMessageId = String(messageId || "")
+    var serial = ++conversationScrollSerial
+    Qt.callLater(function() {
+      root.positionConversationScroll(scrollMode, scrollMessageId, serial)
+    })
   }
 
-  Timer {
-    id: messageScrollSettleTimer
-    interval: 50
-    repeat: true
-    onTriggered: root.applyConversationScroll()
+  function prepareCurrentConversation() {
+    if (conversationReady || !service
+        || service.messagesChatJid !== service.selectedChatJid) return
+    handledMessagesNavigationSerial = Number(
+      service.messagesNavigationSerial || 0)
+    var firstUnreadId = String(service.messagesFirstUnreadId || "")
+    scheduleConversationScroll(firstUnreadId ? "unread" : "bottom",
+      firstUnreadId)
   }
 
   Connections {
     target: root.service
     function onSelectedChatJidChanged() {
-      messageScrollSettleTimer.stop()
-      root.pendingConversationScrollMode = ""
-      root.pendingConversationScrollMessageId = ""
+      root.conversationScrollSerial++
+      root.conversationReady = false
+      root.scrollToBottomAfterMessages = false
       Qt.callLater(root.revealSelectedChat)
     }
     function onMessageSentSerialChanged() {
-      root.scheduleConversationScroll("bottom", "")
+      root.scrollToBottomAfterMessages = true
     }
-    function onMessagesChanged() {
-      if (!root.service || !messageList.count
+    function onMessagesResponseSerialChanged() {
+      if (!root.service
           || root.service.messagesChatJid !== root.service.selectedChatJid) return
+      if (root.service.messagesResponseHasFollowup === true) return
       var serial = Number(root.service.messagesNavigationSerial || 0)
-      if (serial === root.handledMessagesNavigationSerial) return
-      root.handledMessagesNavigationSerial = serial
-      var firstUnreadId = String(root.service.messagesFirstUnreadId || "")
-      root.scheduleConversationScroll(firstUnreadId ? "unread" : "bottom",
-        firstUnreadId)
+      if (serial !== root.handledMessagesNavigationSerial) {
+        root.handledMessagesNavigationSerial = serial
+        root.scrollToBottomAfterMessages = false
+        var firstUnreadId = String(root.service.messagesFirstUnreadId || "")
+        root.scheduleConversationScroll(firstUnreadId ? "unread" : "bottom",
+          firstUnreadId)
+      } else if (root.scrollToBottomAfterMessages) {
+        root.scrollToBottomAfterMessages = false
+        root.scheduleConversationScroll("bottom", "")
+      } else if (!root.conversationReady) {
+        root.prepareCurrentConversation()
+      }
     }
   }
 
@@ -1157,6 +1165,10 @@ Item {
                     width: parent.width
                     height: parent.height - conversationHeader.height - composerRow.height
                     clip: true
+                    opacity: root.conversationReady
+                      || !(root.service && root.service.selectedChatJid) ? 1 : 0
+                    interactive: root.conversationReady
+                      || !(root.service && root.service.selectedChatJid)
                     model: root.service ? root.service.messages : []
                     spacing: Style.space(4)
                     topMargin: Style.space(12)
@@ -1294,6 +1306,25 @@ Item {
                         }
                       }
 
+                      Text {
+                        id: messageWidthProbe
+                        visible: false
+                        text: messageDelegate.renderedMessageText
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        wrapMode: Text.NoWrap
+                        textFormat: Text.StyledText
+                      }
+
+                      Text {
+                        id: senderWidthProbe
+                        visible: false
+                        text: messageDelegate.senderLabelText
+                        font.family: root.fontFamily
+                        font.pixelSize: root.messageMetaFontSize
+                        font.bold: true
+                      }
+
                       Rectangle {
                         id: bubble
                         readonly property real horizontalPadding: Style.space(22)
@@ -1303,9 +1334,10 @@ Item {
                           ? Math.min(maximumWidth, Style.space(340))
                           : Math.min(maximumWidth,
                             Math.max(Style.space(36),
-                              messageLayoutProbe.contentWidth + horizontalPadding,
+                              messageWidthProbe.implicitWidth + horizontalPadding,
                               messageDelegate.showSenderLabel
-                                ? senderLabel.implicitWidth + horizontalPadding : 0))
+                                ? senderWidthProbe.implicitWidth
+                                  + horizontalPadding : 0))
                         height: messageColumn.implicitHeight + Style.space(16)
                         x: modelData.from_me
                           ? messageDelegate.width - width - Style.space(18)
@@ -1316,17 +1348,6 @@ Item {
                           ? Style.selectedFillFor(root.foreground, root.accent)
                           : Style.normalFillFor(root.foreground, root.accent)
 
-                        Text {
-                          id: messageLayoutProbe
-                          visible: false
-                          width: Math.max(0,
-                            bubble.maximumWidth - bubble.horizontalPadding)
-                          text: messageDelegate.renderedMessageText
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.body
-                          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                          textFormat: Text.StyledText
-                        }
                         Column {
                           id: messageColumn
                           anchors.left: parent.left
@@ -1392,7 +1413,8 @@ Item {
                               cursorShape: Qt.PointingHandCursor
                             }
                           }
-                          Image {
+                          Item {
+                            id: imageCard
                             visible: messageDelegate.mediaData
                               && messageDelegate.mediaData.kind === "image"
                             width: parent.width
@@ -1400,11 +1422,41 @@ Item {
                               Style.space(280), width * Number(
                                 messageDelegate.mediaData.height || 1)
                                 / Math.max(1, Number(messageDelegate.mediaData.width || 1)))) : 0
-                            source: visible && root.service
-                              ? root.service.fileUrl(messageDelegate.mediaData.path) : ""
-                            asynchronous: true
-                            cache: false
-                            fillMode: Image.PreserveAspectFit
+
+                            Image {
+                              anchors.fill: parent
+                              source: messageDelegate.mediaData
+                                && imageCard.visible && root.service
+                                ? root.service.fileUrl(
+                                  messageDelegate.mediaData.downloaded === true
+                                    ? messageDelegate.mediaData.path
+                                    : (messageDelegate.mediaData.thumbnail_path
+                                      || messageDelegate.mediaData.path)) : ""
+                              asynchronous: true
+                              cache: false
+                              fillMode: Image.PreserveAspectFit
+                            }
+
+                            CrispButton {
+                              readonly property bool downloading: visible
+                                && root.service
+                                && root.service.imageDownloading(modelData)
+
+                              anchors.centerIn: parent
+                              visible: messageDelegate.mediaData
+                                && imageCard.visible
+                                && messageDelegate.mediaData.downloaded !== true
+                              width: Style.space(40)
+                              height: Style.space(40)
+                              iconText: downloading ? "󰔟" : "󰇚"
+                              tooltipText: downloading
+                                ? "Downloading full image"
+                                : "Download full image"
+                              foreground: root.foreground
+                              accent: root.accent
+                              enabled: visible && root.service && !downloading
+                              onClicked: root.service.downloadImage(modelData)
+                            }
                           }
                           Item {
                             id: documentCard

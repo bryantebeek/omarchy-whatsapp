@@ -37,11 +37,18 @@ Item {
   property int avatarRevision: 0
   property var avatarAvailable: ({})
   property int mediaRevision: 0
+  property var imageDownloadRequests: ({})
+  property var imageDownloadRequestIds: ({})
   property var chats: []
   property var messages: []
   property string messagesChatJid: ""
   property string messagesFirstUnreadId: ""
+  property bool messagesResponseHasFollowup: false
+  property int messagesResponseSerial: 0
   property int messagesNavigationSerial: 0
+  property var messagesRequestIds: ({})
+  property var messagesRequestJids: ({})
+  property var messagesQueuedRequests: ({})
   property int messageSentSerial: 0
   property string selectedChatJid: ""
   property bool panelVisible: false
@@ -200,23 +207,110 @@ Item {
     return payload.id
   }
 
-  function refresh() {
+  function requestMessages(jid, queueIfPending) {
+    var value = String(jid || "")
+    if (!value) return 0
+    var pendingId = Number(messagesRequestIds[value] || 0)
+    if (pendingId) {
+      if (queueIfPending === true) {
+        var queuedRequests = Object.assign({}, messagesQueuedRequests)
+        queuedRequests[value] = true
+        messagesQueuedRequests = queuedRequests
+      }
+      return pendingId
+    }
+    var requestId = send("get_messages", { chat_jid: value, limit: 300 })
+    if (!requestId) return 0
+    var requestIds = Object.assign({}, messagesRequestIds)
+    var requestJids = Object.assign({}, messagesRequestJids)
+    requestIds[value] = requestId
+    requestJids[String(requestId)] = value
+    messagesRequestIds = requestIds
+    messagesRequestJids = requestJids
+    return requestId
+  }
+
+  function finishMessagesRequest(frame) {
+    if (!frame || frame.id === undefined || frame.id === null) return ""
+    var requestId = String(frame.id)
+    var jid = String(messagesRequestJids[requestId] || "")
+    if (!jid) return ""
+    var requestIds = Object.assign({}, messagesRequestIds)
+    var requestJids = Object.assign({}, messagesRequestJids)
+    var queuedRequests = Object.assign({}, messagesQueuedRequests)
+    var shouldRefresh = queuedRequests[jid] === true
+    if (String(requestIds[jid] || "") === requestId) delete requestIds[jid]
+    delete requestJids[requestId]
+    delete queuedRequests[jid]
+    messagesRequestIds = requestIds
+    messagesRequestJids = requestJids
+    messagesQueuedRequests = queuedRequests
+    return shouldRefresh ? jid : ""
+  }
+
+  function imageDownloadKey(message) {
+    if (!message) return ""
+    return String(message.chat_jid || "") + "\n" + String(message.id || "")
+  }
+
+  function imageDownloading(message) {
+    return imageDownloadRequests[imageDownloadKey(message)] === true
+  }
+
+  function downloadImage(message) {
+    if (!message || !message.chat_jid || !message.id || imageDownloading(message))
+      return false
+    var requestId = send("download_image", {
+      chat_jid: String(message.chat_jid),
+      message_id: String(message.id)
+    })
+    if (!requestId) return false
+    var key = imageDownloadKey(message)
+    var requests = Object.assign({}, imageDownloadRequests)
+    var requestIds = Object.assign({}, imageDownloadRequestIds)
+    requests[key] = true
+    requestIds[String(requestId)] = key
+    imageDownloadRequests = requests
+    imageDownloadRequestIds = requestIds
+    return true
+  }
+
+  function finishImageDownloadRequest(frame) {
+    if (!frame || frame.id === undefined || frame.id === null) return
+    var id = String(frame.id)
+    var key = imageDownloadRequestIds[id]
+    if (!key) return
+    var requests = Object.assign({}, imageDownloadRequests)
+    var requestIds = Object.assign({}, imageDownloadRequestIds)
+    delete requests[key]
+    delete requestIds[id]
+    imageDownloadRequests = requests
+    imageDownloadRequestIds = requestIds
+  }
+
+  function refreshMetadata() {
     send("get_state")
     send("list_chats", { limit: 500 })
     send("list_avatars")
-    if (selectedChatJid)
-      send("get_messages", { chat_jid: selectedChatJid, limit: 300 })
+  }
+
+  function refresh() {
+    refreshMetadata()
+    if (selectedChatJid) requestMessages(selectedChatJid)
   }
 
   function selectChat(jid) {
     var value = String(jid || "")
     if (!value) return
-    selectedChatJid = value
-    messagesChatJid = value
-    messagesFirstUnreadId = ""
-    messagesNavigationSerial++
-    messages = []
-    send("get_messages", { chat_jid: value, limit: 300 })
+    var changed = value !== selectedChatJid
+    if (changed) {
+      selectedChatJid = value
+      messagesChatJid = ""
+      messagesFirstUnreadId = ""
+      messagesNavigationSerial++
+      messages = []
+    }
+    if (changed || messagesChatJid !== value) requestMessages(value)
     send("mark_read", { chat_jid: value })
     requestAvatar(value)
     updateActiveChat()
@@ -280,6 +374,8 @@ Item {
     try { frame = JSON.parse(String(line || "")) }
     catch (error) { return }
     if (!frame || !frame.event) return
+    finishImageDownloadRequest(frame)
+    var queuedMessagesJid = finishMessagesRequest(frame)
     lastError = ""
     if (frame.event === "hello") {
       refresh()
@@ -292,10 +388,12 @@ Item {
         selectChat(chats[0].jid)
     } else if (frame.event === "messages") {
       if (String(frame.chat_jid || "") === selectedChatJid) {
+        messagesResponseHasFollowup = queuedMessagesJid === selectedChatJid
         messagesChatJid = String(frame.chat_jid || "")
         messagesFirstUnreadId = String(frame.first_unread_message_id || "")
         mediaRevision++
         messages = normalizeMessages(frame.messages)
+        messagesResponseSerial++
         var requested = {}
         for (var i = messages.length - 1; i >= 0 && i >= messages.length - 40; i--) {
           var sender = String(messages[i].sender_jid || "")
@@ -310,7 +408,7 @@ Item {
       send("list_chats", { limit: 500 })
       if (String(message.chat_jid || "") === selectedChatJid) {
         if (frame.event === "sent") messageSentSerial++
-        send("get_messages", { chat_jid: selectedChatJid, limit: 300 })
+        requestMessages(selectedChatJid, true)
       }
     } else if (frame.event === "unread") {
       unreadTotal = Number(frame.total || 0)
@@ -324,6 +422,8 @@ Item {
     } else if (frame.event === "error") {
       lastError = String(frame.message || "WhatsApp command failed")
     }
+    if (queuedMessagesJid && queuedMessagesJid === selectedChatJid)
+      requestMessages(queuedMessagesJid)
   }
 
   onPanelVisibleChanged: updateActiveChat()
@@ -342,6 +442,9 @@ Item {
       onConnectionStateChanged: {
         root.connected = connected
         if (connected) {
+          root.messagesRequestIds = ({})
+          root.messagesRequestJids = ({})
+          root.messagesQueuedRequests = ({})
           root.reconnectAttempt = 0
           root.lastError = ""
           root.refresh()
