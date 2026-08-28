@@ -8,6 +8,7 @@ The repository has one local entry point for its required checks:
 ./scripts/cargo.sh deny check
 ./scripts/cargo.sh build --release --locked --workspace
 ./tests/smoke.sh
+./tests/deployment-lifecycle.sh
 ```
 
 GitHub Actions runs the same gates for every pull request and for `main`.
@@ -67,7 +68,7 @@ the 100% contract metric and remain visible in the whole-program report:
 | `daemon/notification.rs` | Message-rendering unit tests, whole-program coverage floor |
 | `ctl/main.rs` | Launcher-generation unit tests and daemon/IPC smoke test |
 | Quickshell QML/JS | `qmlformat`, strict local `qmllint`, portable manifest checks, Omarchy plugin validation locally |
-| Installer/service/package | ShellCheck, version and metadata checks, locked release build, live install verification |
+| Installer/service/package | ShellCheck, version and metadata checks, locked release build, isolated install/update/uninstall lifecycle test, live install verification |
 
 This boundary is explicit because reporting 100% by silently excluding
 uncovered application code would be misleading. Contract and diff coverage

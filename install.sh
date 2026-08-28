@@ -3,6 +3,31 @@ set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 skip_build=0
+pending_files=()
+
+cleanup_pending_files() {
+  if ((${#pending_files[@]})); then
+    rm -f -- "${pending_files[@]}"
+  fi
+}
+trap cleanup_pending_files EXIT
+
+# Never expose a partially copied executable or metadata file if installation is
+# interrupted. The final rename stays on the destination filesystem and is
+# therefore atomic.
+install_atomically() {
+  local mode=$1
+  local source=$2
+  local destination=$3
+  local destination_dir temporary
+
+  destination_dir=$(dirname -- "$destination")
+  mkdir -p -- "$destination_dir"
+  temporary=$(mktemp "$destination.tmp.XXXXXX")
+  pending_files+=("$temporary")
+  install -m "$mode" "$source" "$temporary"
+  mv -f -- "$temporary" "$destination"
+}
 
 usage() {
   echo "Usage: ./install.sh [--no-build]" >&2
@@ -26,7 +51,8 @@ for binary in omarchy-whatsappd omarchy-whatsappctl; do
     echo "Missing release binary: $binary" >&2
     exit 1
   }
-  install -Dm755 "$repo_dir/target/release/$binary" "$HOME/.local/bin/$binary"
+  install_atomically 755 \
+    "$repo_dir/target/release/$binary" "$HOME/.local/bin/$binary"
 done
 
 # Versions before 0.2 shipped a standalone GTK launcher. The full interface
@@ -35,13 +61,13 @@ done
 pkill -f "^$HOME/.local/bin/omarchy-whatsapp( |$)" >/dev/null 2>&1 || true
 rm -f -- "$HOME/.local/bin/omarchy-whatsapp"
 
-install -Dm644 \
+install_atomically 644 \
   "$repo_dir/packaging/systemd/omarchy-whatsapp.service" \
   "$HOME/.config/systemd/user/omarchy-whatsapp.service"
-install -Dm644 \
+install_atomically 644 \
   "$repo_dir/packaging/applications/com.omarchy.WhatsApp.desktop" \
   "$HOME/.local/share/applications/com.omarchy.WhatsApp.desktop"
-install -Dm644 \
+install_atomically 644 \
   "$repo_dir/packaging/icons/com.omarchy.WhatsApp.svg" \
   "$HOME/.local/share/icons/hicolor/scalable/apps/com.omarchy.WhatsApp.svg"
 
@@ -80,22 +106,23 @@ if [[ $(realpath -m -- "$repo_dir") != $(realpath -m -- "$plugin_dir") ]]; then
     "$plugin_dir/licenses.json" \
     "$plugin_dir/icons/brand-whatsapp-filled.svg" \
     "$plugin_dir/icons/LICENSE.tabler"
-  install -m644 "$repo_dir/quickshell/BarWidget.qml" \
+  install_atomically 644 "$repo_dir/quickshell/BarWidget.qml" \
     "$plugin_dir/quickshell/BarWidget.qml"
-  install -m644 "$repo_dir/quickshell/Service.qml" \
+  install_atomically 644 "$repo_dir/quickshell/Service.qml" \
     "$plugin_dir/quickshell/Service.qml"
-  install -m644 "$repo_dir/quickshell/Panel.qml" \
+  install_atomically 644 "$repo_dir/quickshell/Panel.qml" \
     "$plugin_dir/quickshell/Panel.qml"
-  install -m644 "$repo_dir/quickshell/Model.js" \
+  install_atomically 644 "$repo_dir/quickshell/Model.js" \
     "$plugin_dir/quickshell/Model.js"
-  install -m644 "$repo_dir/quickshell/licenses.json" \
+  install_atomically 644 "$repo_dir/quickshell/licenses.json" \
     "$plugin_dir/quickshell/licenses.json"
-  install -m644 "$repo_dir/quickshell/icons/brand-whatsapp-filled.svg" \
+  install_atomically 644 \
+    "$repo_dir/quickshell/icons/brand-whatsapp-filled.svg" \
     "$plugin_dir/quickshell/icons/brand-whatsapp-filled.svg"
-  install -m644 "$repo_dir/quickshell/icons/LICENSE.tabler" \
+  install_atomically 644 "$repo_dir/quickshell/icons/LICENSE.tabler" \
     "$plugin_dir/quickshell/icons/LICENSE.tabler"
   # The manifest makes the directory visible to the shell, so install it last.
-  install -m644 "$repo_dir/manifest.json" "$plugin_dir/manifest.json"
+  install_atomically 644 "$repo_dir/manifest.json" "$plugin_dir/manifest.json"
 fi
 
 systemctl --user daemon-reload

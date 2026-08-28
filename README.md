@@ -113,6 +113,10 @@ To also remove the local linked-device keys and history, use
 `./uninstall.sh --purge-data`. That permanently signs this installation out and
 cannot be undone.
 
+Installation and upgrades replace deployed files atomically and never modify
+the account state directory. Normal uninstall also preserves that directory;
+only the explicit `--purge-data` option removes it.
+
 ## Privacy and footprint
 
 - The runtime directory is mode `0700`; its socket and pairing QR are `0600`.
