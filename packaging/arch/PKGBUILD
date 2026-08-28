@@ -1,0 +1,61 @@
+pkgname=omarchy-whatsapp-git
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Low-footprint native WhatsApp linked-device client for Omarchy'
+arch=('x86_64')
+url='https://github.com/bryantebeek/omarchy-whatsapp'
+license=('MIT')
+depends=('omarchy' 'quickshell' 'sqlite' 'systemd-libs')
+makedepends=('rust>=1.94' 'git')
+provides=('omarchy-whatsapp')
+conflicts=('omarchy-whatsapp')
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf '0.2.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$pkgname"
+  cargo build --release --locked --workspace
+}
+
+check() {
+  cd "$pkgname"
+  cargo test --locked --workspace
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/omarchy-whatsappd "$pkgdir/usr/bin/omarchy-whatsappd"
+  install -Dm755 target/release/omarchy-whatsappctl "$pkgdir/usr/bin/omarchy-whatsappctl"
+  sed 's|%h/.local/bin/omarchy-whatsappd|/usr/bin/omarchy-whatsappd|' \
+    packaging/systemd/omarchy-whatsapp.service > omarchy-whatsapp.service
+  install -Dm644 omarchy-whatsapp.service \
+    "$pkgdir/usr/lib/systemd/user/omarchy-whatsapp.service"
+  install -Dm644 packaging/applications/com.omarchy.WhatsApp.desktop \
+    "$pkgdir/usr/share/applications/com.omarchy.WhatsApp.desktop"
+  install -Dm644 packaging/icons/com.omarchy.WhatsApp.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.omarchy.WhatsApp.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 ARCHITECTURE.md "$pkgdir/usr/share/doc/$pkgname/ARCHITECTURE.md"
+  install -Dm644 quickshell/manifest.json \
+    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/manifest.json"
+  install -Dm644 quickshell/BarWidget.qml \
+    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/BarWidget.qml"
+  install -Dm644 quickshell/Service.qml \
+    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/Service.qml"
+  install -Dm644 quickshell/Panel.qml \
+    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/Panel.qml"
+  install -Dm644 quickshell/Model.js \
+    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/Model.js"
+  install -Dm644 quickshell/licenses.json \
+    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/licenses.json"
+  install -Dm644 quickshell/icons/brand-whatsapp-filled.svg \
+    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/icons/brand-whatsapp-filled.svg"
+  install -Dm644 quickshell/icons/LICENSE.tabler \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE.tabler"
+}

@@ -1,0 +1,7 @@
+/target/
+/.idea/
+/.vscode/
+/quickshell/.width-test.qml
+*.db
+*.db-shm
+*.db-wal

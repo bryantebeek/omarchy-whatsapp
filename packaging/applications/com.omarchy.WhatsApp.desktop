@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=WhatsApp
+GenericName=Messaging Client
+Comment=Low-footprint native WhatsApp companion for Omarchy
+Exec=omarchy shell -q io.github.bryantebeek.whatsapp open
+Icon=com.omarchy.WhatsApp
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=WhatsApp;Message;Chat;
+StartupNotify=false
+DBusActivatable=false

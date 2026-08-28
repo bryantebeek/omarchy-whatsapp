@@ -1,0 +1,27 @@
+[package]
+name = "omarchy-whatsappd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures.workspace = true
+omarchy-whatsapp-protocol = { path = "../protocol" }
+qrcode.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ureq.workspace = true
+whatsapp-rust.workspace = true
+
+[dev-dependencies]
+buffa.workspace = true
+flate2.workspace = true
+tempfile.workspace = true

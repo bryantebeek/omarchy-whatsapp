@@ -1,0 +1,464 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+
+Item {
+  id: root
+
+  visible: false
+  width: 0
+  height: 0
+
+  property var shell: null
+  property var manifest: null
+
+  readonly property string pluginId: manifest && manifest.id
+    ? String(manifest.id) : "io.github.bryantebeek.whatsapp"
+  readonly property string socketPath: {
+    var runtime = Quickshell.env("XDG_RUNTIME_DIR")
+    return String(runtime || "/tmp") + "/omarchy-whatsapp/daemon.sock"
+  }
+  readonly property string qrPath: {
+    var runtime = Quickshell.env("XDG_RUNTIME_DIR")
+    return String(runtime || "/tmp") + "/omarchy-whatsapp/pairing.svg"
+  }
+  readonly property string statePath: {
+    var state = Quickshell.env("XDG_STATE_HOME")
+    if (state) return String(state) + "/omarchy-whatsapp"
+    return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
+  }
+  readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
+
+  property bool connected: false
+  property string connectionState: "starting"
+  property string connectionDetail: ""
+  property double pairingExpiresAt: 0
+  property int unreadTotal: 0
+  property int avatarRevision: 0
+  property var avatarAvailable: ({})
+  property int mediaRevision: 0
+  property var chats: []
+  property var messages: []
+  property string messagesChatJid: ""
+  property string messagesFirstUnreadId: ""
+  property int messagesNavigationSerial: 0
+  property int messageSentSerial: 0
+  property string selectedChatJid: ""
+  property bool panelVisible: false
+  property bool panelFocused: false
+  property int nextRequestId: 1
+  property int reconnectAttempt: 0
+  property bool launcherSyncPending: false
+  property string lastError: ""
+  property bool unreadOnly: false
+  property bool uiPreferencesReady: false
+  property bool uiPreferencesDirty: false
+  property int uiPreferencesRevision: 0
+  property int uiPreferencesSavingRevision: 0
+
+  readonly property string qrImageUrl: pairingExpiresAt > 0
+    ? "file://" + qrPath + "?v=" + pairingExpiresAt : ""
+  readonly property var selectedChat: {
+    for (var i = 0; i < chats.length; i++)
+      if (String(chats[i].jid || "") === selectedChatJid) return chats[i]
+    return null
+  }
+
+  function copyArray(value) {
+    return Array.isArray(value) ? value.slice() : []
+  }
+
+  function loadUiPreferences(raw) {
+    if (uiPreferencesReady) return
+    var storedUnreadOnly = false
+    var content = String(raw || "").trim()
+    if (content) {
+      try {
+        var parsed = JSON.parse(content)
+        storedUnreadOnly = parsed && parsed.unread_only === true
+      } catch (error) {
+        console.warn("whatsapp: ignoring invalid UI preferences", error)
+      }
+    }
+    if (!uiPreferencesDirty) unreadOnly = storedUnreadOnly
+    uiPreferencesReady = true
+    if (uiPreferencesDirty) uiPreferencesSaveTimer.restart()
+  }
+
+  function setUnreadOnly(value) {
+    var next = value === true
+    if (unreadOnly === next) return
+    unreadOnly = next
+    uiPreferencesDirty = true
+    uiPreferencesRevision++
+    if (uiPreferencesReady) uiPreferencesSaveTimer.restart()
+  }
+
+  function flushUiPreferences() {
+    if (!uiPreferencesReady || !uiPreferencesDirty) return
+    uiPreferencesSavingRevision = uiPreferencesRevision
+    uiPreferencesFile.setText(JSON.stringify({
+      version: 1,
+      unread_only: unreadOnly
+    }, null, 2) + "\n")
+  }
+
+  function normalizeMessages(value) {
+    var output = copyArray(value)
+    for (var i = 0; i < output.length; i++) {
+      var source = output[i] || {}
+      var reactions = source.reactions
+      var normalized = []
+      if (reactions && typeof reactions.length === "number")
+        for (var j = 0; j < reactions.length; j++) normalized.push(reactions[j])
+      source.reactions = normalized
+      output[i] = source
+    }
+    return output
+  }
+
+  function hexKey(value) {
+    var input = unescape(encodeURIComponent(String(value || "")))
+    var output = ""
+    for (var i = 0; i < input.length; i++)
+      output += ("0" + input.charCodeAt(i).toString(16)).slice(-2)
+    return output
+  }
+
+  function avatarUrl(jid) {
+    if (!jid || String(jid) === "me") return ""
+    if (avatarAvailable[String(jid)] !== true) return ""
+    return "file://" + statePath + "/avatars/" + hexKey(jid)
+      + ".img?v=" + avatarRevision
+  }
+
+  function fileUrl(path) {
+    return path ? "file://" + String(path) + "?v=" + mediaRevision : ""
+  }
+
+  function requestAvatar(jid) {
+    if (jid && String(jid) !== "me")
+      send("request_avatar", { jid: String(jid) })
+  }
+
+  function openMap(latitudeE7, longitudeE7) {
+    var latitude = Number(latitudeE7 || 0) / 10000000
+    var longitude = Number(longitudeE7 || 0) / 10000000
+    if (!isFinite(latitude) || !isFinite(longitude)) return
+    mapOpener.command = ["xdg-open", "https://www.openstreetmap.org/?mlat="
+      + latitude + "&mlon=" + longitude + "#map=16/" + latitude + "/" + longitude]
+    mapOpener.running = true
+  }
+
+  function openFile(path) {
+    var source = String(path || "")
+    if (!source) return
+    Quickshell.execDetached([
+      "/usr/bin/bash", "-c",
+      "for _ in {1..75}; do "
+        + "if [ -s \"$1\" ]; then exec xdg-open \"$1\"; fi; "
+        + "sleep 0.2; done; "
+        + "omarchy-notification-send -g 󰈙 -t 3000 "
+        + "\"Document unavailable\" \"The download has not completed.\"",
+      "bash", source
+    ])
+  }
+
+  function saveFile(path, fileName) {
+    var source = String(path || "")
+    if (!source) return
+    Quickshell.execDetached([
+      "/usr/bin/bash", "-c",
+      "for _ in {1..75}; do [ -s \"$1\" ] && break; sleep 0.2; done; "
+        + "if [ ! -s \"$1\" ]; then "
+        + "omarchy-notification-send -g 󰈙 -t 3000 "
+        + "\"Document unavailable\" \"The download has not completed.\"; exit 1; fi; "
+        + "destination=$(xdg-user-dir DOWNLOAD 2>/dev/null || true); "
+        + "[ -n \"$destination\" ] || destination=\"$HOME/Downloads\"; "
+        + "mkdir -p -- \"$destination\" || exit 1; "
+        + "safe=${2##*/}; [ -n \"$safe\" ] || safe=Document; "
+        + "stem=$safe; suffix=; case $safe in *.*) "
+        + "stem=${safe%.*}; suffix=.${safe##*.};; esac; "
+        + "target=\"$destination/$safe\"; counter=1; "
+        + "while [ -e \"$target\" ]; do "
+        + "target=\"$destination/$stem ($counter)$suffix\"; counter=$((counter + 1)); done; "
+        + "install -m 600 -- \"$1\" \"$target\" && "
+        + "omarchy-notification-send -g 󰈙 -t 4000 "
+        + "\"Document saved\" \"$target\"",
+      "bash", source, String(fileName || "Document")
+    ])
+  }
+
+  function send(command, fields) {
+    var socket = socketLoader.item
+    if (!socket || !socket.connected) return 0
+    var payload = { id: nextRequestId++, command: String(command || "") }
+    fields = fields || {}
+    for (var key in fields) payload[key] = fields[key]
+    socket.write(JSON.stringify(payload) + "\n")
+    socket.flush()
+    return payload.id
+  }
+
+  function refresh() {
+    send("get_state")
+    send("list_chats", { limit: 500 })
+    send("list_avatars")
+    if (selectedChatJid)
+      send("get_messages", { chat_jid: selectedChatJid, limit: 300 })
+  }
+
+  function selectChat(jid) {
+    var value = String(jid || "")
+    if (!value) return
+    selectedChatJid = value
+    messagesChatJid = value
+    messagesFirstUnreadId = ""
+    messagesNavigationSerial++
+    messages = []
+    send("get_messages", { chat_jid: value, limit: 300 })
+    send("mark_read", { chat_jid: value })
+    requestAvatar(value)
+    updateActiveChat()
+  }
+
+  function sendMessage(text) {
+    var body = String(text || "")
+    if (!selectedChatJid || !body.trim()) return false
+    send("send_message", { chat_jid: selectedChatJid, text: body })
+    return true
+  }
+
+  function reactToMessage(message, emoji) {
+    if (!message || !selectedChatJid || !message.id) return false
+    send("react", {
+      chat_jid: selectedChatJid,
+      message_id: String(message.id),
+      sender_jid: String(message.sender_jid || ""),
+      target_from_me: message.from_me === true,
+      emoji: String(emoji || "")
+    })
+    return true
+  }
+
+  function updateActiveChat() {
+    send("set_active_chat", {
+      chat_jid: panelVisible && panelFocused && selectedChatJid
+        ? selectedChatJid : null
+    })
+  }
+
+  function setPanelState(visible, focused) {
+    panelVisible = visible === true
+    panelFocused = focused === true
+    updateActiveChat()
+  }
+
+  function openPanel(chatJid) {
+    if (!shell || typeof shell.summon !== "function") return "unavailable"
+    var payload = chatJid ? { chatJid: String(chatJid) } : {}
+    return shell.summon(pluginId, JSON.stringify(payload)) ? "opened" : "unavailable"
+  }
+
+  function scheduleLauncherSync() {
+    if (launcherSync.running)
+      launcherSyncPending = true
+    else
+      launcherSyncDebounce.restart()
+  }
+
+  function handleState(frame) {
+    var status = frame.status || {}
+    connectionState = String(status.state || "starting")
+    connectionDetail = String(status.reason || status.message || "")
+    pairingExpiresAt = Number(status.expires_at || 0)
+    unreadTotal = Number(frame.unread_total || 0)
+  }
+
+  function handleLine(line) {
+    var frame
+    try { frame = JSON.parse(String(line || "")) }
+    catch (error) { return }
+    if (!frame || !frame.event) return
+    lastError = ""
+    if (frame.event === "hello") {
+      refresh()
+    } else if (frame.event === "state") {
+      handleState(frame)
+    } else if (frame.event === "chats") {
+      chats = copyArray(frame.chats)
+      scheduleLauncherSync()
+      if (!selectedChatJid && chats.length && panelVisible)
+        selectChat(chats[0].jid)
+    } else if (frame.event === "messages") {
+      if (String(frame.chat_jid || "") === selectedChatJid) {
+        messagesChatJid = String(frame.chat_jid || "")
+        messagesFirstUnreadId = String(frame.first_unread_message_id || "")
+        mediaRevision++
+        messages = normalizeMessages(frame.messages)
+        var requested = {}
+        for (var i = messages.length - 1; i >= 0 && i >= messages.length - 40; i--) {
+          var sender = String(messages[i].sender_jid || "")
+          if (sender && sender !== "me" && !requested[sender]) {
+            requested[sender] = true
+            requestAvatar(sender)
+          }
+        }
+      }
+    } else if (frame.event === "message" || frame.event === "sent") {
+      var message = frame.message || {}
+      send("list_chats", { limit: 500 })
+      if (String(message.chat_jid || "") === selectedChatJid) {
+        if (frame.event === "sent") messageSentSerial++
+        send("get_messages", { chat_jid: selectedChatJid, limit: 300 })
+      }
+    } else if (frame.event === "unread") {
+      unreadTotal = Number(frame.total || 0)
+    } else if (frame.event === "avatars") {
+      var available = {}
+      var avatarJids = copyArray(frame.jids)
+      for (var avatarIndex = 0; avatarIndex < avatarJids.length; avatarIndex++)
+        available[String(avatarJids[avatarIndex])] = true
+      avatarAvailable = available
+      avatarRevision = Number(frame.revision || avatarRevision + 1)
+    } else if (frame.event === "error") {
+      lastError = String(frame.message || "WhatsApp command failed")
+    }
+  }
+
+  onPanelVisibleChanged: updateActiveChat()
+  onPanelFocusedChanged: updateActiveChat()
+  onSelectedChatJidChanged: updateActiveChat()
+
+  Component {
+    id: socketComponent
+    Socket {
+      path: root.socketPath
+      connected: true
+      parser: SplitParser {
+        splitMarker: "\n"
+        onRead: function(line) { root.handleLine(line) }
+      }
+      onConnectionStateChanged: {
+        root.connected = connected
+        if (connected) {
+          root.reconnectAttempt = 0
+          root.lastError = ""
+          root.refresh()
+        }
+      }
+      onError: function(_error) {
+        root.connected = false
+        root.connectionState = "starting"
+      }
+    }
+  }
+
+  Loader {
+    id: socketLoader
+    active: true
+    sourceComponent: socketComponent
+  }
+
+  Timer {
+    interval: Math.min(8000, 500 + root.reconnectAttempt * 600)
+    repeat: true
+    running: !root.connected
+    triggeredOnStart: true
+    onTriggered: {
+      root.reconnectAttempt++
+      if (root.reconnectAttempt === 2) daemonStarter.running = true
+      socketLoader.active = false
+      socketLoader.active = true
+    }
+  }
+
+  Timer {
+    interval: 30000
+    repeat: true
+    running: root.connected
+    onTriggered: root.send("ping")
+  }
+
+  Timer {
+    id: launcherSyncDebounce
+    interval: 1200
+    onTriggered: {
+      if (launcherSync.running) {
+        root.launcherSyncPending = true
+        return
+      }
+      root.launcherSyncPending = false
+      launcherSync.running = true
+    }
+  }
+
+  Timer {
+    id: uiPreferencesSaveTimer
+    interval: 150
+    repeat: false
+    onTriggered: root.flushUiPreferences()
+  }
+
+  FileView {
+    id: uiPreferencesFile
+    path: root.uiPreferencesPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadUiPreferences(text())
+    onLoadFailed: root.loadUiPreferences("")
+    onSaved: {
+      if (root.uiPreferencesSavingRevision === root.uiPreferencesRevision)
+        root.uiPreferencesDirty = false
+      else
+        uiPreferencesSaveTimer.restart()
+    }
+    onSaveFailed: if (!ensureUiPreferencesDir.running)
+      ensureUiPreferencesDir.running = true
+  }
+
+  Process {
+    id: daemonStarter
+    command: ["systemctl", "--user", "start", "omarchy-whatsapp.service"]
+  }
+
+  Process {
+    id: ensureUiPreferencesDir
+    command: ["/usr/bin/mkdir", "-p", root.statePath]
+    onExited: {
+      if (!root.uiPreferencesReady) uiPreferencesFile.reload()
+      else if (root.uiPreferencesDirty) root.flushUiPreferences()
+    }
+  }
+
+  Process {
+    id: launcherSync
+    command: ["omarchy-whatsappctl", "launcher-sync"]
+    onExited: {
+      if (!root.launcherSyncPending)
+        return
+      root.launcherSyncPending = false
+      launcherSyncDebounce.restart()
+    }
+  }
+
+  Process { id: mapOpener }
+
+  IpcHandler {
+    target: root.pluginId
+
+    function open(): string { return root.openPanel("") }
+    function show(): string { return root.openPanel("") }
+    function openChat(chatJid: string): string { return root.openPanel(chatJid) }
+    function refresh(): string { root.refresh(); return "ok" }
+    function unreadFilter(): string { return root.unreadOnly ? "on" : "off" }
+    function setUnreadFilter(enabled: bool): string {
+      root.setUnreadOnly(enabled)
+      return root.unreadOnly ? "on" : "off"
+    }
+  }
+
+  Component.onCompleted: daemonStarter.running = true
+  Component.onDestruction: send("set_active_chat", { chat_jid: null })
+}
