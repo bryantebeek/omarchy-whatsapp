@@ -619,6 +619,8 @@ impl Shared {
                     last_sender_name,
                     last_timestamp,
                     unread: conversation.unread_count.unwrap_or(0),
+                    pinned: false,
+                    muted: false,
                     is_group,
                 })?;
             for message in messages {

@@ -34,6 +34,10 @@ pub struct Chat {
     pub last_sender_name: String,
     pub last_timestamp: i64,
     pub unread: u32,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub muted: bool,
     pub is_group: bool,
 }
 

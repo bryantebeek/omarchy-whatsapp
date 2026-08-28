@@ -383,6 +383,8 @@ mod tests {
             last_sender_name: "Ada".to_owned(),
             last_timestamp: 123,
             unread: 4,
+            pinned: false,
+            muted: false,
             is_group,
         }
     }

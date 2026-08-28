@@ -439,6 +439,10 @@ impl Database {
                     chats.last_timestamp,
                     CASE WHEN COALESCE(chat_settings.archived, 0) = 0
                          THEN chats.unread ELSE 0 END,
+                    COALESCE(chat_settings.pinned, 0) = 1,
+                    COALESCE(chat_settings.muted, 0) = 1
+                      AND (COALESCE(chat_settings.mute_end, 0) <= 0
+                           OR chat_settings.mute_end > unixepoch()),
                     chats.is_group
              FROM chats
              LEFT JOIN chat_settings ON chat_settings.jid = chats.jid
@@ -456,7 +460,9 @@ impl Database {
                 last_sender_name: row.get(4)?,
                 last_timestamp: row.get(5)?,
                 unread: row.get(6)?,
-                is_group: row.get(7)?,
+                pinned: row.get(7)?,
+                muted: row.get(8)?,
+                is_group: row.get(9)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1852,6 +1858,8 @@ mod tests {
                 last_sender_name: "Ada".into(),
                 last_timestamp: 1,
                 unread: 0,
+                pinned: false,
+                muted: false,
                 is_group: false,
             })
             .unwrap();
@@ -2295,6 +2303,8 @@ mod tests {
                 last_sender_name: replayed.sender_name.clone(),
                 last_timestamp: replayed.timestamp,
                 unread: 0,
+                pinned: false,
+                muted: false,
                 is_group: true,
             })
             .unwrap();
@@ -2386,6 +2396,8 @@ mod tests {
                 last_sender_name: "WhatsApp".into(),
                 last_timestamp: 2,
                 unread: 0,
+                pinned: false,
+                muted: false,
                 is_group: false,
             })
             .unwrap();
@@ -2587,6 +2599,8 @@ mod tests {
                     last_sender_name: "Ada".into(),
                     last_timestamp: 1,
                     unread,
+                    pinned: false,
+                    muted: false,
                     is_group: true,
                 })
                 .unwrap();

@@ -1358,21 +1358,52 @@ Item {
                               }
                             }
                           }
-                          Text {
+                          Item {
                             width: parent.width
-                            text: {
-                              var message = String(modelData.last_message || "")
-                              if (!message) return "No messages yet"
-                              var sender = String(modelData.last_sender_name || "")
-                              return modelData.is_group === true && sender
-                                ? sender + ": " + message : message
+                            height: Math.max(chatPreview.implicitHeight,
+                              chatStatusIcons.implicitHeight)
+                            Text {
+                              id: chatPreview
+                              anchors.left: parent.left
+                              anchors.right: chatStatusIcons.left
+                              anchors.rightMargin: chatStatusIcons.visible
+                                ? Style.space(5) : 0
+                              text: {
+                                var message = String(modelData.last_message || "")
+                                if (!message) return "No messages yet"
+                                var sender = String(modelData.last_sender_name || "")
+                                return modelData.is_group === true && sender
+                                  ? sender + ": " + message : message
+                              }
+                              color: root.sidebarSecondary
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                              maximumLineCount: 1
+                              wrapMode: Text.NoWrap
+                              elide: Text.ElideRight
                             }
-                            color: root.sidebarSecondary
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.caption
-                            maximumLineCount: 1
-                            wrapMode: Text.NoWrap
-                            elide: Text.ElideRight
+                            Row {
+                              id: chatStatusIcons
+                              visible: modelData.pinned === true
+                                || modelData.muted === true
+                              anchors.right: parent.right
+                              anchors.verticalCenter: parent.verticalCenter
+                              spacing: Style.space(4)
+                              Text {
+                                visible: modelData.pinned === true
+                                text: "󰐃"
+                                color: root.timestamp
+                                font.family: root.fontFamily
+                                font.pixelSize: 12
+                              }
+                              Text {
+                                visible: modelData.muted === true
+                                text: "󰂛"
+                                color: root.timestamp
+                                font.family: root.fontFamily
+                                font.pixelSize: 12
+                              }
+                            }
                           }
                         }
                       }
