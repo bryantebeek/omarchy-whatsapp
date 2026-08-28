@@ -28,4 +28,9 @@ if find "$repo_dir/quickshell" -type l -print -quit | grep -q .; then
   exit 1
 fi
 
+[[ -x $repo_dir/scripts/setup-daemon.sh ]] || {
+  echo "The in-plugin daemon setup helper must be present and executable." >&2
+  exit 1
+}
+
 echo "Manifest contract and entry points are valid."

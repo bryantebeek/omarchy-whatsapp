@@ -34,6 +34,13 @@ state. Both the bar widget and app panel consume it. The service is on-demand an
 remains loaded while the plugin is enabled; the heavier panel object is created
 only while summoned and destroyed when hidden.
 
+When an enabled marketplace checkout has no matching daemon runtime, the panel
+offers an explicit setup action. Its repository-owned helper builds into the
+user cache rather than the recursively watched plugin directory, then uses the
+same atomic runtime-only installation path as the normal installer. Quickshell
+never evaluates build output as code, never requests root access, and continues
+to communicate only through the daemon socket after systemd starts the service.
+
 After a chat snapshot changes, the service debounces `omarchy-whatsappctl
 launcher-sync`. The helper requests a fresh snapshot and atomically maintains a
 marker-delimited block in the user's Omarchy menu extension. Only conversation

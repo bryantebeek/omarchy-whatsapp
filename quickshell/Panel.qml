@@ -52,6 +52,12 @@ Item {
   }
   readonly property bool paired: service && service.connectionState === "connected"
   readonly property bool pairing: service && service.connectionState === "pairing"
+  readonly property bool daemonSetupRequired: service
+    && service.daemonSetupRequired === true
+  readonly property bool daemonSetupBusy: service
+    && service.daemonSetupBusy === true
+  readonly property string visibleError: service
+    ? String(service.daemonSetupError || service.lastError || "") : ""
   readonly property real devicePixelRatio: window.screen
     ? window.screen.devicePixelRatio : 1
   readonly property var filteredChats: {
@@ -2540,7 +2546,9 @@ Item {
               spacing: Style.space(14)
               Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: root.pairing ? "Link WhatsApp" : "Connecting to WhatsApp"
+                text: root.daemonSetupRequired
+                  ? "Set up WhatsApp"
+                  : (root.pairing ? "Link WhatsApp" : "Connecting to WhatsApp")
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.displayLarge
@@ -2550,10 +2558,15 @@ Item {
                 anchors.horizontalCenter: parent.horizontalCenter
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
-                text: root.pairing
-                  ? "On your phone, open WhatsApp → Linked devices → Link a device"
-                  : (root.service && root.service.connectionDetail
-                    ? root.service.connectionDetail : "The background service is starting…")
+                text: root.daemonSetupRequired
+                  ? (root.daemonSetupBusy
+                    ? String(root.service.daemonSetupDetail
+                      || "Building the background service…")
+                    : "Build and install the background service on this computer.")
+                  : (root.pairing
+                    ? "On your phone, open WhatsApp → Linked devices → Link a device"
+                    : (root.service && root.service.connectionDetail
+                      ? root.service.connectionDetail : "The background service is starting…"))
                 color: root.sidebarSecondary
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -2588,20 +2601,43 @@ Item {
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.Wrap
               }
+              Text {
+                visible: root.daemonSetupRequired
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                text: "The first local build can take several minutes and requires mise or Rust."
+                color: root.sidebarSecondary
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
               CrispButton {
-                visible: !root.pairing
+                visible: root.daemonSetupRequired
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: root.daemonSetupBusy
+                  ? "Setting up daemon…" : "Build and start daemon"
+                iconText: root.daemonSetupBusy ? "󰔟" : "󰒓"
+                bordered: true
+                active: !root.daemonSetupBusy
+                enabled: !root.daemonSetupBusy
+                foreground: root.foreground
+                onClicked: if (root.service) root.service.setupDaemonRuntime()
+              }
+              CrispButton {
+                visible: !root.pairing && !root.daemonSetupRequired
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: "Try again"
                 iconText: "󰑐"
                 bordered: true
                 foreground: root.foreground
-                onClicked: if (root.service) root.service.refresh()
+                onClicked: if (root.service) root.service.retryDaemon()
               }
             }
           }
 
           CrispBorderSurface {
-            visible: root.service && root.service.lastError !== ""
+            visible: root.visibleError !== ""
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: parent.bottom
@@ -2617,7 +2653,7 @@ Item {
               id: errorText
               anchors.fill: parent
               anchors.margins: Style.space(8)
-              text: root.service ? root.service.lastError : ""
+              text: root.visibleError
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
