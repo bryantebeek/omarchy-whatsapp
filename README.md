@@ -25,13 +25,14 @@ mind.
 - A hardened user systemd service, launcher entry, scalable icon, installer,
   uninstaller, and Arch `PKGBUILD`.
 
-The app renders contact, group, and group-participant avatars; encrypted image
-and video messages; documents; static/live-location cards; and synchronized
-emoji reactions. Reaction chips aggregate matching emoji and support adding,
-changing, and removing your reaction. Location cards open in the system browser
-using OpenStreetMap, avoiding an embedded browser engine. Audio, stickers, full
-calling, search, and group administration remain lightweight placeholders or
-out of scope.
+The app renders contact, group, and group-participant avatars; encrypted image,
+video, and voice messages; documents; static/live-location cards; and
+synchronized emoji reactions. Voice notes download on demand and play inline.
+Reaction chips aggregate matching emoji and support adding, changing, and
+removing your reaction. Location cards open in the system browser using
+OpenStreetMap, avoiding an embedded browser engine. Stickers, full calling,
+search, and group administration remain lightweight placeholders or out of
+scope.
 
 ## Install on Omarchy
 

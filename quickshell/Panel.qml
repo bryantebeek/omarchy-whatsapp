@@ -27,6 +27,7 @@ Item {
   property real preservedConversationContentY: 0
   property var activeInlineVideoCard: null
   property bool activeInlineVideoGif: false
+  property var activeVoiceMessageCard: null
   property real currentTimestamp: Date.now() / 1000
   property var licenseEntries: []
   property string licenseLoadError: ""
@@ -253,6 +254,7 @@ Item {
 
   function close() {
     stopInlineVideo()
+    stopVoiceMessage()
     scrollToBottomAnimation.stop()
     opened = false
     controlHeld = false
@@ -388,10 +390,34 @@ Item {
       return
     }
     stopInlineVideo()
+    stopVoiceMessage()
     activeInlineVideoCard = card
     activeInlineVideoGif = card.isGif
     inlineVideoPlayer.source = "file://" + card.mediaPath
     inlineVideoPlayer.play()
+  }
+
+  function stopVoiceMessage(card) {
+    if (card && activeVoiceMessageCard !== card) return
+    voiceMessagePlayer.stop()
+    voiceMessagePlayer.source = ""
+    activeVoiceMessageCard = null
+  }
+
+  function toggleVoiceMessage(card) {
+    if (!card || !card.downloaded || !card.mediaPath) return
+    if (activeVoiceMessageCard === card) {
+      if (voiceMessagePlayer.playbackState === MediaPlayer.PlayingState)
+        voiceMessagePlayer.pause()
+      else
+        voiceMessagePlayer.play()
+      return
+    }
+    stopVoiceMessage()
+    stopInlineVideo()
+    activeVoiceMessageCard = card
+    voiceMessagePlayer.source = "file://" + card.mediaPath
+    voiceMessagePlayer.play()
   }
 
   function messageIndex(messageId) {
@@ -536,6 +562,19 @@ Item {
     }
   }
 
+  AudioOutput {
+    id: voiceMessageAudio
+  }
+
+  MediaPlayer {
+    id: voiceMessagePlayer
+    audioOutput: voiceMessageAudio
+
+    onMediaStatusChanged: {
+      if (mediaStatus === MediaPlayer.EndOfMedia) root.stopVoiceMessage()
+    }
+  }
+
   NumberAnimation {
     id: scrollToBottomAnimation
 
@@ -549,6 +588,7 @@ Item {
     target: root.service
     function onSelectedChatJidChanged() {
       root.stopInlineVideo()
+      root.stopVoiceMessage()
       scrollToBottomAnimation.stop()
       root.conversationScrollSerial++
       root.conversationReady = false
@@ -558,6 +598,7 @@ Item {
     }
     function onMessagesWillChange(preservePosition) {
       root.stopInlineVideo()
+      root.stopVoiceMessage()
       if (!preservePosition || !messageList || !root.conversationReady
           || root.restoreConversationAfterMessages) return
       root.preservedConversationContentY = messageList.contentY
@@ -1509,6 +1550,7 @@ Item {
                       readonly property bool hasStructuredMedia: mediaData
                         && (mediaData.kind === "image"
                           || mediaData.kind === "video"
+                          || mediaData.kind === "audio"
                           || mediaData.kind === "document"
                           || mediaData.kind === "location")
                       readonly property bool hasMediaCaption: mediaData
@@ -1578,9 +1620,13 @@ Item {
 
                       ListView.onPooled: {
                         root.stopInlineVideo(mediaPreviewCard)
+                        root.stopVoiceMessage(voiceMessageCard)
                         reactionPicker.close()
                       }
-                      ListView.onReused: reactionPicker.close()
+                      ListView.onReused: {
+                        root.stopVoiceMessage(voiceMessageCard)
+                        reactionPicker.close()
+                      }
 
                       CrispBorderSurface {
                         id: senderAvatar
@@ -1799,7 +1845,7 @@ Item {
                               ? String(messageDelegate.mediaData.thumbnail_path || "") : ""
                             readonly property string displayPath: isVideo
                               ? thumbnailPath
-                              : (downloaded ? mediaPath : (thumbnailPath || mediaPath))
+                              : (downloaded ? mediaPath : thumbnailPath)
                             readonly property bool inlineActive:
                               root.activeInlineVideoCard === mediaPreviewCard
                             readonly property bool inlinePlaying: inlineActive
@@ -1808,7 +1854,7 @@ Item {
                               && (messageDelegate.mediaData.kind === "image"
                                 || messageDelegate.mediaData.kind === "video")
                             width: parent.width
-                            height: visible
+                            height: visible && messageDelegate.mediaData
                               ? (isVideo ? width / bubble.videoAspectRatio
                                 : Math.max(Style.space(110), Math.min(
                                   Style.space(280), width * Number(
@@ -1918,6 +1964,138 @@ Item {
 
                             Component.onDestruction:
                               root.stopInlineVideo(mediaPreviewCard)
+                          }
+                          Item {
+                            id: voiceMessageCard
+                            readonly property bool downloaded:
+                              messageDelegate.mediaData
+                              ? messageDelegate.mediaData.downloaded === true : false
+                            readonly property string mediaPath:
+                              messageDelegate.mediaData
+                              ? String(messageDelegate.mediaData.path || "") : ""
+                            readonly property bool active:
+                              root.activeVoiceMessageCard === voiceMessageCard
+                            readonly property bool playing: active
+                              && voiceMessagePlayer.playbackState
+                                === MediaPlayer.PlayingState
+                            readonly property real totalSeconds: Math.max(0,
+                              Number(messageDelegate.mediaData
+                                ? messageDelegate.mediaData.duration_seconds || 0 : 0))
+                            readonly property real elapsedSeconds: active
+                              ? Math.max(0, Number(voiceMessagePlayer.position || 0) / 1000)
+                              : 0
+                            readonly property real progress: active
+                              && voiceMessagePlayer.duration > 0
+                              ? Math.min(1, voiceMessagePlayer.position
+                                / voiceMessagePlayer.duration) : 0
+
+                            visible: messageDelegate.mediaData
+                              && messageDelegate.mediaData.kind === "audio"
+                            width: parent.width
+                            height: visible ? Style.space(48) : 0
+
+                            CrispButton {
+                              id: voiceMessageButton
+                              readonly property bool downloading: visible
+                                && root.service
+                                && root.service.mediaDownloading(modelData)
+
+                              anchors.left: parent.left
+                              anchors.verticalCenter: parent.verticalCenter
+                              width: Style.space(40)
+                              height: Style.space(40)
+                              iconText: downloading ? "󰔟"
+                                : (voiceMessageCard.downloaded
+                                  ? (voiceMessageCard.playing ? "󰏤" : "󰐊")
+                                  : "󰇚")
+                              tooltipText: downloading ? "Downloading voice message"
+                                : (voiceMessageCard.downloaded
+                                  ? (voiceMessageCard.playing
+                                    ? "Pause voice message" : "Play voice message")
+                                  : "Download voice message")
+                              foreground: root.foreground
+                              accent: root.accent
+                              enabled: root.service && !downloading
+
+                              onClicked: {
+                                if (voiceMessageCard.downloaded)
+                                  root.toggleVoiceMessage(voiceMessageCard)
+                                else
+                                  root.service.downloadMedia(modelData)
+                              }
+                            }
+
+                            Column {
+                              anchors.left: voiceMessageButton.right
+                              anchors.right: parent.right
+                              anchors.leftMargin: Style.space(10)
+                              anchors.verticalCenter: parent.verticalCenter
+                              spacing: Style.space(6)
+
+                              Text {
+                                width: parent.width
+                                text: messageDelegate.mediaData
+                                  && messageDelegate.mediaData.voice_message === false
+                                  ? "Audio" : "Voice message"
+                                color: root.foreground
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.body
+                                font.bold: true
+                                elide: Text.ElideRight
+                              }
+
+                              Item {
+                                width: parent.width
+                                height: Math.max(voiceDuration.implicitHeight,
+                                  Style.space(8))
+
+                                Rectangle {
+                                  id: voiceProgressTrack
+                                  anchors.left: parent.left
+                                  anchors.right: voiceDuration.left
+                                  anchors.rightMargin: Style.space(10)
+                                  anchors.verticalCenter: parent.verticalCenter
+                                  height: Math.max(2, Style.normalBorderWidth)
+                                  radius: height / 2
+                                  color: Style.normalBorderFor(
+                                    root.foreground, root.accent)
+
+                                  Rectangle {
+                                    width: parent.width * voiceMessageCard.progress
+                                    height: parent.height
+                                    radius: parent.radius
+                                    color: root.accent
+                                  }
+
+                                  MouseArea {
+                                    anchors.fill: parent
+                                    enabled: voiceMessageCard.active
+                                      && voiceMessagePlayer.duration > 0
+                                    cursorShape: enabled
+                                      ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                    onClicked: function(mouse) {
+                                      voiceMessagePlayer.position = Math.round(
+                                        mouse.x / width * voiceMessagePlayer.duration)
+                                    }
+                                  }
+                                }
+
+                                Text {
+                                  id: voiceDuration
+                                  anchors.right: parent.right
+                                  anchors.verticalCenter: parent.verticalCenter
+                                  text: Model.mediaDuration(voiceMessageCard.active
+                                    ? voiceMessageCard.elapsedSeconds
+                                    : voiceMessageCard.totalSeconds)
+                                  color: root.timestamp
+                                  font.family: root.fontFamily
+                                  font.pixelSize: root.messageMetaFontSize
+                                }
+                              }
+                            }
+
+                            Component.onDestruction:
+                              root.stopVoiceMessage(voiceMessageCard)
                           }
                           Item {
                             id: documentCard

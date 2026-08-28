@@ -676,6 +676,11 @@ impl Database {
                             thumbnail_path.clear();
                         }
                     }
+                    Some(MessageMedia::Audio {
+                        path, downloaded, ..
+                    }) => {
+                        *downloaded = Path::new(path).is_file();
+                    }
                     _ => {}
                 }
                 Ok(Message {
@@ -1508,7 +1513,7 @@ impl Database {
                 "SELECT id, sender_jid, from_me, timestamp FROM messages
                  WHERE chat_jid = ?1 AND (
                    (media_json IS NULL
-                    AND text IN ('[Image]', '[Video]', '[Document]', '[Location]', '[Live location]'))
+                    AND text IN ('[Image]', '[Video]', '[Voice message]', '[Document]', '[Location]', '[Live location]'))
                    OR ((media_json LIKE '%\"kind\":\"image\"%'
                         OR media_json LIKE '%\"kind\":\"video\"%')
                        AND (media_download IS NULL
@@ -1821,6 +1826,28 @@ mod tests {
         assert_eq!(
             database.list_chats(10).unwrap()[0].last_message,
             "message newer-text"
+        );
+    }
+
+    #[test]
+    fn legacy_voice_message_is_selected_for_media_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut voice = message("voice", 4);
+        voice.text = "[Voice message]".into();
+        database
+            .insert_message(&voice, "Ada", false, false)
+            .unwrap();
+
+        assert_eq!(
+            database.media_recovery_cursor(&voice.chat_jid).unwrap(),
+            Some(HistoryCursor {
+                chat_jid: voice.chat_jid,
+                message_id: voice.id,
+                sender_jid: voice.sender_jid,
+                from_me: voice.from_me,
+                timestamp_ms: voice.timestamp * 1_000,
+            })
         );
     }
 

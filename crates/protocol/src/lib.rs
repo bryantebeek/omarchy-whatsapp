@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -90,6 +90,14 @@ pub enum MessageMedia {
         duration_seconds: u32,
         gif_playback: bool,
     },
+    Audio {
+        path: String,
+        #[serde(default)]
+        downloaded: bool,
+        mime_type: String,
+        duration_seconds: u32,
+        voice_message: bool,
+    },
     Document {
         path: String,
         file_name: String,
@@ -134,6 +142,10 @@ pub enum Command {
         message_id: String,
     },
     DownloadVideo {
+        chat_jid: String,
+        message_id: String,
+    },
+    DownloadAudio {
         chat_jid: String,
         message_id: String,
     },
@@ -495,6 +507,19 @@ mod tests {
             height: 1080,
             duration_seconds: 12,
             gif_playback: false,
+        };
+        let json = serde_json::to_string(&media).unwrap();
+        assert_eq!(serde_json::from_str::<MessageMedia>(&json).unwrap(), media);
+    }
+
+    #[test]
+    fn audio_media_round_trip_is_stable() {
+        let media = MessageMedia::Audio {
+            path: "/private/cache/note.audio.ogg".into(),
+            downloaded: false,
+            mime_type: "audio/ogg; codecs=opus".into(),
+            duration_seconds: 18,
+            voice_message: true,
         };
         let json = serde_json::to_string(&media).unwrap();
         assert_eq!(serde_json::from_str::<MessageMedia>(&json).unwrap(), media);

@@ -128,7 +128,7 @@ temporary file and atomically renamed after verification. Images are limited to
 
 ## Deliberate exclusions
 
-Video, audio, documents, stickers, newsletters, presence/typing, embedded maps,
+Stickers, newsletters, presence/typing, embedded maps,
 and a full VoIP stack are not downloaded or hosted by the UI. Their messages
 remain visible as compact placeholders. This keeps the always-on process small
 and avoids pulling Chromium/WebEngine into Omarchy Shell.

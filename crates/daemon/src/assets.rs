@@ -11,6 +11,7 @@ use tracing::warn;
 use whatsapp_rust::prelude::{Client, Jid, wa};
 
 pub const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_VIDEO_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_DOCUMENT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_AVATAR_BYTES: usize = 1024 * 1024;
@@ -123,6 +124,39 @@ pub fn message_video_thumbnail_path(directory: &Path, chat_jid: &str, message_id
         "{}-{}.video-thumbnail.jpg",
         hex_key(chat_jid),
         hex_key(message_id)
+    ))
+}
+
+fn audio_extension(mime_type: Option<&str>) -> &'static str {
+    match mime_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "audio/ogg" => ".ogg",
+        "audio/mpeg" => ".mp3",
+        "audio/mp4" | "audio/x-m4a" => ".m4a",
+        "audio/aac" => ".aac",
+        "audio/wav" | "audio/x-wav" => ".wav",
+        _ => "",
+    }
+}
+
+pub fn message_audio_path(
+    directory: &Path,
+    chat_jid: &str,
+    message_id: &str,
+    mime_type: Option<&str>,
+) -> PathBuf {
+    directory.join(format!(
+        "{}-{}.audio{}",
+        hex_key(chat_jid),
+        hex_key(message_id),
+        audio_extension(mime_type)
     ))
 }
 
@@ -359,11 +393,15 @@ pub fn remove_message_media(directory: &Path, chat_jid: &str, message_id: &str) 
     let _ = std::fs::remove_file(location_thumbnail_path(directory, chat_jid, message_id));
     let document_prefix = format!("{}-{}.document", hex_key(chat_jid), hex_key(message_id));
     let video_prefix = format!("{}-{}.video", hex_key(chat_jid), hex_key(message_id));
+    let audio_prefix = format!("{}-{}.audio", hex_key(chat_jid), hex_key(message_id));
     if let Ok(entries) = std::fs::read_dir(directory) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(&document_prefix) || name.starts_with(&video_prefix) {
+            if name.starts_with(&document_prefix)
+                || name.starts_with(&video_prefix)
+                || name.starts_with(&audio_prefix)
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -454,6 +492,15 @@ fn video_bytes_are_safe(bytes: &[u8]) -> bool {
     bytes.get(4..8) == Some(b"ftyp")
         || bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
         || bytes.starts_with(&[0x00, 0x00, 0x01, 0xba])
+}
+
+fn audio_bytes_are_safe(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"OggS")
+        || bytes.starts_with(b"ID3")
+        || bytes.starts_with(b"ADIF")
+        || bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE")
+        || bytes.get(4..8) == Some(b"ftyp")
+        || matches!(bytes, [0xff, second, ..] if second & 0xe0 == 0xe0)
 }
 
 pub fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -662,6 +709,55 @@ pub async fn download_message_video(
     }
 }
 
+pub async fn download_message_audio(
+    client: Arc<Client>,
+    audio: wa::message::AudioMessage,
+    path: PathBuf,
+) -> Result<bool> {
+    let declared = audio.file_length.unwrap_or(0);
+    if declared == 0 || declared > MAX_AUDIO_BYTES {
+        bail!("audio declares an invalid size of {declared} bytes");
+    }
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == declared) {
+        return Ok(false);
+    }
+    let temporary = path.with_extension(format!("part-{}", std::process::id()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let result = client.download_to_writer(&audio, file).await;
+    match result {
+        Ok(mut file) => {
+            let length = file.metadata()?.len();
+            if length != declared || length > MAX_AUDIO_BYTES {
+                let _ = std::fs::remove_file(&temporary);
+                bail!("downloaded audio has invalid size {length}");
+            }
+            file.seek(SeekFrom::Start(0))?;
+            let mut header = [0u8; 16];
+            let count = file.read(&mut header)?;
+            if !audio_bytes_are_safe(&header[..count]) {
+                let _ = std::fs::remove_file(&temporary);
+                bail!("downloaded media is not supported audio");
+            }
+            drop(file);
+            std::fs::rename(&temporary, &path)?;
+            if let Some(directory) = path.parent() {
+                prune_directory(directory, MAX_MEDIA_CACHE_BYTES, &path);
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(anyhow!(error)).context("downloading WhatsApp audio")
+        }
+    }
+}
+
 pub async fn download_message_document(
     client: Arc<Client>,
     document: wa::message::DocumentMessage,
@@ -742,6 +838,16 @@ mod tests {
             "31323340672e7573-636c6970.video-thumbnail.jpg"
         );
         assert!(cached_video_thumbnail_path(Path::new("/tmp/cache/not-video.mp4")).is_none());
+        let audio = message_audio_path(
+            directory,
+            "123@g.us",
+            "note",
+            Some("audio/ogg; codecs=opus"),
+        );
+        assert_eq!(
+            audio.file_name().unwrap(),
+            "31323340672e7573-6e6f7465.audio.ogg"
+        );
     }
 
     #[test]
@@ -754,6 +860,8 @@ mod tests {
         assert!(video_bytes_are_safe(b"\0\0\0\x18ftypisom"));
         assert!(video_bytes_are_safe(b"\x1a\x45\xdf\xa3webm"));
         assert!(!video_bytes_are_safe(b"<html>not a video"));
+        assert!(audio_bytes_are_safe(b"OggS\0\x02voice"));
+        assert!(!audio_bytes_are_safe(b"<html>not audio"));
     }
 
     #[test]

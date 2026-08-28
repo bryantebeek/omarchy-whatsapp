@@ -313,7 +313,8 @@ Item {
       return false
     var kind = String(message.media ? message.media.kind || "" : "")
     var command = kind === "image" ? "download_image"
-      : (kind === "video" ? "download_video" : "")
+      : (kind === "video" ? "download_video"
+        : (kind === "audio" ? "download_audio" : ""))
     if (!command) return false
     var requestId = send(command, {
       chat_jid: String(message.chat_jid),

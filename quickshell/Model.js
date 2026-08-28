@@ -66,6 +66,17 @@ function messageTime(seconds) {
   })
 }
 
+function mediaDuration(seconds) {
+  var value = Math.max(0, Math.floor(Number(seconds || 0)))
+  var hours = Math.floor(value / 3600)
+  var minutes = Math.floor((value % 3600) / 60)
+  var remainder = value % 60
+  var paddedSeconds = remainder < 10 ? "0" + remainder : String(remainder)
+  if (!hours) return minutes + ":" + paddedSeconds
+  var paddedMinutes = minutes < 10 ? "0" + minutes : String(minutes)
+  return hours + ":" + paddedMinutes + ":" + paddedSeconds
+}
+
 function fileSize(bytes) {
   var value = Math.max(0, Number(bytes || 0))
   if (!value) return "Unknown size"

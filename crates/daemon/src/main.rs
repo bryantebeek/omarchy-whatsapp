@@ -138,6 +138,11 @@ enum PendingMedia {
         chat_jid: String,
         message_id: String,
     },
+    Audio {
+        audio: wa::message::AudioMessage,
+        chat_jid: String,
+        message_id: String,
+    },
     Document {
         document: wa::message::DocumentMessage,
         path: PathBuf,
@@ -369,6 +374,14 @@ impl Shared {
             warn!(%error, %chat_jid, message_id = %info.id,
                 "could not persist WhatsApp video download metadata");
         }
+        if let Some(audio) = base.audio_message.as_option()
+            && let Err(error) =
+                self.database
+                    .store_media_download(&chat_jid, &info.id, &audio.encode_to_vec())
+        {
+            warn!(%error, %chat_jid, message_id = %info.id,
+                "could not persist WhatsApp audio download metadata");
+        }
         if insert_result.is_ok()
             && info.source.is_group
             && chat_name != chat_jid
@@ -483,6 +496,12 @@ impl Shared {
                         } else if let Some(video) = video_message(base).cloned() {
                             pending_media.push(PendingMedia::Video {
                                 video,
+                                chat_jid: chat_jid.clone(),
+                                message_id: message.id.clone(),
+                            });
+                        } else if let Some(audio) = base.audio_message.as_option().cloned() {
+                            pending_media.push(PendingMedia::Audio {
+                                audio,
                                 chat_jid: chat_jid.clone(),
                                 message_id: message.id.clone(),
                             });
@@ -803,6 +822,21 @@ fn message_media(
             height: video.height.unwrap_or(0),
             duration_seconds: video.seconds.unwrap_or(0),
             gif_playback: video.gif_playback.unwrap_or(false),
+        });
+    }
+    if let Some(audio) = message.audio_message.as_option() {
+        let path =
+            assets::message_audio_path(directory, chat_jid, message_id, audio.mimetype.as_deref());
+        assets::prune_media_cache(directory, &path);
+        return Some(MessageMedia::Audio {
+            path: path.to_string_lossy().into_owned(),
+            downloaded: path.exists(),
+            mime_type: audio
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "audio/ogg; codecs=opus".to_owned()),
+            duration_seconds: audio.seconds.unwrap_or(0),
+            voice_message: audio.ptt.unwrap_or(false),
         });
     }
     if let Some(document) = message.document_message.as_option() {
@@ -1295,6 +1329,15 @@ async fn download_pending_media(
                     &chat_jid,
                     &message_id,
                     &video.encode_to_vec(),
+                ),
+                PendingMedia::Audio {
+                    audio,
+                    chat_jid,
+                    message_id,
+                } => shared.database.store_media_download(
+                    &chat_jid,
+                    &message_id,
+                    &audio.encode_to_vec(),
                 ),
                 PendingMedia::Document { document, path } => {
                     assets::download_message_document(client, document, path).await
@@ -2754,6 +2797,76 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 chat_jid,
             })
         }
+        Command::DownloadAudio {
+            chat_jid,
+            message_id,
+        } => {
+            if message_id.is_empty() || message_id.len() > 512 {
+                bail!("invalid audio message ID");
+            }
+            let client = shared
+                .client
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+            let chat_jid = canonical_requested_jid(shared, &chat_jid).await;
+            if shared
+                .database
+                .message_media_kind(&chat_jid, &message_id)?
+                .as_deref()
+                != Some("audio")
+            {
+                bail!("message is not audio");
+            }
+            let key = format!("{chat_jid}\0{message_id}");
+            {
+                let mut downloads = shared.media_downloads.lock().await;
+                if !downloads.insert(key.clone()) {
+                    bail!("this audio is already downloading");
+                }
+            }
+
+            let result = async {
+                let payload =
+                    media_download_payload(shared, &client, &chat_jid, &message_id, "audio")
+                        .await?;
+                let audio = wa::message::AudioMessage::decode_from_slice(&payload)
+                    .context("reading audio download metadata")?;
+                let path = assets::message_audio_path(
+                    &shared.media_dir,
+                    &chat_jid,
+                    &message_id,
+                    audio.mimetype.as_deref(),
+                );
+                shared.database.update_message_media(
+                    &chat_jid,
+                    &message_id,
+                    &MessageMedia::Audio {
+                        path: path.to_string_lossy().into_owned(),
+                        downloaded: path.exists(),
+                        mime_type: audio
+                            .mimetype
+                            .clone()
+                            .unwrap_or_else(|| "audio/ogg; codecs=opus".to_owned()),
+                        duration_seconds: audio.seconds.unwrap_or(0),
+                        voice_message: audio.ptt.unwrap_or(false),
+                    },
+                )?;
+                assets::download_message_audio(client, audio, path).await?;
+                Result::<()>::Ok(())
+            }
+            .await;
+            shared.media_downloads.lock().await.remove(&key);
+            result?;
+
+            broadcast_messages(shared, &chat_jid);
+            Ok(ServerEvent::Messages {
+                messages: shared.database.messages(&chat_jid, 300)?,
+                first_unread_message_id: shared.database.first_unread_message_id(&chat_jid)?,
+                chat_jid,
+            })
+        }
         Command::React {
             chat_jid,
             message_id,
@@ -3316,7 +3429,7 @@ mod tests {
     }
 
     #[test]
-    fn visual_document_and_live_location_payloads_become_private_ui_media() {
+    fn visual_audio_document_and_live_location_payloads_become_private_ui_media() {
         let directory = tempfile::tempdir().unwrap();
         let media_dir = directory.path().join("media");
         assets::private_dir(&media_dir).unwrap();
@@ -3402,6 +3515,35 @@ mod tests {
             std::fs::read(thumbnail_path).unwrap(),
             b"\xff\xd8\xffvideo-thumbnail"
         );
+
+        let audio = wa::Message {
+            audio_message: MessageField::some(wa::message::AudioMessage {
+                mimetype: Some("audio/ogg; codecs=opus".into()),
+                file_length: Some(120_000),
+                seconds: Some(18),
+                ptt: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let audio_media = message_media(&audio, &media_dir, "1@s.whatsapp.net", "note", 18, 0)
+            .expect("audio media");
+        let MessageMedia::Audio {
+            path,
+            downloaded,
+            mime_type,
+            duration_seconds,
+            voice_message,
+        } = audio_media
+        else {
+            panic!("expected audio media")
+        };
+        assert_eq!(mime_type, "audio/ogg; codecs=opus");
+        assert_eq!(duration_seconds, 18);
+        assert!(voice_message);
+        assert!(!downloaded);
+        assert!(path.ends_with(".audio.ogg"));
+        assert_eq!(media_text(&audio, ""), Some("[Voice message]".to_owned()));
 
         let document = wa::Message {
             document_message: MessageField::some(wa::message::DocumentMessage {
