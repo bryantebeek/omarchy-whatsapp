@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -40,11 +41,13 @@ pub fn avatar_missing_path(directory: &Path, jid: &str) -> PathBuf {
     directory.join(format!("{}.none", hex_key(jid)))
 }
 
-pub fn available_avatar_jids(directory: &Path) -> Vec<String> {
+pub type AvatarFingerprint = (u64, u64, i64, i64);
+
+pub fn avatar_fingerprints(directory: &Path) -> BTreeMap<String, AvatarFingerprint> {
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return Vec::new();
+        return BTreeMap::new();
     };
-    let mut jids = entries
+    entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
@@ -60,11 +63,23 @@ pub fn available_avatar_jids(directory: &Path) -> Vec<String> {
                 .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16))
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .ok()?;
-            String::from_utf8(bytes).ok()
+            let jid = String::from_utf8(bytes).ok()?;
+            let metadata = entry.metadata().ok()?;
+            Some((
+                jid,
+                (
+                    metadata.ino(),
+                    metadata.len(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                ),
+            ))
         })
-        .collect::<Vec<_>>();
-    jids.sort();
-    jids
+        .collect()
+}
+
+pub fn available_avatar_jids(directory: &Path) -> Vec<String> {
+    avatar_fingerprints(directory).into_keys().collect()
 }
 
 pub fn message_image_path(directory: &Path, chat_jid: &str, message_id: &str) -> PathBuf {
@@ -768,6 +783,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(available_avatar_jids(directory.path()), vec!["123-4@g.us"]);
+    }
+
+    #[test]
+    fn avatar_fingerprints_change_after_an_atomic_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(avatar_fingerprints(&directory.path().join("missing")).is_empty());
+        let jid = "123-4@g.us";
+        let path = avatar_path(directory.path(), jid);
+        write_private_bytes(&path, b"first").unwrap();
+        let first = avatar_fingerprints(directory.path());
+
+        write_private_bytes(&path, b"second").unwrap();
+        let second = avatar_fingerprints(directory.path());
+
+        assert_eq!(
+            first.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![jid]
+        );
+        assert_eq!(
+            second.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![jid]
+        );
+        assert_ne!(first[jid], second[jid]);
     }
 
     #[test]
