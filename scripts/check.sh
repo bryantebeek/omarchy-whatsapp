@@ -10,6 +10,7 @@ cd "$repo_dir"
 ./scripts/check-version.sh
 ./scripts/check-manifest.sh
 ./scripts/generate-license-report.sh --check
+./tests/diff-coverage.sh
 /usr/lib/qt6/bin/qmlformat -n quickshell/*.qml >/dev/null
 jq -e . manifest.json quickshell/licenses.json >/dev/null
 ./scripts/qml-lint.sh

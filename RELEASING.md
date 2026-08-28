@@ -18,14 +18,16 @@ Releases use semantic versions and are cut from a reviewed, green `main`.
      reinstall and confirm the daemon reconnects without relinking.
    Restore the previous bar position if the disable/re-enable test changes it.
 5. Merge only after the required GitHub checks and review pass.
-6. Create a signed or annotated `vX.Y.Z` tag whose version matches the package
-   metadata, and push that tag. CI reruns all quality, coverage, packaging, and
-   smoke gates for release tags and rejects a version mismatch.
-7. Publish release notes describing user-visible changes, upgrade impact,
-   security fixes, and known protocol limitations. GitHub supplies source
-   archives for the tag; do not attach locally built binaries unless a
-   reproducible, checksummed artifact workflow is added first.
+6. Create a signed `vX.Y.Z` tag whose version matches the package metadata and
+   points to a commit already present on protected `main`, then push that tag.
+   CI reruns all quality, coverage, packaging, and smoke gates for release tags.
+7. The release workflow verifies the tag and version, produces a reproducible
+   x86_64 archive, publishes its SHA-256 checksum, records a GitHub/Sigstore
+   provenance attestation, and creates the GitHub release. Add release notes
+   describing user-visible changes, upgrade impact, security fixes, and known
+   protocol limitations.
 
 Keep the previous release available so users can roll back binaries while
-preserving `~/.local/state/omarchy-whatsapp`. Never package or publish that state
-directory.
+preserving `~/.local/state/omarchy-whatsapp`. Verify downloaded archives with
+both the published checksum and `gh attestation verify`. Never package or
+publish the local state directory.

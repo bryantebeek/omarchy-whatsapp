@@ -17,17 +17,22 @@ GitHub repository settings.
 
 ## One-time GitHub settings
 
-Configuration files cannot enable repository rules themselves. After these
-workflows first reach GitHub, create a ruleset for `main` that:
+Keep the repository's `main` ruleset configured to:
 
 - requires a pull request, resolved conversations, and all six checks named
   above;
 - requires the branch to be up to date before merge;
 - blocks force pushes and deletion and requires linear history;
-- limits the default `GITHUB_TOKEN` to read-only and permits write access only
-  in a future, narrowly scoped release workflow;
+- requires CodeQL results at the configured security threshold in addition to
+  requiring the workflow status;
+- limits the default `GITHUB_TOKEN` to read-only and grants write access only
+  to the narrowly scoped release job;
+- requires full-length action SHAs and permits only GitHub-owned actions plus
+  the explicitly approved third-party action repositories;
 - enables private vulnerability reporting, Dependabot alerts/security updates,
-  secret scanning, and push protection where the repository plan supports them.
+  secret scanning, and push protection; enable non-provider pattern scanning
+  and validity checks as well when GitHub makes them available to the
+  repository.
 
 Also protect `v*` tags from updates or deletion. Repository administrators
 should not bypass these rules for routine changes.
@@ -39,13 +44,17 @@ approval dismissal when a second maintainer with write access is added.
 
 ## Coverage contract
 
-`scripts/coverage.sh` applies two independent policies:
+`scripts/coverage.sh` applies three independent policies:
 
-1. Total Rust line coverage may not fall below 54%, the measured whole-program
-   baseline when this policy was introduced.
+1. Total Rust line coverage may not fall below 54.8%, the measured
+   whole-program baseline when this policy was last ratcheted.
 2. Every line in the deterministic contract layer must be covered. This is the
    protocol crate and the exhaustive upstream-event policy in
    `event_coverage.rs`; the threshold is both 100% overall and 100% per file.
+3. In CI, every executable Rust line added or changed relative to the pull
+   request base (or previous pushed commit) must be covered. Diff coverage is
+   therefore 100%, preventing new coverage debt while legacy integration
+   boundaries remain visible in the whole-program report.
 
 The following executable or integration-boundary files are deliberately outside
 the 100% contract metric and remain visible in the whole-program report:
@@ -61,10 +70,10 @@ the 100% contract metric and remain visible in the whole-program report:
 | Installer/service/package | ShellCheck, version and metadata checks, locked release build, live install verification |
 
 This boundary is explicit because reporting 100% by silently excluding
-uncovered application code would be misleading. The contract threshold catches
-every uncovered line in the most stable, security-sensitive serialization
-surface, while the total threshold prevents untested application code from
-growing unnoticed. Raise the total baseline whenever new tests improve it.
+uncovered application code would be misleading. Contract and diff coverage
+guarantee that stable and newly changed testable code is fully exercised, while
+the total threshold keeps legacy integration code visible and can only ratchet
+upward. Raise the total baseline whenever new tests improve it.
 
 Coverage is evidence that lines executed, not proof that every behavior is
 correct. Tests should still cover success, failure, boundary, and regression

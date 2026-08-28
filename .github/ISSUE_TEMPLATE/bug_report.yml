@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a reproducible problem using privacy-safe test data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem.
+
+        **Privacy warning:** do not attach pairing QR codes, databases, account state, logs containing message content, real phone numbers, real names, or screenshots of real conversations. Use fictional replacements. Report suspected vulnerabilities through the private security link instead.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed or replaced all account-specific and personally identifying information.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+  - type: input
+    id: omarchy-version
+    attributes:
+      label: Omarchy version
+      placeholder: "4.0.1"
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version or commit
+      placeholder: "0.3.0 or commit SHA"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior using fictional data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Open …
+        2. Select …
+        3. Observe …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Optional. Remove message bodies, JIDs, phone numbers, paths containing names, tokens, and account identifiers.
+      render: shell
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Attach only sanitized screenshots or fixtures.

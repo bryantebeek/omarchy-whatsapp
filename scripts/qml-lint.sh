@@ -37,12 +37,18 @@ if [[ -r $commons_qmldir && -r $ui_qmldir ]]; then
   exit 0
 fi
 
-# Hosted CI does not include Omarchy's private shell modules. qmllint still
-# rejects malformed QML; its unresolved-import warnings do not affect status.
-lint_output=$(mktemp)
-trap 'rm -f -- "$lint_output"' EXIT
-if ! "$qmllint_command" "${qml_files[@]}" >"$lint_output" 2>&1; then
-  cat "$lint_output" >&2
+# Hosted CI does not include Omarchy or Quickshell's runtime QML modules. A
+# bare qmllint invocation therefore reports every imported type as unresolved
+# and exits unsuccessfully even for valid plugin QML. qmlformat uses the same
+# Qt parser without pretending that semantic type checking was performed.
+if command -v qmlformat >/dev/null 2>&1; then
+  qmlformat_command=$(command -v qmlformat)
+elif [[ -x /usr/lib/qt6/bin/qmlformat ]]; then
+  qmlformat_command=/usr/lib/qt6/bin/qmlformat
+else
+  echo "qmlformat is required; install the Qt 6 declarative development tools." >&2
   exit 1
 fi
-echo "QML syntax passed; Omarchy type definitions are unavailable in this environment."
+
+"$qmlformat_command" -n "${qml_files[@]}" >/dev/null
+echo "QML syntax passed; semantic lint requires an Omarchy host and was skipped."

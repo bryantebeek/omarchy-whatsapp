@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: Required CI gates
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Build, attest, and publish
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify protected release source and version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          expected_version=$(jq -er .version manifest.json)
+          test "$GITHUB_REF_NAME" = "v$expected_version"
+          ./scripts/check-version.sh
+          tag_sha=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+            --jq '.object | select(.type == "tag") | .sha')
+          test -n "$tag_sha"
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" \
+            --jq '.verification.verified' | grep --quiet '^true$'
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-06-16 --profile minimal
+      - name: Build locked release binaries
+        run: cargo build --release --locked --workspace
+      - name: Create reproducible release archive
+        id: package
+        run: |
+          archive_path=$(./scripts/package-release.sh "$RUNNER_TEMP/release")
+          echo "archive=$archive_path" >>"$GITHUB_OUTPUT"
+          echo "checksum=$archive_path.sha256" >>"$GITHUB_OUTPUT"
+      - name: Attest release archive provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ARCHIVE: ${{ steps.package.outputs.archive }}
+          RELEASE_CHECKSUM: ${{ steps.package.outputs.checksum }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "$RELEASE_ARCHIVE" \
+            "$RELEASE_CHECKSUM" \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"

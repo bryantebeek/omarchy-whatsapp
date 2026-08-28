@@ -1,9 +1,9 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install system quality tools
@@ -55,16 +55,19 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install nightly-2026-06-16 --profile minimal --component llvm-tools-preview
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63 # v2
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
         with:
           tool: cargo-llvm-cov@0.9.0
       - name: Enforce coverage policy
+        env:
+          COVERAGE_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD^' }}
         run: ./scripts/coverage.sh
 
   smoke:
@@ -73,7 +76,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install smoke-test dependencies
@@ -100,7 +103,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Audit dependencies, licenses, and sources
