@@ -9,7 +9,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-archive=$($repo_dir/scripts/package-release.sh "$test_dir")
+archive=$("$repo_dir"/scripts/package-release.sh "$test_dir")
 version=$(jq -er .version "$repo_dir/manifest.json")
 archive_root="omarchy-whatsapp-$version"
 plugin_root="$archive_root/usr/share/omarchy/shell/plugins/whatsapp"
