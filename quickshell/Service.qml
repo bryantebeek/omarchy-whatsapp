@@ -15,6 +15,10 @@ Item {
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "io.github.bryantebeek.whatsapp"
+  readonly property string pluginDir: manifest && manifest.__sourceDir
+    ? String(manifest.__sourceDir) : ""
+  readonly property string daemonSetupScript: pluginDir
+    ? pluginDir + "/scripts/setup-daemon.sh" : ""
   readonly property string socketPath: {
     var runtime = Quickshell.env("XDG_RUNTIME_DIR")
     return String(runtime || "/tmp") + "/omarchy-whatsapp/daemon.sock"
@@ -94,11 +98,18 @@ Item {
   property int chatStateResyncRequestId: 0
   readonly property bool chatStateResyncBusy:
     chatStateResyncStatus === "requested" || chatStateResyncStatus === "syncing"
+  property bool daemonRuntimeChecked: false
+  property bool daemonRuntimeReady: false
+  property bool daemonSetupBusy: false
+  property string daemonSetupDetail: ""
+  property string daemonSetupError: ""
   property bool unreadOnly: false
   property bool uiPreferencesReady: false
   property bool uiPreferencesDirty: false
   property int uiPreferencesRevision: 0
   property int uiPreferencesSavingRevision: 0
+  readonly property bool daemonSetupRequired: daemonRuntimeChecked
+    && !daemonRuntimeReady
 
   signal messagesWillChange(bool preservePosition)
   signal textMessageAccepted(string deliveryId, string chatJid, string text)
@@ -461,6 +472,50 @@ Item {
     voiceMessageRequestChatJid = ""
     voiceMessageRequestDurationMs = 0
     return true
+  function updateDaemonSetupDetail(line) {
+    var detail = String(line || "").trim()
+    if (!detail) return
+    if (detail.indexOf("setup: ") === 0) detail = detail.substring(7)
+    daemonSetupDetail = detail.length > 240
+      ? detail.substring(0, 237) + "…" : detail
+  }
+
+  function checkDaemonRuntime() {
+    if (runtimeCheck.running) return
+    if (!daemonSetupScript) {
+      daemonStarter.running = true
+      return
+    }
+    runtimeCheck.command = ["/usr/bin/bash", daemonSetupScript, "check"]
+    runtimeCheck.running = true
+  }
+
+  function setupDaemonRuntime() {
+    if (daemonSetupBusy) return false
+    if (!daemonSetupScript) {
+      daemonRuntimeChecked = true
+      daemonRuntimeReady = false
+      daemonSetupError = "The plugin checkout does not include its daemon setup helper."
+      return false
+    }
+    daemonSetupError = ""
+    daemonSetupDetail = "Preparing the local build…"
+    daemonSetupBusy = true
+    runtimeSetup.command = ["/usr/bin/bash", daemonSetupScript, "setup"]
+    runtimeSetup.running = true
+    return true
+  }
+
+  function retryDaemon() {
+    daemonSetupError = ""
+    reconnectAttempt = 0
+    if (daemonSetupRequired) {
+      checkDaemonRuntime()
+      return
+    }
+    if (!daemonStarter.running) daemonStarter.running = true
+    socketLoader.active = false
+    socketLoader.active = true
   }
 
   function groupParticipantRequestPending(jid) {
@@ -1564,6 +1619,10 @@ Item {
         if (connected) {
           root.protocolCompatible = false
           root.resetRequestState("")
+          root.daemonRuntimeChecked = true
+          root.daemonRuntimeReady = true
+          root.daemonSetupError = ""
+          root.daemonSetupDetail = ""
           root.reconnectAttempt = 0
           root.sentPresenceState = -1
         } else {
@@ -1597,7 +1656,9 @@ Item {
     triggeredOnStart: true
     onTriggered: {
       root.reconnectAttempt++
-      if (root.reconnectAttempt === 2) daemonStarter.running = true
+      if (root.reconnectAttempt === 2 && !root.daemonSetupBusy
+          && (!root.daemonRuntimeChecked || root.daemonRuntimeReady))
+        daemonStarter.running = true
       socketLoader.active = false
       socketLoader.active = true
     }
@@ -1691,6 +1752,65 @@ Item {
   Process {
     id: daemonStarter
     command: ["systemctl", "--user", "start", "omarchy-whatsapp.service"]
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.daemonRuntimeChecked = true
+        root.daemonRuntimeReady = true
+        return
+      }
+      root.daemonRuntimeChecked = true
+      root.daemonRuntimeReady = false
+      if (!root.daemonSetupScript)
+        root.daemonSetupError = "The plugin source directory is unavailable."
+    }
+  }
+
+  Process {
+    id: runtimeCheck
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.daemonRuntimeChecked = true
+        root.daemonRuntimeReady = true
+        if (!daemonStarter.running) daemonStarter.running = true
+        return
+      }
+      if (exitCode === 127) {
+        if (!daemonStarter.running) daemonStarter.running = true
+        return
+      }
+      root.daemonRuntimeChecked = true
+      root.daemonRuntimeReady = false
+    }
+  }
+
+  Process {
+    id: runtimeSetup
+    stdout: SplitParser {
+      splitMarker: "\n"
+      onRead: function(line) { root.updateDaemonSetupDetail(line) }
+    }
+    stderr: SplitParser {
+      splitMarker: "\n"
+      onRead: function(line) { root.updateDaemonSetupDetail(line) }
+    }
+    onExited: function(exitCode) {
+      root.daemonSetupBusy = false
+      root.daemonRuntimeChecked = true
+      root.daemonRuntimeReady = exitCode === 0
+      if (exitCode === 0) {
+        root.daemonSetupError = ""
+        root.daemonSetupDetail = "Starting WhatsApp…"
+        root.reconnectAttempt = 0
+        socketLoader.active = false
+        socketLoader.active = true
+        return
+      }
+      root.daemonSetupError = exitCode === 20
+        ? "WhatsApp setup needs jq, which is normally included with Omarchy."
+        : (exitCode === 21
+          ? "Install mise or a Rust toolchain, then try the daemon setup again."
+          : (root.daemonSetupDetail || "The WhatsApp daemon could not be set up."))
+    }
   }
 
   Process {
@@ -1729,7 +1849,7 @@ Item {
     }
   }
 
-  Component.onCompleted: daemonStarter.running = true
+  Component.onCompleted: checkDaemonRuntime()
   Component.onDestruction: {
     pauseComposing()
     send("set_presence", { available: false })

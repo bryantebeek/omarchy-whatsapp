@@ -224,18 +224,21 @@ Requirements are Omarchy 4, Quickshell, SQLite, systemd, and a Rust toolchain.
 The repository pins the nightly used by `whatsapp-rust`; if `mise` is installed,
 the installer selects it automatically.
 
-Install the disabled plugin checkout through Omarchy, then run its reviewed
-installer to build the external Rust daemon, install its user service, and
-enable the plugin:
+Install and enable the plugin checkout through Omarchy:
 
 ```bash
-omarchy plugin add https://github.com/bryantebeek/omarchy-whatsapp.git
-~/.config/omarchy/plugins/io.github.bryantebeek.whatsapp/install.sh
+omarchy plugin add https://github.com/bryantebeek/omarchy-whatsapp.git --enable
 ```
 
-Omarchy intentionally never executes plugin install hooks. Running the second
-command is therefore required; `omarchy plugin add ... --enable` by itself only
-installs the shell interface and cannot install the daemon or systemd unit.
+Open WhatsApp and select **Build and start daemon**. The reviewed setup helper
+builds in `~/.cache/omarchy-whatsapp/build`, atomically installs the daemon and
+control binary, installs the hardened user service, and starts it. Building
+outside the plugin checkout prevents Omarchy's file watcher from reloading the
+plugin while Cargo is active. The first build can take several minutes.
+
+Omarchy intentionally never executes plugin install hooks, so setup begins only
+after that explicit action in the enabled plugin UI. It requires `mise` or a
+Rust toolchain; no root privileges are needed.
 
 For a development checkout elsewhere on disk, run the same installer there:
 
