@@ -36,10 +36,11 @@ rm -rf -- \
   "$HOME/.config/omarchy/plugins/io.github.bryantebeek.whatsapp" \
   "$HOME/.config/omarchy/plugins/io.github.bryantebeek.whatsapp-native"
 
+state_dir="${XDG_STATE_HOME:-"$HOME/.local/state"}/omarchy-whatsapp"
 if ((purge_data == 1)); then
-  rm -rf -- "$HOME/.local/state/omarchy-whatsapp"
+  rm -rf -- "$state_dir"
   echo "Removed application files and local WhatsApp session/history data."
 else
-  echo "Removed application files. Session data remains in ~/.local/state/omarchy-whatsapp."
+  echo "Removed application files. Session data remains in $state_dir."
 fi
 systemctl --user daemon-reload

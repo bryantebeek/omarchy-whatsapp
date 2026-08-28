@@ -38,13 +38,13 @@ install -Dm644 "$repo_dir/packaging/icons/com.omarchy.WhatsApp.svg" \
   "$package_root/usr/share/icons/hicolor/scalable/apps/com.omarchy.WhatsApp.svg"
 
 install -Dm644 "$repo_dir/manifest.json" \
-  "$package_root/usr/share/omarchy-whatsapp/manifest.json"
+  "$package_root/usr/share/omarchy/shell/plugins/whatsapp/manifest.json"
 for plugin_file in BarWidget.qml Service.qml Panel.qml Model.js licenses.json; do
   install -Dm644 "$repo_dir/quickshell/$plugin_file" \
-    "$package_root/usr/share/omarchy-whatsapp/quickshell/$plugin_file"
+    "$package_root/usr/share/omarchy/shell/plugins/whatsapp/quickshell/$plugin_file"
 done
 install -Dm644 "$repo_dir/quickshell/icons/brand-whatsapp-filled.svg" \
-  "$package_root/usr/share/omarchy-whatsapp/quickshell/icons/brand-whatsapp-filled.svg"
+  "$package_root/usr/share/omarchy/shell/plugins/whatsapp/quickshell/icons/brand-whatsapp-filled.svg"
 install -Dm644 "$repo_dir/quickshell/icons/LICENSE.tabler" \
   "$package_root/usr/share/licenses/omarchy-whatsapp/LICENSE.tabler"
 install -Dm644 "$repo_dir/LICENSE" \

@@ -98,6 +98,8 @@ jobs:
         run: ./tests/smoke.sh
       - name: Exercise install, update, and uninstall lifecycle
         run: ./tests/deployment-lifecycle.sh
+      - name: Verify packaged plugin discovery layout
+        run: ./tests/package-layout.sh
 
   supply-chain:
     name: Supply chain

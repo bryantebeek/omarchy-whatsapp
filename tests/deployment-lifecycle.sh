@@ -20,7 +20,8 @@ test_home="$test_dir/home"
 shim_dir="$test_dir/bin"
 systemctl_log="$test_dir/systemctl.log"
 real_install=$(command -v install)
-mkdir -p -- "$test_home/.local/state/omarchy-whatsapp" "$shim_dir"
+test_state_home="$test_dir/xdg-state"
+mkdir -p -- "$test_state_home/omarchy-whatsapp" "$shim_dir"
 
 # Keep the test independent of a running user manager. The install shim also
 # lets us simulate an interrupted copy before the atomic rename.
@@ -44,11 +45,12 @@ printf '%s\n' \
 chmod 755 "$shim_dir/systemctl" "$shim_dir/install"
 
 export HOME="$test_home"
+export XDG_STATE_HOME="$test_state_home"
 export PATH="$shim_dir:/usr/bin:/bin"
 export REAL_INSTALL="$real_install"
 export SYSTEMCTL_LOG="$systemctl_log"
 
-state_dir="$HOME/.local/state/omarchy-whatsapp"
+state_dir="$XDG_STATE_HOME/omarchy-whatsapp"
 printf '%s\n' 'fictional linked-device test state' >"$state_dir/session.db"
 printf '%s\n' 'fictional local history test state' >"$state_dir/history.db"
 session_digest=$(sha256sum "$state_dir/session.db" | cut -d' ' -f1)

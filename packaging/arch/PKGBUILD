@@ -44,19 +44,19 @@ package() {
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 ARCHITECTURE.md "$pkgdir/usr/share/doc/$pkgname/ARCHITECTURE.md"
   install -Dm644 manifest.json \
-    "$pkgdir/usr/share/omarchy-whatsapp/manifest.json"
+    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/manifest.json"
   install -Dm644 quickshell/BarWidget.qml \
-    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/BarWidget.qml"
+    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/BarWidget.qml"
   install -Dm644 quickshell/Service.qml \
-    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/Service.qml"
+    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/Service.qml"
   install -Dm644 quickshell/Panel.qml \
-    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/Panel.qml"
+    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/Panel.qml"
   install -Dm644 quickshell/Model.js \
-    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/Model.js"
+    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/Model.js"
   install -Dm644 quickshell/licenses.json \
-    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/licenses.json"
+    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/licenses.json"
   install -Dm644 quickshell/icons/brand-whatsapp-filled.svg \
-    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/icons/brand-whatsapp-filled.svg"
+    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/icons/brand-whatsapp-filled.svg"
   install -Dm644 quickshell/icons/LICENSE.tabler \
     "$pkgdir/usr/share/licenses/$pkgname/LICENSE.tabler"
 }
