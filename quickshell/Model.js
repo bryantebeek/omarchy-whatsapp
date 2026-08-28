@@ -45,25 +45,56 @@ function initials(name, jid) {
   return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase()
 }
 
-function shortTime(seconds) {
+function unquotedDateFormat(value) {
+  var input = String(value || "")
+  var output = ""
+  var quoted = false
+  for (var i = 0; i < input.length; i++) {
+    if (input.charAt(i) !== "'") {
+      if (!quoted) output += input.charAt(i)
+      continue
+    }
+    if (i + 1 < input.length && input.charAt(i + 1) === "'") {
+      i++
+      continue
+    }
+    quoted = !quoted
+  }
+  return output
+}
+
+function timeFormat(clockFormats) {
+  var candidates = Array.isArray(clockFormats) ? clockFormats : [clockFormats]
+  for (var i = 0; i < candidates.length; i++) {
+    var format = unquotedDateFormat(candidates[i])
+    var hour = format.match(/H{1,2}|h{1,2}/)
+    if (!hour) continue
+    var minute = format.match(/m{1,2}/)
+    var output = hour[0] + ":" + (minute ? minute[0] : "mm")
+    if (hour[0].charAt(0) === "h")
+      output += format.indexOf("ap") >= 0 ? " ap" : " AP"
+    return output
+  }
+  return "HH:mm"
+}
+
+function shortTime(seconds, format) {
   var value = Number(seconds || 0)
   if (!value) return ""
   var date = new Date(value * 1000)
   var today = new Date()
   if (date.toDateString() === today.toDateString())
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    return Qt.formatTime(date, format || "HH:mm")
   var age = today.getTime() - date.getTime()
   if (age < 6 * 86400000)
     return date.toLocaleDateString([], { weekday: "short" })
   return date.toLocaleDateString([], { day: "2-digit", month: "short" })
 }
 
-function messageTime(seconds) {
+function messageTime(seconds, format) {
   var value = Number(seconds || 0)
   if (!value) return ""
-  return new Date(value * 1000).toLocaleTimeString([], {
-    hour: "2-digit", minute: "2-digit"
-  })
+  return Qt.formatTime(new Date(value * 1000), format || "HH:mm")
 }
 
 function mediaDuration(seconds) {

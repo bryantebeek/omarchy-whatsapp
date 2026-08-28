@@ -46,6 +46,7 @@ Item {
   readonly property string fontFamily: Style.font.family
   readonly property int messageMetaFontSize: Math.max(8, Style.font.caption - 1)
   readonly property url whatsappIcon: Qt.resolvedUrl("icons/brand-whatsapp-filled.svg")
+  readonly property string messageTimeFormat: Model.timeFormat(root.clockFormats())
   readonly property string licenseReportPath: {
     var value = String(Qt.resolvedUrl("licenses.json"))
     return value.indexOf("file://") === 0
@@ -75,6 +76,25 @@ Item {
   function snapToDevicePixel(value) {
     var scale = Math.max(1, Number(devicePixelRatio) || 1)
     return Math.round(Number(value) * scale) / scale
+  }
+
+  function clockFormats() {
+    var config = shell && shell.shellConfig ? shell.shellConfig : null
+    var registry = shell && shell.pluginRegistry ? shell.pluginRegistry : null
+    if (!config || !config.bar || !config.bar.layout || !registry
+        || typeof registry.findRelativeBarLocation !== "function")
+      return ["dddd HH:mm"]
+
+    var location = registry.findRelativeBarLocation(config, "omarchy.clock", "")
+    if (!location || location.found !== true) return ["dddd HH:mm"]
+    var entries = config.bar.layout[location.section]
+    var entry = entries && entries[location.index] ? entries[location.index] : null
+    if (!entry) return ["dddd HH:mm"]
+
+    var vertical = shell.bar && shell.bar.vertical === true
+    return vertical
+      ? [entry.verticalFormat, entry.format, entry.verticalFormatAlt, entry.formatAlt]
+      : [entry.format, entry.verticalFormat, entry.formatAlt, entry.verticalFormatAlt]
   }
 
   function devicePixelBorderSpec(spec) {
@@ -1304,7 +1324,8 @@ Item {
                               readonly property string shortcutLabel:
                                 root.chatShortcutLabelForIndex(index)
                               readonly property string timestampLabel:
-                                Model.shortTime(modelData.last_timestamp)
+                                Model.shortTime(modelData.last_timestamp,
+                                  root.messageTimeFormat)
                               width: Math.max(timestampText.implicitWidth,
                                 shortcutText.implicitWidth)
                               height: Math.max(timestampText.implicitHeight,
@@ -2305,7 +2326,8 @@ Item {
                                 : locationCard.liveUntil > 0
                                   ? root.remainingTimeLabel(locationCard.liveUntil)
                                   : "Updated " + Model.messageTime(
-                                    messageDelegate.mediaData.updated_at)
+                                    messageDelegate.mediaData.updated_at,
+                                    root.messageTimeFormat)
                               color: root.foreground
                               font.family: root.fontFamily
                               font.pixelSize: Style.font.caption
@@ -2604,7 +2626,8 @@ Item {
                         x: modelData.from_me
                           ? bubble.x + bubble.width - width - Style.space(4)
                           : bubble.x + Style.space(4)
-                        text: Model.messageTime(modelData.timestamp)
+                        text: Model.messageTime(modelData.timestamp,
+                          root.messageTimeFormat)
                         color: root.timestamp
                         font.family: root.fontFamily
                         font.pixelSize: root.messageMetaFontSize
