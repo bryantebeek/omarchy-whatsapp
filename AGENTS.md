@@ -1,5 +1,15 @@
 # Working on Omarchy WhatsApp
 
+## Protect public repository contents
+
+This is a public repository. Treat every committed or pushed byte as visible to
+anyone. Before every commit and push, inspect the staged diff and untracked
+files carefully for secrets, credentials, tokens, private keys, WhatsApp account
+or session data, personal information, private logs, and machine-specific paths
+or identifiers. Never stage local state from `~/.local/state/omarchy-whatsapp`
+or other private runtime data. If any content might be private, stop and remove
+or redact it before publishing; when uncertain, ask the user before pushing.
+
 ## Make local changes visible
 
 This repository is developed and tested on the same Omarchy workstation where
