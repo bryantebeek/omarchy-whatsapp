@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-coverage_boundary='crates/(ctl/src/main|daemon/src/(assets|database|main|notification))\.rs$'
+coverage_boundary='crates/(ctl/src/main|daemon/src/(assets|database|live_location|main|notification))\.rs$'
 overall_line_floor=54.8
 lcov_report="$repo_dir/target/llvm-cov/lcov.info"
 

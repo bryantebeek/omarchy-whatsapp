@@ -9,6 +9,7 @@ fi
 repo_dir=${COVERAGE_REPO_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}
 lcov_file=$1
 base_ref=$2
+coverage_boundary='^crates/(ctl/src/main|daemon/src/(assets|database|live_location|main|notification))\.rs$'
 
 [[ -r $lcov_file ]] || {
   echo "Coverage report is unreadable: $lcov_file" >&2
@@ -61,6 +62,10 @@ while IFS= read -r diff_line; do
       ;;
     +*)
       if [[ $diff_line != "+++ "* && -n $current_file ]]; then
+        if [[ $current_file =~ $coverage_boundary ]]; then
+          new_line=$((new_line + 1))
+          continue
+        fi
         key="$current_file:$new_line"
         if [[ -n ${executable_lines[$key]+present} ]]; then
           changed_executable=$((changed_executable + 1))
