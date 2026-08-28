@@ -29,7 +29,14 @@ jobs:
       - name: Install system quality tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes jq qt6-declarative-dev-tools shellcheck
+          sudo apt-get install --yes \
+            jq \
+            qml6-module-qtmultimedia \
+            qml6-module-qtquick \
+            qml6-module-qtquick-controls \
+            qml6-module-qttest \
+            qt6-declarative-dev-tools \
+            shellcheck
       - name: Install pinned Rust toolchain
         run: rustup toolchain install nightly-2026-06-16 --profile minimal --component clippy,rustfmt,llvm-tools-preview
       - name: Lint GitHub Actions workflows
@@ -48,6 +55,81 @@ jobs:
           "$actionlint_dir/actionlint" -color
       - name: Run quality checks
         run: ./scripts/check.sh
+
+  qml-tests:
+    name: QML / ${{ matrix.suite.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - name: JavaScript unit
+            file: tests/qml/tst_model.qml
+          - name: Components
+            file: tests/qml/tst_components.qml
+          - name: Service state
+            file: tests/qml/tst_service.qml
+          - name: UI workflows
+            file: tests/qml/tst_workflows.qml
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Qt Quick Test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            qml6-module-qtmultimedia \
+            qml6-module-qtquick \
+            qml6-module-qtquick-controls \
+            qml6-module-qttest \
+            qt6-declarative-dev-tools
+      - name: Run ${{ matrix.suite.name }} suite
+        run: ./scripts/qml-test.sh -input "${{ matrix.suite.file }}" -silent
+
+  qml-coverage:
+    name: QML / Coverage contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Qt Quick Test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            qml6-module-qtmultimedia \
+            qml6-module-qtquick \
+            qml6-module-qtquick-controls \
+            qml6-module-qttest \
+            qt6-declarative-dev-tools
+      - name: Enforce QML behavioral-contract coverage
+        run: ./scripts/qml-coverage.sh
+
+  qml-mutation:
+    name: QML / Mutation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Qt Quick Test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            qml6-module-qtmultimedia \
+            qml6-module-qtquick \
+            qml6-module-qtquick-controls \
+            qml6-module-qttest \
+            qt6-declarative-dev-tools
+      - name: Require a 100% QML mutation score
+        run: ./scripts/qml-mutation.sh
 
   coverage:
     name: Coverage

@@ -17,6 +17,51 @@ the plugin is installed. Unless the user explicitly asks for a source-only
 change, do not stop after editing repository files: deploy the result so the
 user can immediately see or exercise it.
 
+## Keep the QML test suites current
+
+Treat the Qt Quick tests under `tests/qml/` as part of the production contract,
+not as optional follow-up work. Every new or changed frontend behavior must add
+or update tests in the appropriate suite:
+
+- `tst_model.qml` for every helper and edge case in `quickshell/Model.js`,
+  including malformed input, escaping, dates, locales, and time zones;
+- `tst_components.qml` for component loading, bindings, control states, and
+  independently testable panel or bar behavior;
+- `tst_service.qml` for every IPC event, state transition, request lifecycle,
+  stale or malformed response, reconnect path, and selection change in
+  `quickshell/Service.qml`;
+- `tst_workflows.qml` for user-visible workflows such as opening and searching
+  the panel, selecting chats, composing and sending, loading history, opening
+  media, and recovering from connection changes.
+
+When adding a service event, production entry point, public `Model.js` helper,
+or required workflow, update `scripts/qml-coverage.py` when necessary so the
+portable behavioral-contract gate continues to report 100%. Add meaningful
+semantic mutants for new deterministic frontend logic in
+`scripts/qml-mutation.py`, and require a 100% mutation score. Do not delete or
+weaken a valid mutant merely to make the gate pass; strengthen the test. Replace
+genuinely equivalent mutants with observable ones.
+
+Keep test doubles and fixtures synthetic and side-effect-free. QML tests must
+never connect to the real daemon, read or write paired account state, start user
+services, execute desktop commands, or contain captured account data. Keep
+stable `objectName` hooks on controls exercised by workflow tests. Run the tests
+offscreen through the repository scripts; do not invoke `qmltestrunner`
+directly in a way that creates visible windows.
+
+Before declaring any QML or frontend-related change complete, run:
+
+```bash
+./scripts/qml-coverage.sh
+./scripts/qml-mutation.sh
+```
+
+Both commands must pass. Also run the formatting, linting, validation,
+deployment, reload, and live-log checks required by the relevant section below.
+Keep the four-suite matrix and the dedicated QML coverage and mutation jobs in
+`.github/workflows/ci.yml` synchronized with these local gates so every pull
+request and `main` push reports each frontend layer independently.
+
 ### Quickshell-only changes
 
 For changes under `quickshell/`:

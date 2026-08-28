@@ -125,6 +125,7 @@ mod tests {
             text: text.into(),
             timestamp: 0,
             from_me: false,
+            receipt: 0,
             media: None,
             reactions: Vec::new(),
         }

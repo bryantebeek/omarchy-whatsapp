@@ -14,7 +14,7 @@ use database::Database;
 use futures::StreamExt;
 use omarchy_whatsapp_protocol::{
     AppPaths, Chat, ChatParticipant, ClientFrame, Command, ConnectionStatus, Message, MessageMedia,
-    PROTOCOL_VERSION, ServerEvent, ServerFrame,
+    PROTOCOL_VERSION, PollOption, ServerEvent, ServerFrame,
 };
 use qrcode::{QrCode, render::svg};
 use std::collections::{HashMap, HashSet};
@@ -327,6 +327,97 @@ impl Shared {
             return;
         }
         let base = context.message.get_base_message();
+        if let Some(update) = base.poll_update_message.as_option() {
+            let Some(target_id) = update
+                .poll_creation_message_key
+                .as_option()
+                .and_then(|key| key.id.as_deref())
+            else {
+                warn!(message_id = %info.id, "poll vote is missing its parent message ID");
+                return;
+            };
+            let stored = match self.database.poll_for_voting(&chat_jid, target_id) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => {
+                    warn!(%chat_jid, poll_message_id = %target_id,
+                        "could not apply poll vote because the parent poll is unavailable");
+                    return;
+                }
+                Err(error) => {
+                    warn!(%error, %chat_jid, poll_message_id = %target_id,
+                        "could not load parent poll for incoming vote");
+                    return;
+                }
+            };
+            let Some(vote) = update.vote.as_option() else {
+                return;
+            };
+            let (Some(enc_payload), Some(enc_iv)) =
+                (vote.enc_payload.as_deref(), vote.enc_iv.as_deref())
+            else {
+                warn!(%chat_jid, poll_message_id = %target_id,
+                    "incoming poll vote has no encrypted payload");
+                return;
+            };
+            let creator = match stored.creator_jid.parse::<Jid>() {
+                Ok(creator) => creator,
+                Err(error) => {
+                    warn!(%error, creator_jid = %stored.creator_jid,
+                        "stored poll creator JID is invalid");
+                    return;
+                }
+            };
+            let raw_voter = info.source.sender.to_non_ad();
+            let hashes = match context
+                .client
+                .polls()
+                .decrypt_vote(
+                    whatsapp_rust::PollVoteCiphertext {
+                        enc_payload,
+                        enc_iv,
+                    },
+                    &stored.message_secret,
+                    target_id,
+                    &creator,
+                    &raw_voter,
+                )
+                .await
+            {
+                Ok(hashes) => hashes,
+                Err(error) => {
+                    warn!(%error, %chat_jid, poll_message_id = %target_id,
+                        "could not decrypt incoming poll vote");
+                    return;
+                }
+            };
+            let Some(selected_options) = option_names_for_hashes(&stored.options, &hashes) else {
+                warn!(%chat_jid, poll_message_id = %target_id,
+                    "incoming poll vote references an unknown option");
+                return;
+            };
+            let poll_timestamp = update
+                .sender_timestamp_ms
+                .unwrap_or_else(|| info.timestamp.timestamp_millis());
+            let voter_key = if info.source.is_from_me {
+                "me"
+            } else {
+                sender_jid.as_str()
+            };
+            match self.database.apply_poll_vote(
+                &chat_jid,
+                target_id,
+                voter_key,
+                &selected_options,
+                info.source.is_from_me,
+                poll_timestamp,
+            ) {
+                Ok(true) => broadcast_messages(self, &chat_jid),
+                Ok(false) => {}
+                Err(error) => warn!(%error, %chat_jid, poll_message_id = %target_id,
+                    "could not persist incoming poll vote"),
+            }
+            return;
+        }
         if let Some(distribution) = base
             .fast_ratchet_key_sender_key_distribution_message
             .as_option()
@@ -373,6 +464,7 @@ impl Shared {
             text,
             timestamp: info.timestamp.timestamp(),
             from_me: info.source.is_from_me,
+            receipt: u8::from(info.source.is_from_me),
             media,
             reactions: Vec::new(),
         };
@@ -381,6 +473,19 @@ impl Shared {
         let insert_result =
             self.database
                 .insert_message(&message, &chat_name, info.source.is_group, unread);
+        if insert_result.is_ok()
+            && matches!(message.media, Some(MessageMedia::Poll { .. }))
+            && let Some(secret) = message_secret(&context.message, base)
+            && let Err(error) = self.database.store_poll_secret(
+                &chat_jid,
+                &info.id,
+                &info.source.sender.to_non_ad_string(),
+                secret,
+            )
+        {
+            warn!(%error, %chat_jid, message_id = %info.id,
+                "could not persist poll message secret");
+        }
         if let Some(image) = base.image_message.as_option()
             && let Err(error) =
                 self.database
@@ -519,6 +624,7 @@ impl Shared {
     fn ingest_history(
         &self,
         lazy: &whatsapp_rust::types::events::LazyHistorySync,
+        own_pn: Option<&str>,
     ) -> Result<Vec<PendingMedia>> {
         let mut pending_media = Vec::new();
         let mut pending_documents = 0;
@@ -634,6 +740,85 @@ impl Shared {
                 if !inserted && let Some(media) = &message.media {
                     self.database
                         .update_message_media(&message.chat_jid, &message.id, media)?;
+                }
+            }
+            for wire in conversation
+                .messages
+                .iter()
+                .filter_map(|history| history.message.as_option())
+            {
+                let (Some(key), Some(outer)) = (wire.key.as_option(), wire.message.as_option())
+                else {
+                    continue;
+                };
+                let Some(message_id) = key.id.as_deref() else {
+                    continue;
+                };
+                let base = outer.get_base_message();
+                let Some(MessageMedia::Poll { options, .. }) = poll_media(base) else {
+                    continue;
+                };
+                let option_names: Vec<String> =
+                    options.into_iter().map(|option| option.name).collect();
+                if let (Some(creator_jid), Some(secret)) = (
+                    history_poll_creator(&chat_jid, wire, own_pn),
+                    wire.message_secret
+                        .as_deref()
+                        .or_else(|| message_secret(outer, base)),
+                ) && let Err(error) =
+                    self.database
+                        .store_poll_secret(&chat_jid, message_id, &creator_jid, secret)
+                {
+                    warn!(%error, %chat_jid, %message_id,
+                        "could not persist history poll message secret");
+                }
+                for update in &wire.poll_updates {
+                    let (Some(update_key), Some(vote)) = (
+                        update.poll_update_message_key.as_option(),
+                        update.vote.as_option(),
+                    ) else {
+                        continue;
+                    };
+                    let Some(selected_options) =
+                        option_names_for_hashes(&option_names, &vote.selected_options)
+                    else {
+                        warn!(%chat_jid, %message_id,
+                            "history poll vote references an unknown option");
+                        continue;
+                    };
+                    let from_me = update_key.from_me.unwrap_or(false);
+                    let voter_jid = if from_me {
+                        "me".to_owned()
+                    } else if is_group {
+                        let Some(participant) = update_key.participant.as_deref() else {
+                            warn!(%chat_jid, %message_id,
+                                "history group poll vote is missing its participant");
+                            continue;
+                        };
+                        normalize_jid(participant)
+                    } else {
+                        chat_jid.clone()
+                    };
+                    let timestamp = update
+                        .sender_timestamp_ms
+                        .or(update.server_timestamp_ms)
+                        .unwrap_or_else(|| {
+                            wire.message_timestamp
+                                .and_then(|value| i64::try_from(value).ok())
+                                .unwrap_or(0)
+                                .saturating_mul(1_000)
+                        });
+                    if let Err(error) = self.database.apply_poll_vote(
+                        &chat_jid,
+                        message_id,
+                        &voter_jid,
+                        &selected_options,
+                        from_me,
+                        timestamp,
+                    ) {
+                        warn!(%error, %chat_jid, %message_id,
+                            "could not persist history poll vote");
+                    }
                 }
             }
         }
@@ -769,7 +954,12 @@ fn media_text(message: &wa::Message, fallback_type: &str) -> Option<String> {
         || message.poll_creation_message_v5.is_set()
         || message.poll_creation_message_v6.is_set()
     {
-        Some("[Poll]")
+        return Some(
+            poll_creation_message(message)
+                .and_then(|poll| poll.name.as_deref())
+                .and_then(nonempty)
+                .map_or_else(|| "[Poll]".to_owned(), |name| format!("[Poll] {name}")),
+        );
     } else if message.event_message.is_set() || message.event_invite_message.is_set() {
         Some("[Event]")
     } else if message.group_invite_message.is_set() {
@@ -792,6 +982,72 @@ fn video_message(message: &wa::Message) -> Option<&wa::message::VideoMessage> {
         .video_message
         .as_option()
         .or_else(|| message.ptv_message.as_option())
+}
+
+fn poll_creation_message(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
+    message
+        .poll_creation_message_v6
+        .as_option()
+        .or_else(|| message.poll_creation_message_v5.as_option())
+        .or_else(|| message.poll_creation_message_v3.as_option())
+        .or_else(|| message.poll_creation_message_v2.as_option())
+        .or_else(|| message.poll_creation_message.as_option())
+}
+
+fn poll_media(message: &wa::Message) -> Option<MessageMedia> {
+    let poll = poll_creation_message(message)?;
+    let options: Vec<PollOption> = poll
+        .options
+        .iter()
+        .filter_map(|option| option.option_name.as_deref().and_then(nonempty))
+        .map(|name| PollOption {
+            name,
+            votes: 0,
+            selected_by_me: false,
+        })
+        .collect();
+    if options.len() < 2 {
+        return None;
+    }
+    let correct_option_index = poll.correct_answer.as_option().and_then(|correct| {
+        let name = correct.option_name.as_deref()?;
+        options
+            .iter()
+            .position(|option| option.name == name)
+            .and_then(|index| u32::try_from(index).ok())
+    });
+    let mut end_timestamp = poll.end_time.unwrap_or(0);
+    if end_timestamp > 10_000_000_000 {
+        end_timestamp = end_timestamp.div_euclid(1_000);
+    }
+    Some(MessageMedia::Poll {
+        question: poll
+            .name
+            .as_deref()
+            .and_then(nonempty)
+            .unwrap_or_else(|| "Poll".to_owned()),
+        selectable_count: poll
+            .selectable_options_count
+            .unwrap_or(1)
+            .clamp(1, u32::try_from(options.len()).unwrap_or(u32::MAX)),
+        options,
+        total_voters: 0,
+        quiz: poll.poll_type == Some(wa::message::PollType::QUIZ),
+        correct_option_index,
+        end_timestamp,
+    })
+}
+
+fn message_secret<'a>(outer: &'a wa::Message, base: &'a wa::Message) -> Option<&'a [u8]> {
+    base.message_context_info
+        .as_option()
+        .and_then(|context| context.message_secret.as_deref())
+        .or_else(|| {
+            outer
+                .message_context_info
+                .as_option()
+                .and_then(|context| context.message_secret.as_deref())
+        })
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -829,6 +1085,9 @@ fn message_media(
     timestamp: i64,
     live_duration_seconds: u32,
 ) -> Option<MessageMedia> {
+    if let Some(poll) = poll_media(message) {
+        return Some(poll);
+    }
     if let Some(image) = message.image_message.as_option() {
         let path = assets::message_image_path(directory, chat_jid, message_id);
         let thumbnail_path = assets::cache_message_image_thumbnail(
@@ -1037,6 +1296,28 @@ async fn canonical_contact_jid(shared: &Shared, client: &Client, jid: &Jid) -> S
         warn!(%error, %canonical, "could not cache canonical WhatsApp phone number");
     }
     canonical
+}
+
+async fn own_poll_creator_jid(client: &Client, chat: &Jid) -> Result<Jid> {
+    if chat.is_group()
+        && client
+            .groups()
+            .get_metadata(chat)
+            .await
+            .is_ok_and(|metadata| {
+                metadata.addressing_mode
+                    == whatsapp_rust::wacore::types::message::AddressingMode::Lid
+            })
+    {
+        return client
+            .lid()
+            .map(|jid| jid.to_non_ad())
+            .ok_or_else(|| anyhow!("own LID is unavailable for this group poll"));
+    }
+    client
+        .pn()
+        .map(|jid| jid.to_non_ad())
+        .ok_or_else(|| anyhow!("own WhatsApp JID is unavailable"))
 }
 
 async fn reconcile_direct_chat_aliases(shared: &Shared, client: &Client) {
@@ -1611,6 +1892,40 @@ fn history_reaction(chat_jid: &str, wire: &wa::WebMessageInfo) -> Option<History
     })
 }
 
+fn option_names_for_hashes(options: &[String], hashes: &[Vec<u8>]) -> Option<Vec<String>> {
+    let selected: Vec<String> = options
+        .iter()
+        .filter(|option| {
+            let hash = whatsapp_rust::wacore::poll::compute_option_hash(option);
+            hashes.iter().any(|selected| selected.as_slice() == hash)
+        })
+        .cloned()
+        .collect();
+    (selected.len() == hashes.len()).then_some(selected)
+}
+
+fn history_poll_creator(
+    chat_jid: &str,
+    wire: &wa::WebMessageInfo,
+    own_pn: Option<&str>,
+) -> Option<String> {
+    let key = wire.key.as_option()?;
+    if key.from_me.unwrap_or(false) {
+        key.participant
+            .as_deref()
+            .or(wire.participant.as_deref())
+            .map(normalize_jid)
+            .or_else(|| own_pn.map(str::to_owned))
+    } else if chat_jid.ends_with("@g.us") {
+        wire.participant
+            .as_deref()
+            .or(key.participant.as_deref())
+            .map(normalize_jid)
+    } else {
+        Some(chat_jid.to_owned())
+    }
+}
+
 fn history_message(
     chat_jid: &str,
     chat_name: &str,
@@ -1688,6 +2003,7 @@ fn history_message(
         text,
         timestamp,
         from_me,
+        receipt: u8::from(from_me),
         media,
         reactions: Vec::new(),
     })
@@ -1745,17 +2061,42 @@ const APP_EVENT_KINDS: &[EventKind] = &[
 async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Client>) {
     match &*event {
         Event::Receipt(receipt) => {
-            let state = match receipt.r#type.as_wire_str() {
+            let receipt_type = receipt.r#type.as_wire_str();
+            if matches!(receipt_type, "read-self" | "played-self") {
+                let jid = canonical_contact_jid(&shared, &client, &receipt.source.chat).await;
+                match shared.database.apply_self_read_receipt(
+                    &jid,
+                    &receipt.message_ids,
+                    receipt.timestamp.timestamp(),
+                ) {
+                    Ok(true) => broadcast_snapshot(&shared),
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(%error, "could not apply cross-device WhatsApp read receipt");
+                    }
+                }
+                return;
+            }
+            let state: u8 = match receipt_type {
                 "read" | "read-self" => 3,
                 "played" | "played-self" => 4,
                 "delivery" => 2,
                 "sent" | "sender" => 1,
                 _ => 0,
             };
-            if state > 0
-                && let Err(error) = shared.database.update_receipts(&receipt.message_ids, state)
-            {
-                warn!(%error, "could not persist WhatsApp receipts");
+            if state > 0 {
+                match shared.database.update_receipts(&receipt.message_ids, state) {
+                    Ok(true) => {
+                        let _ = shared
+                            .events
+                            .send(ServerFrame::event(ServerEvent::Receipts {
+                                message_ids: receipt.message_ids.clone(),
+                                receipt: state,
+                            }));
+                    }
+                    Ok(false) => {}
+                    Err(error) => warn!(%error, "could not persist WhatsApp receipts"),
+                }
             }
         }
         Event::UndecryptableMessage(details) => {
@@ -2346,8 +2687,11 @@ async fn main() -> Result<()> {
                 let shared = Arc::clone(&history_shared);
                 async move {
                     let ingest_shared = Arc::clone(&shared);
+                    let own_pn = client.pn().map(|jid| jid.to_non_ad_string());
                     let result = tokio::task::spawn_blocking(move || match &*event {
-                        Event::HistorySync(history) => ingest_shared.ingest_history(history),
+                        Event::HistorySync(history) => {
+                            ingest_shared.ingest_history(history, own_pn.as_deref())
+                        }
                         _ => Ok(Vec::new()),
                     })
                     .await;
@@ -2777,6 +3121,7 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 text,
                 timestamp: Utc::now().timestamp(),
                 from_me: true,
+                receipt: 1,
                 media: None,
                 reactions: Vec::new(),
             };
@@ -2798,6 +3143,167 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 message: message.clone(),
             }));
             Ok(ServerEvent::Sent { message })
+        }
+        Command::CreatePoll {
+            chat_jid,
+            question,
+            options,
+            selectable_count,
+            correct_option_index,
+        } => {
+            let question = question.trim().to_owned();
+            if question.is_empty() {
+                bail!("poll question cannot be empty");
+            }
+            let options: Vec<String> = options
+                .into_iter()
+                .map(|option| option.trim().to_owned())
+                .filter(|option| !option.is_empty())
+                .collect();
+            let client = shared
+                .client
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+            let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
+            let canonical = canonical_contact_jid(shared, &client, &requested).await;
+            let jid: Jid = canonical.parse().context("invalid canonical chat JID")?;
+            let creator_jid = own_poll_creator_jid(&client, &jid).await?;
+            let (result, message_secret) = if let Some(correct_index) = correct_option_index {
+                client
+                    .polls()
+                    .create_quiz(
+                        jid.clone(),
+                        &question,
+                        &options,
+                        usize::try_from(correct_index).context("invalid correct option index")?,
+                    )
+                    .await?
+            } else {
+                client
+                    .polls()
+                    .create(jid.clone(), &question, &options, selectable_count)
+                    .await?
+            };
+            let message = Message {
+                id: result.message_id,
+                chat_jid: jid.to_non_ad_string(),
+                sender_jid: "me".into(),
+                sender_name: "You".into(),
+                text: format!("[Poll] {question}"),
+                timestamp: Utc::now().timestamp(),
+                from_me: true,
+                receipt: 1,
+                media: Some(MessageMedia::Poll {
+                    question,
+                    options: options
+                        .into_iter()
+                        .map(|name| PollOption {
+                            name,
+                            votes: 0,
+                            selected_by_me: false,
+                        })
+                        .collect(),
+                    selectable_count: if correct_option_index.is_some() {
+                        1
+                    } else {
+                        selectable_count
+                    },
+                    total_voters: 0,
+                    quiz: correct_option_index.is_some(),
+                    correct_option_index,
+                    end_timestamp: 0,
+                }),
+                reactions: Vec::new(),
+            };
+            let chat_name = shared
+                .database
+                .chat_name(&message.chat_jid)?
+                .or_else(|| {
+                    shared
+                        .database
+                        .contact_name(&message.chat_jid)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_else(|| message.chat_jid.clone());
+            shared
+                .database
+                .insert_message(&message, &chat_name, jid.is_group(), false)?;
+            shared.database.store_poll_secret(
+                &message.chat_jid,
+                &message.id,
+                &creator_jid.to_non_ad_string(),
+                &message_secret,
+            )?;
+            let _ = shared.events.send(ServerFrame::event(ServerEvent::Sent {
+                message: message.clone(),
+            }));
+            Ok(ServerEvent::Sent { message })
+        }
+        Command::VotePoll {
+            chat_jid,
+            message_id,
+            selected_options,
+        } => {
+            if message_id.is_empty() || message_id.len() > 512 {
+                bail!("invalid poll message ID");
+            }
+            let client = shared
+                .client
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+            let chat_jid = canonical_requested_jid(shared, &chat_jid).await;
+            let jid: Jid = chat_jid.parse().context("invalid chat JID")?;
+            let poll = shared
+                .database
+                .poll_for_voting(&chat_jid, &message_id)?
+                .ok_or_else(|| {
+                    anyhow!("poll details are unavailable; its history may need to be recovered")
+                })?;
+            if poll.end_timestamp > 0 && poll.end_timestamp <= Utc::now().timestamp() {
+                bail!("this poll has ended");
+            }
+            let mut selected = Vec::new();
+            for option in selected_options {
+                if !poll.options.contains(&option) {
+                    bail!("poll vote contains an unknown option");
+                }
+                if !selected.contains(&option) {
+                    selected.push(option);
+                }
+            }
+            if selected.len() > usize::try_from(poll.selectable_count).unwrap_or(usize::MAX) {
+                bail!("poll vote selects more options than the poll allows");
+            }
+            let creator_jid: Jid = poll
+                .creator_jid
+                .parse()
+                .context("stored poll creator JID is invalid")?;
+            client
+                .polls()
+                .vote(
+                    jid,
+                    &message_id,
+                    &creator_jid,
+                    &poll.message_secret,
+                    &selected,
+                )
+                .await?;
+            if shared.database.apply_poll_vote(
+                &chat_jid,
+                &message_id,
+                "me",
+                &selected,
+                true,
+                Utc::now().timestamp_millis(),
+            )? {
+                broadcast_messages(shared, &chat_jid);
+            }
+            Ok(ServerEvent::Ack)
         }
         Command::DownloadImage {
             chat_jid,
@@ -2843,33 +3349,32 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                     image.jpeg_thumbnail.as_ref(),
                     image.file_length,
                 )?;
-                shared.database.update_message_media(
-                    &chat_jid,
-                    &message_id,
-                    &MessageMedia::Image {
-                        path: path.to_string_lossy().into_owned(),
-                        thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
-                        downloaded: path.exists(),
-                        mime_type: image
-                            .mimetype
-                            .clone()
-                            .unwrap_or_else(|| "image/jpeg".to_owned()),
-                        width: image.width.unwrap_or(0),
-                        height: image.height.unwrap_or(0),
-                    },
-                )?;
+                let mut media = MessageMedia::Image {
+                    path: path.to_string_lossy().into_owned(),
+                    thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+                    downloaded: path.exists(),
+                    mime_type: image
+                        .mimetype
+                        .clone()
+                        .unwrap_or_else(|| "image/jpeg".to_owned()),
+                    width: image.width.unwrap_or(0),
+                    height: image.height.unwrap_or(0),
+                };
+                shared
+                    .database
+                    .update_message_media(&chat_jid, &message_id, &media)?;
                 assets::download_message_image(client, image, path).await?;
-                Result::<()>::Ok(())
+                if let MessageMedia::Image { downloaded, .. } = &mut media {
+                    *downloaded = true;
+                }
+                Result::<MessageMedia>::Ok(media)
             }
             .await;
             shared.media_downloads.lock().await.remove(&key);
-            result?;
-
-            broadcast_messages(shared, &chat_jid);
-            Ok(ServerEvent::Messages {
-                messages: shared.database.messages(&chat_jid, 300)?,
-                first_unread_message_id: shared.database.first_unread_message_id(&chat_jid)?,
+            Ok(ServerEvent::MediaDownloaded {
+                media: result?,
                 chat_jid,
+                message_id,
             })
         }
         Command::DownloadVideo {
@@ -2922,23 +3427,22 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                     video.jpeg_thumbnail.as_ref(),
                     video.file_length,
                 )?;
-                shared.database.update_message_media(
-                    &chat_jid,
-                    &message_id,
-                    &MessageMedia::Video {
-                        path: path.to_string_lossy().into_owned(),
-                        thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
-                        downloaded: path.exists(),
-                        mime_type: video
-                            .mimetype
-                            .clone()
-                            .unwrap_or_else(|| "video/mp4".to_owned()),
-                        width: video.width.unwrap_or(0),
-                        height: video.height.unwrap_or(0),
-                        duration_seconds: video.seconds.unwrap_or(0),
-                        gif_playback: video.gif_playback.unwrap_or(false),
-                    },
-                )?;
+                let mut media = MessageMedia::Video {
+                    path: path.to_string_lossy().into_owned(),
+                    thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+                    downloaded: path.exists(),
+                    mime_type: video
+                        .mimetype
+                        .clone()
+                        .unwrap_or_else(|| "video/mp4".to_owned()),
+                    width: video.width.unwrap_or(0),
+                    height: video.height.unwrap_or(0),
+                    duration_seconds: video.seconds.unwrap_or(0),
+                    gif_playback: video.gif_playback.unwrap_or(false),
+                };
+                shared
+                    .database
+                    .update_message_media(&chat_jid, &message_id, &media)?;
                 assets::download_message_video(client, video, path.clone()).await?;
                 let preview_result = tokio::task::spawn_blocking(move || {
                     assets::ensure_message_video_thumbnail(&path, &thumbnail_path)
@@ -2951,17 +3455,17 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                     }
                     Err(error) => warn!(%error, "video preview worker panicked"),
                 }
-                Result::<()>::Ok(())
+                if let MessageMedia::Video { downloaded, .. } = &mut media {
+                    *downloaded = true;
+                }
+                Result::<MessageMedia>::Ok(media)
             }
             .await;
             shared.media_downloads.lock().await.remove(&key);
-            result?;
-
-            broadcast_messages(shared, &chat_jid);
-            Ok(ServerEvent::Messages {
-                messages: shared.database.messages(&chat_jid, 300)?,
-                first_unread_message_id: shared.database.first_unread_message_id(&chat_jid)?,
+            Ok(ServerEvent::MediaDownloaded {
+                media: result?,
                 chat_jid,
+                message_id,
             })
         }
         Command::DownloadAudio {
@@ -3006,32 +3510,31 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                     &message_id,
                     audio.mimetype.as_deref(),
                 );
-                shared.database.update_message_media(
-                    &chat_jid,
-                    &message_id,
-                    &MessageMedia::Audio {
-                        path: path.to_string_lossy().into_owned(),
-                        downloaded: path.exists(),
-                        mime_type: audio
-                            .mimetype
-                            .clone()
-                            .unwrap_or_else(|| "audio/ogg; codecs=opus".to_owned()),
-                        duration_seconds: audio.seconds.unwrap_or(0),
-                        voice_message: audio.ptt.unwrap_or(false),
-                    },
-                )?;
+                let mut media = MessageMedia::Audio {
+                    path: path.to_string_lossy().into_owned(),
+                    downloaded: path.exists(),
+                    mime_type: audio
+                        .mimetype
+                        .clone()
+                        .unwrap_or_else(|| "audio/ogg; codecs=opus".to_owned()),
+                    duration_seconds: audio.seconds.unwrap_or(0),
+                    voice_message: audio.ptt.unwrap_or(false),
+                };
+                shared
+                    .database
+                    .update_message_media(&chat_jid, &message_id, &media)?;
                 assets::download_message_audio(client, audio, path).await?;
-                Result::<()>::Ok(())
+                if let MessageMedia::Audio { downloaded, .. } = &mut media {
+                    *downloaded = true;
+                }
+                Result::<MessageMedia>::Ok(media)
             }
             .await;
             shared.media_downloads.lock().await.remove(&key);
-            result?;
-
-            broadcast_messages(shared, &chat_jid);
-            Ok(ServerEvent::Messages {
-                messages: shared.database.messages(&chat_jid, 300)?,
-                first_unread_message_id: shared.database.first_unread_message_id(&chat_jid)?,
+            Ok(ServerEvent::MediaDownloaded {
+                media: result?,
                 chat_jid,
+                message_id,
             })
         }
         Command::React {
@@ -3132,6 +3635,25 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             let _ = shared
                 .events
                 .send(ServerFrame::event(ServerEvent::Unread { total }));
+            Ok(ServerEvent::Ack)
+        }
+        Command::SetChatPinned { chat_jid, pinned } => {
+            let client = shared
+                .client
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+            let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
+            let chat_jid = canonical_contact_jid(shared, &client, &requested).await;
+            let chat: Jid = chat_jid.parse().context("invalid canonical chat JID")?;
+            if pinned {
+                client.chat_actions().pin_chat(&chat).await?;
+            } else {
+                client.chat_actions().unpin_chat(&chat).await?;
+            }
+            shared.database.apply_pin(&chat_jid, pinned)?;
+            broadcast_chats(shared);
             Ok(ServerEvent::Ack)
         }
         Command::RequestAvatar { jid } => {
@@ -3586,6 +4108,63 @@ mod tests {
     }
 
     #[test]
+    fn poll_creation_payload_becomes_interactive_ui_media() {
+        let message = wa::Message {
+            poll_creation_message_v3: MessageField::some(wa::message::PollCreationMessage {
+                name: Some("Lunch?".into()),
+                options: vec![
+                    wa::message::poll_creation_message::Option {
+                        option_name: Some("Soup".into()),
+                        ..Default::default()
+                    },
+                    wa::message::poll_creation_message::Option {
+                        option_name: Some("Salad".into()),
+                        ..Default::default()
+                    },
+                ],
+                selectable_options_count: Some(1),
+                poll_type: Some(wa::message::PollType::QUIZ),
+                correct_answer: MessageField::some(wa::message::poll_creation_message::Option {
+                    option_name: Some("Soup".into()),
+                    ..Default::default()
+                }),
+                end_time: Some(1_700_000_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            media_text(&message, "poll").as_deref(),
+            Some("[Poll] Lunch?")
+        );
+        let Some(MessageMedia::Poll {
+            question,
+            options,
+            selectable_count,
+            quiz,
+            correct_option_index,
+            end_timestamp,
+            ..
+        }) = poll_media(&message)
+        else {
+            panic!("expected poll media");
+        };
+        assert_eq!(question, "Lunch?");
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Soup", "Salad"]
+        );
+        assert_eq!(selectable_count, 1);
+        assert!(quiz);
+        assert_eq!(correct_option_index, Some(0));
+        assert_eq!(end_timestamp, 1_700_000_000);
+    }
+
+    #[test]
     fn protocol_control_messages_have_no_user_visible_fallback() {
         let control = wa::Message {
             protocol_message: MessageField::some(wa::message::ProtocolMessage::default()),
@@ -3981,7 +4560,7 @@ mod tests {
             Some(100),
         );
 
-        shared.ingest_history(&lazy).unwrap();
+        shared.ingest_history(&lazy, None).unwrap();
 
         let chats = shared.database.list_chats(10).unwrap();
         assert_eq!(chats.len(), 1);

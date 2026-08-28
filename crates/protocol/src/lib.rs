@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 16;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -57,6 +57,9 @@ pub struct Message {
     pub text: String,
     pub timestamp: i64,
     pub from_me: bool,
+    /// Outgoing receipt state: 0 unknown, 1 sent, 2 delivered, 3 read, 4 played.
+    #[serde(default)]
+    pub receipt: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MessageMedia>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -68,6 +71,15 @@ pub struct Reaction {
     pub emoji: String,
     pub count: u32,
     pub from_me: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PollOption {
+    pub name: String,
+    #[serde(default)]
+    pub votes: u32,
+    #[serde(default)]
+    pub selected_by_me: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,6 +133,19 @@ pub enum MessageMedia {
         #[serde(default)]
         duration_seconds: u32,
     },
+    Poll {
+        question: String,
+        options: Vec<PollOption>,
+        selectable_count: u32,
+        #[serde(default)]
+        total_voters: u32,
+        #[serde(default)]
+        quiz: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correct_option_index: Option<u32>,
+        #[serde(default)]
+        end_timestamp: i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -140,6 +165,19 @@ pub enum Command {
     SendMessage {
         chat_jid: String,
         text: String,
+    },
+    CreatePoll {
+        chat_jid: String,
+        question: String,
+        options: Vec<String>,
+        selectable_count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correct_option_index: Option<u32>,
+    },
+    VotePoll {
+        chat_jid: String,
+        message_id: String,
+        selected_options: Vec<String>,
     },
     DownloadImage {
         chat_jid: String,
@@ -162,6 +200,10 @@ pub enum Command {
     },
     MarkRead {
         chat_jid: String,
+    },
+    SetChatPinned {
+        chat_jid: String,
+        pinned: bool,
     },
     RequestAvatar {
         jid: String,
@@ -215,8 +257,17 @@ pub enum ServerEvent {
     Message {
         message: Message,
     },
+    MediaDownloaded {
+        chat_jid: String,
+        message_id: String,
+        media: MessageMedia,
+    },
     Sent {
         message: Message,
+    },
+    Receipts {
+        message_ids: Vec<String>,
+        receipt: u8,
     },
     Unread {
         total: u32,
@@ -332,6 +383,62 @@ mod tests {
     }
 
     #[test]
+    fn set_chat_pinned_command_round_trip_is_stable() {
+        let frame = ClientFrame::new(
+            Some(9),
+            Command::SetChatPinned {
+                chat_jid: "123-456@g.us".into(),
+                pinned: true,
+            },
+        );
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":9,"command":"set_chat_pinned","chat_jid":"123-456@g.us","pinned":true}"#
+        );
+        assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn poll_commands_and_media_round_trip_are_stable() {
+        for command in [
+            Command::CreatePoll {
+                chat_jid: "123-456@g.us".into(),
+                question: "Lunch?".into(),
+                options: vec!["Soup".into(), "Salad".into()],
+                selectable_count: 1,
+                correct_option_index: None,
+            },
+            Command::VotePoll {
+                chat_jid: "123-456@g.us".into(),
+                message_id: "poll-1".into(),
+                selected_options: vec!["Soup".into()],
+            },
+        ] {
+            let frame = ClientFrame::new(Some(9), command);
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+        }
+
+        let media = MessageMedia::Poll {
+            question: "Lunch?".into(),
+            options: vec![PollOption {
+                name: "Soup".into(),
+                votes: 2,
+                selected_by_me: true,
+            }],
+            selectable_count: 1,
+            total_voters: 2,
+            quiz: false,
+            correct_option_index: None,
+            end_timestamp: 0,
+        };
+        let json = serde_json::to_string(&media).unwrap();
+        assert_eq!(serde_json::from_str::<MessageMedia>(&json).unwrap(), media);
+        assert!(!json.contains("message_secret"));
+    }
+
+    #[test]
     fn logout_command_round_trip_is_stable() {
         let frame = ClientFrame::new(Some(10), Command::Logout);
         let json = serde_json::to_string(&frame).unwrap();
@@ -441,6 +548,27 @@ mod tests {
     }
 
     #[test]
+    fn downloaded_media_event_round_trip_is_stable() {
+        let frame = ServerFrame::response(
+            Some(7),
+            ServerEvent::MediaDownloaded {
+                chat_jid: "1@s.whatsapp.net".into(),
+                message_id: "image-1".into(),
+                media: MessageMedia::Image {
+                    path: "/private/cache/image-1.img".into(),
+                    thumbnail_path: "/private/cache/image-1.thumbnail.jpg".into(),
+                    downloaded: true,
+                    mime_type: "image/jpeg".into(),
+                    width: 640,
+                    height: 480,
+                },
+            },
+        );
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
     fn rich_message_media_round_trip_is_stable() {
         let message = Message {
             id: "image-1".into(),
@@ -450,6 +578,7 @@ mod tests {
             text: "A photo".into(),
             timestamp: 42,
             from_me: false,
+            receipt: 3,
             media: Some(MessageMedia::Image {
                 path: "/private/cache/image-1.img".into(),
                 thumbnail_path: "/private/cache/image-1.thumbnail.jpg".into(),
@@ -466,6 +595,25 @@ mod tests {
         };
         let json = serde_json::to_string(&message).unwrap();
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);
+    }
+
+    #[test]
+    fn legacy_messages_default_to_an_unknown_receipt() {
+        let message = serde_json::from_str::<Message>(
+            r#"{"id":"message-1","chat_jid":"1@s.whatsapp.net","sender_jid":"me","sender_name":"You","text":"Hi","timestamp":42,"from_me":true}"#,
+        )
+        .unwrap();
+        assert_eq!(message.receipt, 0);
+    }
+
+    #[test]
+    fn receipt_event_round_trip_is_stable() {
+        let frame = ServerFrame::event(ServerEvent::Receipts {
+            message_ids: vec!["message-1".into(), "message-2".into()],
+            receipt: 3,
+        });
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
     }
 
     #[test]

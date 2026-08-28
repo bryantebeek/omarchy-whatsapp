@@ -25,6 +25,11 @@ Item {
   property bool scrollToBottomAfterMessages: false
   property bool restoreConversationAfterMessages: false
   property real preservedConversationContentY: 0
+  property string mediaDownloadAnchorChatJid: ""
+  property string mediaDownloadAnchorMessageId: ""
+  property real mediaDownloadAnchorOffset: 0
+  property int mediaDownloadAnchorSerial: 0
+  property string imagePreviewUrl: ""
   property var activeInlineVideoCard: null
   property bool activeInlineVideoGif: false
   property var activeVoiceMessageCard: null
@@ -273,6 +278,8 @@ Item {
   }
 
   function close() {
+    createPollPopup.close()
+    imagePreviewPopup.close()
     stopInlineVideo()
     stopVoiceMessage()
     scrollToBottomAnimation.stop()
@@ -280,6 +287,12 @@ Item {
     controlHeld = false
     controlActivatorKey = 0
     if (service) service.setPanelState(false, false)
+  }
+
+  function openImagePreview(path, revision) {
+    if (!service || !path) return
+    imagePreviewUrl = service.fileUrl(path, revision)
+    imagePreviewPopup.open()
   }
 
   function requestClose() {
@@ -392,6 +405,22 @@ Item {
     scheduleConversationScroll("bottom", "")
   }
 
+  function openPollCreator() {
+    pollQuestion.text = ""
+    pollOptions.text = ""
+    createPollPopup.multipleAnswers = false
+    createPollPopup.open()
+  }
+
+  function submitPoll() {
+    if (!service) return
+    var options = String(pollOptions.text || "").split(/\r?\n/)
+    if (!service.createPoll(pollQuestion.text, options,
+        createPollPopup.multipleAnswers)) return
+    createPollPopup.close()
+    scheduleConversationScroll("bottom", "")
+  }
+
   function stopInlineVideo(card) {
     if (card && activeInlineVideoCard !== card) return
     inlineVideoPlayer.stop()
@@ -447,6 +476,59 @@ Item {
     return -1
   }
 
+  function clearMediaDownloadAnchor() {
+    mediaDownloadAnchorClearTimer.stop()
+    mediaDownloadAnchorSerial++
+    mediaDownloadAnchorChatJid = ""
+    mediaDownloadAnchorMessageId = ""
+    mediaDownloadAnchorOffset = 0
+  }
+
+  function downloadMedia(message, delegateItem) {
+    if (!service || !message || !delegateItem || !messageList) return false
+    messageList.forceLayout()
+    mediaDownloadAnchorChatJid = String(message.chat_jid || "")
+    mediaDownloadAnchorMessageId = String(message.id || "")
+    mediaDownloadAnchorOffset = delegateItem.y - messageList.contentY
+    mediaDownloadAnchorSerial++
+    mediaDownloadAnchorClearTimer.stop()
+    if (service.downloadMedia(message)) return true
+    clearMediaDownloadAnchor()
+    return false
+  }
+
+  function restoreMediaDownloadAnchor(serial, remainingPasses) {
+    if (serial !== mediaDownloadAnchorSerial || !messageList
+        || !mediaDownloadAnchorMessageId) return
+    var index = messageIndex(mediaDownloadAnchorMessageId)
+    if (index < 0) return
+    messageList.forceLayout()
+    var delegateItem = messageList.itemAtIndex(index)
+    if (!delegateItem) {
+      messageList.positionViewAtIndex(index, ListView.Beginning)
+      messageList.forceLayout()
+      delegateItem = messageList.itemAtIndex(index)
+    }
+    if (delegateItem)
+      messageList.contentY = delegateItem.y - mediaDownloadAnchorOffset
+    if (remainingPasses > 0) {
+      Qt.callLater(function() {
+        root.restoreMediaDownloadAnchor(serial, remainingPasses - 1)
+      })
+    } else {
+      mediaDownloadAnchorClearTimer.restart()
+    }
+  }
+
+  function scheduleMediaDownloadAnchorRestore(messageId) {
+    if (!mediaDownloadAnchorMessageId
+        || (messageId && String(messageId) !== mediaDownloadAnchorMessageId)) return
+    var serial = ++mediaDownloadAnchorSerial
+    Qt.callLater(function() {
+      root.restoreMediaDownloadAnchor(serial, 2)
+    })
+  }
+
   function alignConversationViewportToBottom(serial, remainingPasses) {
     if (serial !== conversationScrollSerial || !messageList) return
     messageList.forceLayout()
@@ -458,8 +540,10 @@ Item {
       messageList.contentY += gapRatio * messageList.height / heightRatio
     if (remainingPasses > 0) {
       var nextPass = remainingPasses - 1
+      var target = root
       Qt.callLater(function() {
-        root.alignConversationViewportToBottom(serial, nextPass)
+        if (target && typeof target.alignConversationViewportToBottom === "function")
+          target.alignConversationViewportToBottom(serial, nextPass)
       })
     }
   }
@@ -556,12 +640,33 @@ Item {
     return label + " left"
   }
 
+  function messageReceiptIcon(receipt) {
+    var value = Math.max(0, Math.min(4, Math.floor(Number(receipt || 0))))
+    if (value === 0) return "󰥔"
+    if (value === 1) return "✓"
+    if (value < 4) return "✓✓"
+    return "󰍬"
+  }
+
+  function messageReceiptLabel(receipt) {
+    var labels = ["Waiting to send", "Sent", "Delivered", "Read", "Played"]
+    var value = Math.max(0, Math.min(4, Math.floor(Number(receipt || 0))))
+    return labels[value]
+  }
+
   Timer {
     interval: 30000
     repeat: true
     running: root.opened
     triggeredOnStart: true
     onTriggered: root.currentTimestamp = Date.now() / 1000
+  }
+
+  Timer {
+    id: mediaDownloadAnchorClearTimer
+    interval: 750
+    repeat: false
+    onTriggered: root.clearMediaDownloadAnchor()
   }
 
   AudioOutput {
@@ -607,6 +712,8 @@ Item {
   Connections {
     target: root.service
     function onSelectedChatJidChanged() {
+      imagePreviewPopup.close()
+      root.clearMediaDownloadAnchor()
       root.stopInlineVideo()
       root.stopVoiceMessage()
       scrollToBottomAnimation.stop()
@@ -619,6 +726,7 @@ Item {
     function onMessagesWillChange(preservePosition) {
       root.stopInlineVideo()
       root.stopVoiceMessage()
+      if (root.mediaDownloadAnchorMessageId) return
       if (!preservePosition || !messageList || !root.conversationReady
           || root.restoreConversationAfterMessages) return
       root.preservedConversationContentY = messageList.contentY
@@ -649,9 +757,18 @@ Item {
         root.scheduleConversationScroll("bottom", "")
       } else if (!root.conversationReady) {
         root.prepareCurrentConversation()
+      } else if (root.mediaDownloadAnchorMessageId) {
+        root.scheduleMediaDownloadAnchorRestore("")
       } else if (root.restoreConversationAfterMessages) {
         root.scheduleConversationPositionRestore()
       }
+    }
+    function onMediaDownloadRequestsChanged() {
+      if (!root.mediaDownloadAnchorMessageId || !root.service) return
+      var key = root.mediaDownloadAnchorChatJid + "\n"
+        + root.mediaDownloadAnchorMessageId
+      if (root.service.mediaDownloadRequests[key] !== true)
+        mediaDownloadAnchorClearTimer.restart()
     }
   }
 
@@ -732,6 +849,219 @@ Item {
         onCanceled: opened = false
         onConfirmed: {
           if (root.service && root.service.unlinkDevice()) opened = false
+        }
+      }
+
+      QQC.Popup {
+        id: imagePreviewPopup
+
+        parent: focusScope
+        x: 0
+        y: 0
+        width: parent.width
+        height: parent.height
+        padding: 0
+        modal: true
+        focus: true
+        closePolicy: QQC.Popup.CloseOnEscape
+
+        onClosed: root.imagePreviewUrl = ""
+
+        background: Rectangle {
+          color: Qt.rgba(root.background.r, root.background.g,
+            root.background.b, 0.96)
+        }
+
+        contentItem: Item {
+          MouseArea {
+            anchors.fill: parent
+            onClicked: imagePreviewPopup.close()
+          }
+
+          Image {
+            id: fullImagePreview
+
+            anchors.fill: parent
+            anchors.margins: Style.space(28)
+            source: root.imagePreviewUrl
+            asynchronous: true
+            cache: false
+            fillMode: Image.PreserveAspectFit
+            smooth: true
+            mipmap: true
+          }
+
+          MouseArea {
+            x: fullImagePreview.x
+              + (fullImagePreview.width - fullImagePreview.paintedWidth) / 2
+            y: fullImagePreview.y
+              + (fullImagePreview.height - fullImagePreview.paintedHeight) / 2
+            width: fullImagePreview.paintedWidth
+            height: fullImagePreview.paintedHeight
+            enabled: fullImagePreview.status === Image.Ready
+            onClicked: function(mouse) { mouse.accepted = true }
+          }
+
+          Text {
+            anchors.centerIn: parent
+            visible: fullImagePreview.status === Image.Loading
+              || fullImagePreview.status === Image.Error
+            text: fullImagePreview.status === Image.Error
+              ? "Image unavailable" : "Loading image…"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+
+          CrispButton {
+            anchors.top: parent.top
+            anchors.right: parent.right
+            anchors.margins: Style.space(16)
+            width: Style.space(40)
+            height: Style.space(40)
+            iconSize: Style.font.icon * 1.5
+            iconText: "󰅖"
+            foreground: root.foreground
+            accent: root.accent
+            tooltipText: "Close image preview"
+            focusable: true
+            onClicked: imagePreviewPopup.close()
+          }
+        }
+      }
+
+      QQC.Popup {
+        id: createPollPopup
+        objectName: "createPollPopup"
+
+        property bool multipleAnswers: false
+        readonly property var normalizedOptions: {
+          var values = String(pollOptions.text || "").split(/\r?\n/)
+          var output = []
+          for (var i = 0; i < values.length; i++) {
+            var value = String(values[i] || "").trim()
+            if (value && output.indexOf(value) < 0) output.push(value)
+          }
+          return output
+        }
+        readonly property bool valid: String(pollQuestion.text || "").trim() !== ""
+          && normalizedOptions.length >= 2 && normalizedOptions.length <= 12
+          && root.service && root.service.pollCreateRequestId === 0
+        readonly property var popupBorderSpec:
+          Border.localOrSurfaceSpec("popups", "border",
+            Color.popups.border, Color.popups.border,
+            Math.max(1, Style.normalBorderWidth))
+
+        parent: focusScope
+        x: Math.round((parent.width - width) / 2)
+        y: Math.round((parent.height - height) / 2)
+        width: Math.min(Style.space(520), parent.width - Style.space(48))
+        height: Math.min(Style.space(470), parent.height - Style.space(48))
+        padding: Style.space(18)
+        modal: true
+        focus: true
+        closePolicy: QQC.Popup.CloseOnEscape | QQC.Popup.CloseOnPressOutside
+
+        onOpened: Qt.callLater(function() { pollQuestion.forceActiveFocus() })
+
+        background: CrispBorderSurface {
+          color: Color.popups.background
+          sourceBorderSpec: createPollPopup.popupBorderSpec
+          radius: Style.cornerRadius + Style.space(4)
+        }
+
+        contentItem: Column {
+          spacing: Style.space(10)
+
+          Text {
+            width: parent.width
+            text: "Create poll"
+            color: Color.popups.text
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+          }
+
+          CrispTextField {
+            id: pollQuestion
+            objectName: "pollQuestion"
+            width: parent.width
+            placeholderText: "Question"
+          }
+
+          Text {
+            width: parent.width
+            text: "Options — one per line (2–12)"
+            color: Color.popups.text
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          QQC.TextArea {
+            id: pollOptions
+            objectName: "pollOptions"
+            width: parent.width
+            height: Style.space(220)
+            color: Color.popups.text
+            placeholderText: "First option\nSecond option"
+            placeholderTextColor: Qt.rgba(Color.popups.text.r,
+              Color.popups.text.g, Color.popups.text.b, 0.55)
+            selectionColor: root.accent
+            selectedTextColor: Color.popups.background
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            wrapMode: TextEdit.Wrap
+            padding: Style.space(10)
+            background: CrispBorderSurface {
+              color: Style.normalFillFor(Color.popups.text, root.accent)
+              sourceBorderSpec: Border.flat(
+                Style.normalBorderFor(Color.popups.text, root.accent),
+                Math.max(1, Style.normalBorderWidth))
+              radius: Style.cornerRadius
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+
+            CrispButton {
+              id: multipleAnswersButton
+              text: createPollPopup.multipleAnswers
+                ? "✓ Multiple answers" : "Multiple answers"
+              bordered: true
+              selected: createPollPopup.multipleAnswers
+              foreground: Color.popups.text
+              onClicked: createPollPopup.multipleAnswers
+                = !createPollPopup.multipleAnswers
+            }
+
+            Item {
+              width: parent.width - multipleAnswersButton.width - createPollButton.width
+                - cancelPollButton.width - parent.spacing * 3
+              height: 1
+            }
+
+            CrispButton {
+              id: cancelPollButton
+              text: "Cancel"
+              bordered: true
+              foreground: Color.popups.text
+              onClicked: createPollPopup.close()
+            }
+
+            CrispButton {
+              id: createPollButton
+              objectName: "createPollButton"
+              text: "Create"
+              iconText: "󰘻"
+              bordered: true
+              active: createPollPopup.valid
+              enabled: createPollPopup.valid
+              foreground: Color.popups.text
+              onClicked: root.submitPoll()
+            }
+          }
         }
       }
 
@@ -1123,6 +1453,7 @@ Item {
                       spacing: root.snapToDevicePixel(Style.space(6))
                       CrispTextField {
                         id: chatSearch
+                        objectName: "chatSearch"
                         width: parent.width - unreadFilterButton.width
                           - newChatButton.width - parent.spacing * 2
                         placeholderText: "Search conversations"
@@ -1147,6 +1478,7 @@ Item {
                       }
                       CrispButton {
                         id: newChatButton
+                        objectName: "newChatButton"
                         width: root.snapToDevicePixel(implicitWidth)
                         height: root.snapToDevicePixel(implicitHeight)
                         iconText: root.newChatVisible ? "󰅖" : "󰐕"
@@ -1168,12 +1500,14 @@ Item {
                       spacing: Style.space(6)
                       CrispTextField {
                         id: newChat
+                        objectName: "newChat"
                         width: parent.width - openChatButton.width - parent.spacing
                         placeholderText: "Phone number or JID"
                         onAccepted: root.openNewChat()
                       }
                       CrispButton {
                         id: openChatButton
+                        objectName: "openChatButton"
                         text: "Open"
                         bordered: true
                         foreground: root.foreground
@@ -1184,6 +1518,7 @@ Item {
 
                   ListView {
                     id: chatList
+                    objectName: "chatList"
                     width: parent.width
                     height: parent.height - sidebarTools.height
                     clip: true
@@ -1192,13 +1527,30 @@ Item {
                     reuseItems: true
                     QQC.ScrollBar.vertical: QQC.ScrollBar {}
 
+                    onDraggingChanged: {
+                      if (dragging) root.clearMediaDownloadAnchor()
+                    }
+
                     delegate: Item {
+                      id: chatDelegate
+
                       required property var modelData
                       required property int index
+                      objectName: "chatRow-" + String(modelData.jid || "")
+                      property alias contextMenu: chatContextMenu
+                      property alias pinAction: chatPinAction
                       width: chatList.width
                       height: Style.space(60)
                       readonly property bool selected: root.service
                         && String(modelData.jid || "") === root.service.selectedChatJid
+
+                      function openContextMenuAt(pointerX, pointerY) {
+                        chatContextMenu.x = Math.max(0,
+                          Math.min(pointerX, chatDelegate.width
+                            - chatContextMenu.width))
+                        chatContextMenu.y = pointerY
+                        chatContextMenu.open()
+                      }
 
                       Rectangle {
                         anchors.fill: parent
@@ -1281,9 +1633,8 @@ Item {
                             Text {
                               id: chatNameLabel
                               anchors.left: parent.left
-                              anchors.right: unreadBadge.left
-                              anchors.rightMargin: unreadBadge.visible
-                                ? Style.space(5) : 0
+                              anchors.right: timeLabel.left
+                              anchors.rightMargin: Style.space(5)
                               anchors.verticalCenter: parent.verticalCenter
                               text: Model.friendlyName(modelData.name, modelData.jid)
                               color: root.foreground
@@ -1293,29 +1644,6 @@ Item {
                               maximumLineCount: 1
                               wrapMode: Text.NoWrap
                               elide: Text.ElideRight
-                            }
-                            Rectangle {
-                              id: unreadBadge
-                              visible: Number(modelData.unread || 0) > 0
-                              width: visible ? Math.max(Style.space(14),
-                                unreadText.implicitWidth + Style.space(4)) : 0
-                              height: visible ? Style.space(14) : 0
-                              anchors.right: timeLabel.left
-                              anchors.rightMargin: visible ? Style.space(5) : 0
-                              anchors.verticalCenter: parent.verticalCenter
-                              anchors.verticalCenterOffset: -root.snapToDevicePixel(1)
-                              radius: height / 2
-                              color: root.accent
-                              Text {
-                                id: unreadText
-                                anchors.centerIn: parent
-                                text: Number(modelData.unread || 0) > 99
-                                  ? "99+" : String(modelData.unread || 0)
-                                color: root.background
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.caption
-                                font.bold: true
-                              }
                             }
                             Item {
                               id: timeLabel
@@ -1386,6 +1714,7 @@ Item {
                               id: chatStatusIcons
                               visible: modelData.pinned === true
                                 || modelData.muted === true
+                                || Number(modelData.unread || 0) > 0
                               anchors.right: parent.right
                               anchors.verticalCenter: parent.verticalCenter
                               spacing: Style.space(4)
@@ -1403,6 +1732,25 @@ Item {
                                 font.family: root.fontFamily
                                 font.pixelSize: 12
                               }
+                              Rectangle {
+                                id: unreadBadge
+                                visible: Number(modelData.unread || 0) > 0
+                                width: visible ? Math.max(Style.space(14),
+                                  unreadText.implicitWidth + Style.space(4)) : 0
+                                height: visible ? Style.space(14) : 0
+                                radius: height / 2
+                                color: root.accent
+                                Text {
+                                  id: unreadText
+                                  anchors.centerIn: parent
+                                  text: Number(modelData.unread || 0) > 99
+                                    ? "99+" : String(modelData.unread || 0)
+                                  color: root.muted
+                                  font.family: root.fontFamily
+                                  font.pixelSize: Style.font.caption
+                                  font.bold: true
+                                }
+                              }
                             }
                           }
                         }
@@ -1412,8 +1760,72 @@ Item {
                         id: rowMouse
                         anchors.fill: parent
                         hoverEnabled: true
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: root.chooseChat(modelData.jid)
+                        onClicked: function(mouse) {
+                          if (mouse.button === Qt.RightButton) {
+                            chatDelegate.openContextMenuAt(mouse.x, mouse.y)
+                          } else {
+                            root.chooseChat(modelData.jid)
+                          }
+                        }
+                      }
+
+                      QQC.Popup {
+                        id: chatContextMenu
+
+                        objectName: "chatContextMenu-"
+                          + String(modelData.jid || "")
+                        readonly property var popupBorderSpec:
+                          Border.localOrSurfaceSpec("popups", "border",
+                            Color.popups.border, Color.popups.border,
+                            Math.max(1, Style.normalBorderWidth))
+
+                        parent: chatDelegate
+                        width: Style.space(188)
+                        height: chatPinAction.implicitHeight
+                          + topPadding + bottomPadding
+                        margins: Style.space(8)
+                        padding: Style.space(6)
+                        leftPadding: padding + Border.left(popupBorderSpec)
+                        rightPadding: padding + Border.right(popupBorderSpec)
+                        topPadding: padding + Border.top(popupBorderSpec)
+                        bottomPadding: padding + Border.bottom(popupBorderSpec)
+                        modal: false
+                        focus: true
+                        closePolicy: QQC.Popup.CloseOnEscape
+                          | QQC.Popup.CloseOnPressOutsideParent
+
+                        onOpened: Qt.callLater(function() {
+                          chatPinAction.forceActiveFocus()
+                        })
+
+                        background: CrispBorderSurface {
+                          color: Color.popups.background
+                          sourceBorderSpec: chatContextMenu.popupBorderSpec
+                          radius: Style.cornerRadius + Style.space(2)
+                        }
+
+                        contentItem: CrispMenuButton {
+                          id: chatPinAction
+
+                          objectName: "chatPinAction-"
+                            + String(modelData.jid || "")
+                          width: parent.width
+                          menuIconText: "󰐃"
+                          menuText: modelData.pinned === true
+                            ? "Unpin conversation" : "Pin conversation"
+                          foreground: Color.popups.text
+                          accent: root.accent
+                          focusable: true
+                          onClicked: {
+                            chatContextMenu.close()
+                            if (root.service
+                                && typeof root.service.setChatPinned === "function")
+                              root.service.setChatPinned(modelData.jid,
+                                modelData.pinned !== true)
+                          }
+                        }
                       }
                     }
 
@@ -1575,6 +1987,7 @@ Item {
 
                   ListView {
                     id: messageList
+                    objectName: "messageList"
                     width: parent.width
                     height: parent.height - conversationHeader.height - composerRow.height
                     clip: true
@@ -1592,19 +2005,25 @@ Item {
 
                     delegate: Item {
                       id: messageDelegate
+                      objectName: "messageDelegate-" + String(modelData.id || "")
                       required property var modelData
                       required property int index
-                      readonly property var mediaData: modelData.media || null
+                      readonly property var mediaData: root.service
+                        ? root.service.messageMedia(modelData)
+                        : modelData.media || null
                       readonly property var reactionsData: modelData.reactions || []
                       readonly property int reactionCount: reactionsData
                         && typeof reactionsData.length === "number"
                         ? reactionsData.length : 0
+                      readonly property bool isPoll: mediaData
+                        && mediaData.kind === "poll"
                       readonly property bool hasStructuredMedia: mediaData
                         && (mediaData.kind === "image"
                           || mediaData.kind === "video"
                           || mediaData.kind === "audio"
                           || mediaData.kind === "document"
-                          || mediaData.kind === "location")
+                          || mediaData.kind === "location"
+                          || mediaData.kind === "poll")
                       readonly property bool hasMediaCaption: mediaData
                         && String(modelData.text || "").charAt(0) !== "["
                       readonly property bool showSenderLabel: root.service
@@ -1662,12 +2081,40 @@ Item {
                         reactionPicker.open()
                       }
 
+                      function selectedPollOptions() {
+                        var selected = []
+                        if (!isPoll || !Array.isArray(mediaData.options)) return selected
+                        for (var i = 0; i < mediaData.options.length; i++)
+                          if (mediaData.options[i].selected_by_me === true)
+                            selected.push(String(mediaData.options[i].name || ""))
+                        return selected
+                      }
+
+                      function togglePollOption(optionIndex) {
+                        if (!root.service || !isPoll || pollCard.ended
+                            || root.service.pollVotePending(modelData)) return
+                        var options = mediaData.options || []
+                        var option = options[optionIndex] || {}
+                        var name = String(option.name || "")
+                        if (!name) return
+                        var selected = selectedPollOptions()
+                        var selectedIndex = selected.indexOf(name)
+                        if (Number(mediaData.selectable_count || 1) === 1) {
+                          selected = selectedIndex >= 0 ? [] : [name]
+                        } else if (selectedIndex >= 0) {
+                          selected.splice(selectedIndex, 1)
+                        } else {
+                          selected.push(name)
+                        }
+                        root.service.votePoll(modelData, selected)
+                      }
+
                       width: messageList.width
                       height: Math.max(bubble.height, senderAvatar.height)
                         + (reactionsBar.visible
                           ? reactionsBar.height - Style.space(6) : 0)
-                        + (messageFooterTime.visible
-                          ? messageFooterTime.implicitHeight + Style.space(3) : 0)
+                        + (messageFooter.visible
+                          ? messageFooter.implicitHeight + Style.space(3) : 0)
                         + Style.space(4)
 
                       ListView.onPooled: {
@@ -1774,18 +2221,31 @@ Item {
                             - horizontalPadding
                         readonly property real locationPreviewWidth:
                           Math.min(maximumMediaWidth, Style.space(260))
-                        readonly property real videoAspectRatio:
+                        readonly property real mediaAspectRatio:
                           Number(messageDelegate.mediaData
                             ? messageDelegate.mediaData.width || 1 : 1)
                             / Math.max(1, Number(messageDelegate.mediaData
                               ? messageDelegate.mediaData.height || 1 : 1))
+                        readonly property real imageAspectRatio:
+                          mediaPreviewImage.status === Image.Ready
+                            && mediaPreviewImage.sourceSize.width > 0
+                            && mediaPreviewImage.sourceSize.height > 0
+                          ? mediaPreviewImage.sourceSize.width
+                            / mediaPreviewImage.sourceSize.height
+                          : mediaAspectRatio
+                        readonly property real imagePreviewWidth: Math.max(
+                          Style.space(40), Math.min(maximumMediaWidth,
+                            Style.space(280) * imageAspectRatio))
                         readonly property real videoPreviewWidth: Math.max(
                           Style.space(40), Math.min(maximumMediaWidth,
-                            Style.space(280) * videoAspectRatio))
+                            Style.space(280) * mediaAspectRatio))
 
                         width: messageDelegate.mediaData
                           && messageDelegate.mediaData.kind === "video"
                           ? videoPreviewWidth + horizontalPadding
+                          : messageDelegate.mediaData
+                            && messageDelegate.mediaData.kind === "image"
+                          ? imagePreviewWidth + horizontalPadding
                           : messageDelegate.mediaData
                             && messageDelegate.mediaData.kind === "location"
                           ? locationPreviewWidth + horizontalPadding
@@ -1883,6 +2343,139 @@ Item {
                             }
                           }
                           Item {
+                            id: pollCard
+                            objectName: "pollCard-" + String(modelData.id || "")
+                            readonly property bool ended:
+                              Number(messageDelegate.mediaData
+                                ? messageDelegate.mediaData.end_timestamp || 0 : 0) > 0
+                              && Number(messageDelegate.mediaData.end_timestamp)
+                                <= root.currentTimestamp
+                            readonly property int totalVoters:
+                              Number(messageDelegate.mediaData
+                                ? messageDelegate.mediaData.total_voters || 0 : 0)
+                            visible: messageDelegate.isPoll
+                            width: parent.width
+                            height: visible ? pollContent.implicitHeight : 0
+
+                            Column {
+                              id: pollContent
+                              width: parent.width
+                              spacing: Style.space(7)
+
+                              Text {
+                                width: parent.width
+                                text: messageDelegate.mediaData
+                                  ? String(messageDelegate.mediaData.question || "Poll") : "Poll"
+                                color: root.foreground
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.body
+                                font.bold: true
+                                wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                                textFormat: Text.PlainText
+                              }
+
+                              Text {
+                                width: parent.width
+                                text: Number(messageDelegate.mediaData
+                                  ? messageDelegate.mediaData.selectable_count || 1 : 1) > 1
+                                  ? "Select one or more" : "Select one"
+                                color: root.sidebarSecondary
+                                font.family: root.fontFamily
+                                font.pixelSize: root.messageMetaFontSize
+                              }
+
+                              Repeater {
+                                model: messageDelegate.mediaData
+                                  && Array.isArray(messageDelegate.mediaData.options)
+                                  ? messageDelegate.mediaData.options : []
+
+                                delegate: Item {
+                                  id: pollOption
+                                  objectName: "pollOption-" + String(index)
+                                  required property var modelData
+                                  required property int index
+                                  readonly property bool selected:
+                                    modelData.selected_by_me === true
+                                  readonly property int votes:
+                                    Number(modelData.votes || 0)
+                                  width: pollContent.width
+                                  height: Math.max(Style.space(38),
+                                    pollOptionLabel.implicitHeight + Style.space(16))
+
+                                  CrispBorderSurface {
+                                    anchors.fill: parent
+                                    radius: Style.cornerRadius + Style.space(2)
+                                    color: pollOption.selected
+                                      ? Style.selectedFillFor(root.foreground, root.accent)
+                                      : Style.normalFillFor(root.foreground, root.accent)
+                                    sourceBorderSpec: Border.flat(
+                                      pollOption.selected ? root.accent
+                                        : Style.normalBorderFor(root.foreground, root.accent),
+                                      Math.max(1, Style.normalBorderWidth))
+
+                                    Rectangle {
+                                      anchors.left: parent.left
+                                      anchors.bottom: parent.bottom
+                                      height: Math.max(1, Style.normalBorderWidth * 2)
+                                      width: pollCard.totalVoters > 0
+                                        ? parent.width * Math.min(1,
+                                          pollOption.votes / pollCard.totalVoters) : 0
+                                      color: root.accent
+                                      opacity: 0.75
+                                    }
+                                  }
+
+                                  Text {
+                                    id: pollOptionLabel
+                                    anchors.left: parent.left
+                                    anchors.right: pollOptionCount.left
+                                    anchors.leftMargin: Style.space(10)
+                                    anchors.rightMargin: Style.space(8)
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: (pollOption.selected ? "✓  " : "")
+                                      + String(pollOption.modelData.name || "")
+                                    color: root.foreground
+                                    font.family: root.fontFamily
+                                    font.pixelSize: Style.font.body
+                                    wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                                    textFormat: Text.PlainText
+                                  }
+
+                                  Text {
+                                    id: pollOptionCount
+                                    anchors.right: parent.right
+                                    anchors.rightMargin: Style.space(10)
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: String(pollOption.votes)
+                                    color: root.sidebarSecondary
+                                    font.family: root.fontFamily
+                                    font.pixelSize: root.messageMetaFontSize
+                                  }
+
+                                  MouseArea {
+                                    objectName: "pollOptionMouse-" + String(pollOption.index)
+                                    anchors.fill: parent
+                                    enabled: !pollCard.ended && root.service
+                                      && !root.service.pollVotePending(messageDelegate.modelData)
+                                    cursorShape: enabled
+                                      ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                    onClicked: messageDelegate.togglePollOption(pollOption.index)
+                                  }
+                                }
+                              }
+
+                              Text {
+                                width: parent.width
+                                text: pollCard.ended ? "Poll ended"
+                                  : (pollCard.totalVoters === 1 ? "1 vote"
+                                    : pollCard.totalVoters + " votes")
+                                color: pollCard.ended ? Color.urgent : root.sidebarSecondary
+                                font.family: root.fontFamily
+                                font.pixelSize: root.messageMetaFontSize
+                              }
+                            }
+                          }
+                          Item {
                             id: mediaPreviewCard
                             property alias videoSurface: inlineVideoOutput
                             readonly property bool isVideo: messageDelegate.mediaData
@@ -1907,12 +2500,9 @@ Item {
                                 || messageDelegate.mediaData.kind === "video")
                             width: parent.width
                             height: visible && messageDelegate.mediaData
-                              ? (isVideo ? width / bubble.videoAspectRatio
-                                : Math.max(Style.space(110), Math.min(
-                                  Style.space(280), width * Number(
-                                    messageDelegate.mediaData.height || 1)
-                                    / Math.max(1, Number(
-                                      messageDelegate.mediaData.width || 1)))))
+                              ? width / (isVideo
+                                ? bubble.mediaAspectRatio
+                                : bubble.imageAspectRatio)
                               : 0
 
                             Image {
@@ -1920,10 +2510,17 @@ Item {
                               anchors.fill: parent
                               visible: !mediaPreviewCard.inlineActive
                               source: mediaPreviewCard.visible && root.service
-                                ? root.service.fileUrl(mediaPreviewCard.displayPath) : ""
+                                ? root.service.fileUrl(
+                                  mediaPreviewCard.displayPath,
+                                  root.service.messageMediaRevision(modelData)) : ""
                               asynchronous: true
                               cache: false
                               fillMode: Image.PreserveAspectFit
+                              onStatusChanged: {
+                                if (status === Image.Ready)
+                                  root.scheduleMediaDownloadAnchorRestore(
+                                    modelData.id)
+                              }
                             }
 
                             VideoOutput {
@@ -1940,12 +2537,17 @@ Item {
 
                             MouseArea {
                               anchors.fill: parent
-                              enabled: mediaPreviewCard.isVideo
-                                && mediaPreviewCard.downloaded
+                              enabled: mediaPreviewCard.downloaded
                               cursorShape: enabled
                                 ? Qt.PointingHandCursor : Qt.ArrowCursor
-                              onClicked:
-                                root.toggleInlineVideo(mediaPreviewCard)
+                              onClicked: {
+                                if (mediaPreviewCard.isVideo)
+                                  root.toggleInlineVideo(mediaPreviewCard)
+                                else if (root.service)
+                                  root.openImagePreview(
+                                    mediaPreviewCard.mediaPath,
+                                    root.service.messageMediaRevision(modelData))
+                              }
                             }
 
                             Text {
@@ -1974,9 +2576,7 @@ Item {
                                 ? (mediaPreviewHover.hovered ? 1 : 0) : 1
                               width: Style.space(40)
                               height: Style.space(40)
-                              iconSize: mediaPreviewCard.isVideo
-                                && mediaPreviewCard.downloaded
-                                ? Style.font.icon * 1.5 : Style.font.icon
+                              iconSize: Style.font.icon * 1.5
                               iconText: downloading ? "󰔟"
                                 : (mediaPreviewCard.isVideo
                                   && mediaPreviewCard.downloaded
@@ -2010,7 +2610,7 @@ Item {
                                     && mediaPreviewCard.downloaded)
                                   root.toggleInlineVideo(mediaPreviewCard)
                                 else
-                                  root.service.downloadMedia(modelData)
+                                  root.downloadMedia(modelData, messageDelegate)
                               }
                             }
 
@@ -2073,7 +2673,7 @@ Item {
                                 if (voiceMessageCard.downloaded)
                                   root.toggleVoiceMessage(voiceMessageCard)
                                 else
-                                  root.service.downloadMedia(modelData)
+                                  root.downloadMedia(modelData, messageDelegate)
                               }
                             }
 
@@ -2648,8 +3248,8 @@ Item {
                           }
                       }
 
-                      Text {
-                        id: messageFooterTime
+                      Row {
+                        id: messageFooter
                         visible: messageDelegate.showMessageTime
                         anchors.top: reactionsBar.visible
                           ? reactionsBar.bottom : bubble.bottom
@@ -2657,11 +3257,34 @@ Item {
                         x: modelData.from_me
                           ? bubble.x + bubble.width - width - Style.space(4)
                           : bubble.x + Style.space(4)
-                        text: Model.messageTime(modelData.timestamp,
-                          root.messageTimeFormat)
-                        color: root.timestamp
-                        font.family: root.fontFamily
-                        font.pixelSize: root.messageMetaFontSize
+                        spacing: Style.space(2)
+
+                        Text {
+                          objectName: "messageReceiptStatus-"
+                            + String(modelData.id || "")
+                          visible: modelData.from_me === true
+                          anchors.verticalCenter: parent.verticalCenter
+                          text: root.messageReceiptIcon(modelData.receipt)
+                          color: Number(modelData.receipt || 0) >= 3
+                            ? root.accent : root.timestamp
+                          font.family: root.fontFamily
+                          font.pixelSize: 12
+                          font.bold: Number(modelData.receipt || 0) > 0
+                          Accessible.name:
+                            root.messageReceiptLabel(modelData.receipt)
+                        }
+
+                        Text {
+                          id: messageFooterTime
+                          objectName: "messageTimestamp-"
+                            + String(modelData.id || "")
+                          anchors.verticalCenter: parent.verticalCenter
+                          text: Model.messageTime(modelData.timestamp,
+                            root.messageTimeFormat)
+                          color: root.timestamp
+                          font.family: root.fontFamily
+                          font.pixelSize: 10
+                        }
                       }
                     }
 
@@ -2724,13 +3347,26 @@ Item {
                       spacing: Style.space(8)
                       CrispTextField {
                         id: composer
-                        width: parent.width - sendButton.width - parent.spacing
+                        objectName: "composer"
+                        width: parent.width - pollButton.width - sendButton.width
+                          - parent.spacing * 2
                         enabled: root.service && root.service.selectedChatJid !== ""
                         placeholderText: enabled ? "Message" : "Select a conversation"
                         onAccepted: root.submitMessage()
                       }
                       CrispButton {
+                        id: pollButton
+                        objectName: "pollButton"
+                        iconText: "󰘻"
+                        bordered: true
+                        enabled: composer.enabled
+                        foreground: root.foreground
+                        tooltipText: "Create poll"
+                        onClicked: root.openPollCreator()
+                      }
+                      CrispButton {
                         id: sendButton
+                        objectName: "sendButton"
                         iconText: "󰒊"
                         text: "Send"
                         bordered: true

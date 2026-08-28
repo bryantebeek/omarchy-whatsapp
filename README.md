@@ -21,18 +21,20 @@ mind.
 - `io.github.bryantebeek.whatsapp`: the full Quickshell app. Its service
   keeps lightweight UI state, its bar widget shows connection/unread state, and
   its panel provides pairing, chats, history, composing, and deep links.
-- `omarchy-whatsappctl`: scriptable status, history, send, and read operations.
+- `omarchy-whatsappctl`: scriptable status, history, send, poll, and read
+  operations.
 - A hardened user systemd service, launcher entry, scalable icon, installer,
   uninstaller, and Arch `PKGBUILD`.
 
 The app renders contact, group, and group-participant avatars; encrypted image,
 video, and voice messages; documents; static/live-location cards; and
-synchronized emoji reactions. Voice notes download on demand and play inline.
-Reaction chips aggregate matching emoji and support adding, changing, and
-removing your reaction. Location cards open in the system browser using
-OpenStreetMap, avoiding an embedded browser engine. Stickers, full calling,
-search, and group administration remain lightweight placeholders or out of
-scope.
+synchronized emoji reactions. Poll cards show live vote totals and let you vote
+or revise your selection; new single- or multiple-answer polls can be created
+from the composer. Voice notes download on demand and play inline. Reaction
+chips aggregate matching emoji and support adding, changing, and removing your
+reaction. Location cards open in the system browser using OpenStreetMap,
+avoiding an embedded browser engine. Stickers, full calling, search, and group
+administration remain lightweight placeholders or out of scope.
 
 ## Install on Omarchy
 
@@ -85,6 +87,8 @@ omarchy-whatsappctl status
 omarchy-whatsappctl chats
 omarchy-whatsappctl messages 31612345678@s.whatsapp.net
 omarchy-whatsappctl send 31612345678@s.whatsapp.net "Hello from Omarchy"
+omarchy-whatsappctl poll-create 31612345678@s.whatsapp.net "Lunch?" -o Soup -o Salad
+omarchy-whatsappctl poll-vote 31612345678@s.whatsapp.net POLL_MESSAGE_ID -o Soup
 jq '.chats | length' < <(omarchy-whatsappctl chats --limit 500)
 journalctl --user -u omarchy-whatsapp.service -f
 ```
@@ -123,10 +127,11 @@ only the explicit `--purge-data` option removes it.
 - The runtime directory is mode `0700`; its socket and pairing QR are `0600`.
 - Linked-device cryptographic state lives in
   `~/.local/state/omarchy-whatsapp/session.db`.
-- The UI index lives separately in `history.db` and retains at most 1,000 text
-  entries per chat. Raster images are limited to 25 MiB each and the private
-  media cache is pruned to 256 MiB; profile previews are capped at 1 MiB each
-  and 64 MiB total.
+- The UI index lives separately in `history.db` and retains at most 1,000
+  messages per chat. Poll creation secrets and each participant's latest vote
+  stay in this private database and are not exposed through shell IPC. Raster
+  images are limited to 25 MiB each and the private media cache is pruned to
+  256 MiB; profile previews are capped at 1 MiB each and 64 MiB total.
 - Notification content is passed as argv, never through a shell. Clicking a
   notification asks Omarchy Shell to open the app at the relevant conversation.
 - Offline history sync is indexed but does not create desktop notifications.
@@ -157,6 +162,8 @@ state as built-in panels and widgets. The Rust daemon remains appearance-free.
 ```bash
 ./scripts/check.sh
 ./scripts/coverage.sh
+./scripts/qml-coverage.sh
+./scripts/qml-mutation.sh
 ./scripts/cargo.sh deny check
 ./scripts/cargo.sh build --release --locked --workspace
 ./tests/smoke.sh
@@ -166,14 +173,19 @@ state as built-in panels and widgets. The Rust daemon remains appearance-free.
 not touch the installed service or paired account.
 
 The local checks are mirrored by required GitHub Actions jobs for formatting,
-strict Clippy linting, unit tests, coverage, release smoke testing, dependency
-policy, dependency review, and CodeQL. See [QUALITY.md](QUALITY.md) for the exact
-coverage contract and merge-policy setup.
+strict Clippy linting, Rust unit tests and coverage, each of the four QML test
+suites, QML behavioral-contract coverage, QML mutation testing, release smoke
+testing, dependency policy, dependency review, and CodeQL. See
+[QUALITY.md](QUALITY.md) for the exact coverage contract and merge-policy setup.
 
-`scripts/check.sh` validates the root marketplace manifest and entry points.
-On Omarchy it also runs strict `qmllint` against the installed shell modules;
-hosted CI, where those private modules are unavailable, still performs QML
-syntax and formatting checks.
+`scripts/check.sh` validates the root marketplace manifest and entry points. It
+also runs portable Qt Quick unit, component, service-state, and UI workflow
+tests against side-effect-free Quickshell and Omarchy test doubles. The QML
+behavioral contract requires every `Model.js` helper, every `Service.qml` event,
+every production entry point, and every required workflow to be covered. A
+semantic mutation suite must kill every checked-in mutant. On Omarchy, the same
+check additionally runs strict `qmllint` against the installed shell modules;
+hosted CI uses the portable test doubles where those modules are unavailable.
 
 The IPC protocol is newline-delimited JSON. Every request may carry an `id`; a
 matching response carries the same value, while broadcasts omit it. For example:

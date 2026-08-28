@@ -53,10 +53,11 @@ the device identity and protocol persistence required to reconnect after login.
 
 `history.db` is application-owned. It stores only the fields required by the
 UI, media references, per-sender emoji reactions, synchronized chat settings,
-and unread handling. Inserts
-are idempotent on `(chat_jid, id)`, so
-offline replay does not duplicate messages or unread counts. Retention is capped
-per chat and never deletes protocol state.
+poll definitions, daemon-private poll creation secrets, each participant's
+latest poll selection, and unread handling. Only aggregate poll results and the
+local user's selected options cross IPC. Inserts are idempotent on
+`(chat_jid, id)`, so offline replay does not duplicate messages or unread
+counts. Retention is capped per chat and never deletes protocol state.
 
 The active chat is ephemeral daemon state. The focused, visible Quickshell panel
 sets it and clears it when hidden or unfocused. Live incoming messages in that
@@ -119,6 +120,12 @@ applied incrementally. Reactions embedded in live and history message streams
 are stored as per-sender updates and exposed as aggregated chips; an empty
 reaction removes that sender's prior choice. Local mark-read also writes the
 app-state action back to WhatsApp so other devices converge.
+
+Poll creation messages retain their encryption secret only in the daemon's
+private database. Incoming vote updates are decrypted there, applied with
+last-vote-wins semantics per participant, and broadcast as refreshed aggregate
+cards. Voting uses the stored secret through `whatsapp-rust`; Quickshell never
+receives it.
 
 Avatar previews and message images are raster-only and owner-readable. Encrypted
 message images are streamed through the library's authenticated decryptor to a

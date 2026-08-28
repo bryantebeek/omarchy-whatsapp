@@ -78,17 +78,18 @@ function timeFormat(clockFormats) {
   return "HH:mm"
 }
 
-function shortTime(seconds, format) {
+function shortTime(seconds, format, locale) {
   var value = Number(seconds || 0)
   if (!value) return ""
   var date = new Date(value * 1000)
   var today = new Date()
+  var activeLocale = locale || Qt.locale()
   if (date.toDateString() === today.toDateString())
     return Qt.formatTime(date, format || "HH:mm")
   var age = today.getTime() - date.getTime()
   if (age < 6 * 86400000)
-    return date.toLocaleDateString([], { weekday: "short" })
-  return date.toLocaleDateString([], { day: "2-digit", month: "short" })
+    return date.toLocaleDateString(activeLocale, "ddd")
+  return date.toLocaleDateString(activeLocale, "dd MMM")
 }
 
 function messageTime(seconds, format) {
@@ -98,7 +99,8 @@ function messageTime(seconds, format) {
 }
 
 function mediaDuration(seconds) {
-  var value = Math.max(0, Math.floor(Number(seconds || 0)))
+  var parsed = Number(seconds || 0)
+  var value = isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0
   var hours = Math.floor(value / 3600)
   var minutes = Math.floor((value % 3600) / 60)
   var remainder = value % 60
@@ -109,7 +111,8 @@ function mediaDuration(seconds) {
 }
 
 function fileSize(bytes) {
-  var value = Math.max(0, Number(bytes || 0))
+  var parsed = Number(bytes || 0)
+  var value = isFinite(parsed) ? Math.max(0, parsed) : 0
   if (!value) return "Unknown size"
   var units = ["B", "KB", "MB", "GB"]
   var unit = 0

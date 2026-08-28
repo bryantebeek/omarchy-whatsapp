@@ -41,6 +41,22 @@ enum Action {
         chat: String,
         text: String,
     },
+    PollCreate {
+        chat: String,
+        question: String,
+        #[arg(short = 'o', long = "option", required = true)]
+        options: Vec<String>,
+        #[arg(long, default_value_t = 1)]
+        selectable_count: u32,
+        #[arg(long)]
+        correct_option_index: Option<u32>,
+    },
+    PollVote {
+        chat: String,
+        message_id: String,
+        #[arg(short = 'o', long = "option")]
+        selected_options: Vec<String>,
+    },
     MarkRead {
         chat: String,
     },
@@ -117,6 +133,28 @@ fn command_for_action(action: Action) -> Result<Command> {
         Action::Send { chat, text } => Command::SendMessage {
             chat_jid: chat,
             text,
+        },
+        Action::PollCreate {
+            chat,
+            question,
+            options,
+            selectable_count,
+            correct_option_index,
+        } => Command::CreatePoll {
+            chat_jid: chat,
+            question,
+            options,
+            selectable_count,
+            correct_option_index,
+        },
+        Action::PollVote {
+            chat,
+            message_id,
+            selected_options,
+        } => Command::VotePoll {
+            chat_jid: chat,
+            message_id,
+            selected_options,
         },
         Action::MarkRead { chat } => Command::MarkRead { chat_jid: chat },
         Action::Ping => Command::Ping,

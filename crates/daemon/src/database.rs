@@ -11,6 +11,13 @@ const CHAT_NAME_HISTORY: i64 = 10;
 const CHAT_NAME_MESSAGE: i64 = 20;
 const CHAT_NAME_GROUP_METADATA: i64 = 30;
 const CHAT_NAME_ADDRESS_BOOK: i64 = 40;
+const READ_BOUNDARY_IDS_CAP: usize = 256;
+
+fn read_boundary_ids(value: Option<String>) -> Vec<String> {
+    value
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -38,6 +45,15 @@ pub struct ActiveLiveLocation {
     pub chat_jid: String,
     pub message_id: String,
     pub duration_seconds: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPoll {
+    pub creator_jid: String,
+    pub message_secret: Vec<u8>,
+    pub options: Vec<String>,
+    pub selectable_count: u32,
+    pub end_timestamp: i64,
 }
 
 impl Database {
@@ -94,7 +110,9 @@ impl Database {
                 disappearing_duration     INTEGER,
                 disappearing_updated_at   INTEGER,
                 deleted                    INTEGER NOT NULL DEFAULT 0,
-                cleared_at                 INTEGER NOT NULL DEFAULT 0
+                cleared_at                 INTEGER NOT NULL DEFAULT 0,
+                read_boundary              INTEGER NOT NULL DEFAULT 0,
+                read_boundary_ids          TEXT
             );
             CREATE TABLE IF NOT EXISTS message_tombstones (
                 chat_jid  TEXT NOT NULL,
@@ -114,6 +132,24 @@ impl Database {
                 ON reactions(chat_jid, message_id);
             CREATE INDEX IF NOT EXISTS reactions_by_reactor
                 ON reactions(reactor_jid);
+            CREATE TABLE IF NOT EXISTS poll_secrets (
+                chat_jid      TEXT NOT NULL,
+                message_id    TEXT NOT NULL,
+                creator_jid   TEXT NOT NULL,
+                message_secret BLOB NOT NULL,
+                PRIMARY KEY (chat_jid, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS poll_votes (
+                chat_jid         TEXT NOT NULL,
+                message_id       TEXT NOT NULL,
+                voter_jid        TEXT NOT NULL,
+                selected_options TEXT NOT NULL,
+                from_me          INTEGER NOT NULL DEFAULT 0,
+                timestamp        INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_jid, message_id, voter_jid)
+            );
+            CREATE INDEX IF NOT EXISTS poll_votes_by_message
+                ON poll_votes(chat_jid, message_id);
             CREATE TABLE IF NOT EXISTS labels (
                 id      TEXT PRIMARY KEY,
                 name    TEXT NOT NULL DEFAULT '',
@@ -165,6 +201,14 @@ impl Database {
         );
         let _ = connection.execute(
             "ALTER TABLE chat_settings ADD COLUMN cleared_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE chat_settings ADD COLUMN read_boundary INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE chat_settings ADD COLUMN read_boundary_ids TEXT",
             [],
         );
         // A JID is an identifier, never a chat name. Legacy databases stored
@@ -244,6 +288,8 @@ impl Database {
         transaction.execute_batch(
             "
             DELETE FROM reactions;
+            DELETE FROM poll_votes;
+            DELETE FROM poll_secrets;
             DELETE FROM message_tombstones;
             DELETE FROM messages;
             DELETE FROM chat_labels;
@@ -384,12 +430,27 @@ impl Database {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let (read_boundary, boundary_ids) = transaction
+            .query_row(
+                "SELECT read_boundary, read_boundary_ids
+                 FROM chat_settings WHERE jid = ?1",
+                [&message.chat_jid],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, None));
+        let covered_by_self_read = message.timestamp <= read_boundary
+            || read_boundary_ids(boundary_ids)
+                .iter()
+                .any(|id| id == &message.id);
+        let message_is_unread = increment_unread && !covered_by_self_read;
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO messages
-             (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, read, media_json)
+             (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, read,
+              receipt, media_json)
              VALUES (?1, ?2, ?3,
                 COALESCE((SELECT name FROM contacts WHERE jid = ?3 AND source = 1), ?4),
-                ?5, ?6, ?7, ?8, ?9)",
+                ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 message.chat_jid,
                 message.id,
@@ -398,11 +459,12 @@ impl Database {
                 message.text,
                 message.timestamp,
                 message.from_me,
-                !increment_unread,
+                !message_is_unread,
+                message.receipt,
                 media_json,
             ],
         )? > 0;
-        if inserted && increment_unread {
+        if inserted && message_is_unread {
             transaction.execute(
                 "UPDATE chats SET unread = unread + 1 WHERE jid = ?1",
                 [&message.chat_jid],
@@ -418,6 +480,16 @@ impl Database {
         transaction.execute(
             "DELETE FROM messages WHERE chat_jid = ?1 AND rowid NOT IN
              (SELECT rowid FROM messages WHERE chat_jid = ?1 ORDER BY timestamp DESC LIMIT 1000)",
+            [&message.chat_jid],
+        )?;
+        transaction.execute(
+            "DELETE FROM poll_votes WHERE chat_jid = ?1 AND message_id NOT IN
+             (SELECT id FROM messages WHERE chat_jid = ?1)",
+            [&message.chat_jid],
+        )?;
+        transaction.execute(
+            "DELETE FROM poll_secrets WHERE chat_jid = ?1 AND message_id NOT IN
+             (SELECT id FROM messages WHERE chat_jid = ?1)",
             [&message.chat_jid],
         )?;
         transaction.commit()?;
@@ -661,9 +733,11 @@ impl Database {
             .lock()
             .expect("history database mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me, media_json
+            "SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me,
+                    receipt, media_json
              FROM (
-                SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me, media_json
+                SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me,
+                       receipt, media_json
                 FROM messages WHERE chat_jid = ?1
                 ORDER BY timestamp DESC LIMIT ?2
              ) ORDER BY timestamp ASC",
@@ -671,7 +745,7 @@ impl Database {
         let rows =
             statement.query_map(params![chat_jid, i64::from(limit.clamp(1, 1000))], |row| {
                 let mut media = row
-                    .get::<_, Option<String>>(7)?
+                    .get::<_, Option<String>>(8)?
                     .and_then(|json| serde_json::from_str(&json).ok());
                 match &mut media {
                     Some(MessageMedia::Image {
@@ -713,6 +787,7 @@ impl Database {
                     text: row.get(4)?,
                     timestamp: row.get(5)?,
                     from_me: row.get(6)?,
+                    receipt: u8::try_from(row.get::<_, i64>(7)?.clamp(0, 4)).unwrap_or_default(),
                     media,
                     reactions: Vec::new(),
                 })
@@ -785,11 +860,213 @@ impl Database {
         )? > 0)
     }
 
+    pub fn store_poll_secret(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+        creator_jid: &str,
+        message_secret: &[u8],
+    ) -> Result<()> {
+        if message_secret.len() != 32 {
+            anyhow::bail!(
+                "poll message secret must be exactly 32 bytes, got {}",
+                message_secret.len()
+            );
+        }
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        connection.execute(
+            "INSERT INTO poll_secrets
+             (chat_jid, message_id, creator_jid, message_secret)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_jid, message_id) DO UPDATE SET
+                creator_jid = excluded.creator_jid,
+                message_secret = excluded.message_secret",
+            params![chat_jid, message_id, creator_jid, message_secret],
+        )?;
+        Ok(())
+    }
+
+    pub fn poll_for_voting(&self, chat_jid: &str, message_id: &str) -> Result<Option<StoredPoll>> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        let row = connection
+            .query_row(
+                "SELECT poll_secrets.creator_jid, poll_secrets.message_secret,
+                        messages.media_json
+                 FROM poll_secrets
+                 JOIN messages ON messages.chat_jid = poll_secrets.chat_jid
+                              AND messages.id = poll_secrets.message_id
+                 WHERE poll_secrets.chat_jid = ?1 AND poll_secrets.message_id = ?2",
+                params![chat_jid, message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((creator_jid, message_secret, Some(media_json))) = row else {
+            return Ok(None);
+        };
+        let Ok(MessageMedia::Poll {
+            options,
+            selectable_count,
+            end_timestamp,
+            ..
+        }) = serde_json::from_str(&media_json)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(StoredPoll {
+            creator_jid,
+            message_secret,
+            options: options.into_iter().map(|option| option.name).collect(),
+            selectable_count,
+            end_timestamp,
+        }))
+    }
+
+    pub fn apply_poll_vote(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+        voter_jid: &str,
+        selected_options: &[String],
+        from_me: bool,
+        timestamp: i64,
+    ) -> Result<bool> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let Some(media_json) = transaction
+            .query_row(
+                "SELECT media_json FROM messages WHERE chat_jid = ?1 AND id = ?2",
+                params![chat_jid, message_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let Ok(mut media @ MessageMedia::Poll { .. }) = serde_json::from_str(&media_json) else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let (valid_names, selectable_count) = match &media {
+            MessageMedia::Poll {
+                options,
+                selectable_count,
+                ..
+            } => (
+                options
+                    .iter()
+                    .map(|option| option.name.as_str())
+                    .collect::<std::collections::HashSet<_>>(),
+                *selectable_count,
+            ),
+            _ => unreachable!(),
+        };
+        let mut normalized = Vec::new();
+        for option in selected_options {
+            if valid_names.contains(option.as_str()) && !normalized.contains(option) {
+                normalized.push(option.clone());
+            }
+        }
+        if normalized.len() > usize::try_from(selectable_count).unwrap_or(usize::MAX) {
+            anyhow::bail!("poll vote selects more options than the poll allows");
+        }
+        let selected_json = serde_json::to_string(&normalized)?;
+        let changed = transaction.execute(
+            "INSERT INTO poll_votes
+             (chat_jid, message_id, voter_jid, selected_options, from_me, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(chat_jid, message_id, voter_jid) DO UPDATE SET
+                selected_options = excluded.selected_options,
+                from_me = excluded.from_me,
+                timestamp = excluded.timestamp
+             WHERE excluded.timestamp >= poll_votes.timestamp
+               AND (poll_votes.selected_options != excluded.selected_options
+                    OR poll_votes.from_me != excluded.from_me
+                    OR poll_votes.timestamp != excluded.timestamp)",
+            params![
+                chat_jid,
+                message_id,
+                voter_jid,
+                selected_json,
+                from_me,
+                timestamp,
+            ],
+        )? > 0;
+        if !changed {
+            transaction.commit()?;
+            return Ok(false);
+        }
+
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        let mut selected_by_me = std::collections::HashSet::new();
+        let mut total_voters = 0u32;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT selected_options, from_me FROM poll_votes
+                 WHERE chat_jid = ?1 AND message_id = ?2",
+            )?;
+            let rows = statement.query_map(params![chat_jid, message_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })?;
+            for row in rows {
+                let (json, own) = row?;
+                let selections: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+                if !selections.is_empty() {
+                    total_voters = total_voters.saturating_add(1);
+                }
+                for selection in selections {
+                    *counts.entry(selection.clone()).or_default() += 1;
+                    if own {
+                        selected_by_me.insert(selection);
+                    }
+                }
+            }
+        }
+        if let MessageMedia::Poll {
+            options,
+            total_voters: media_total_voters,
+            ..
+        } = &mut media
+        {
+            *media_total_voters = total_voters;
+            for option in options {
+                option.votes = counts.get(&option.name).copied().unwrap_or(0);
+                option.selected_by_me = selected_by_me.contains(&option.name);
+            }
+        }
+        let updated_json = serde_json::to_string(&media)?;
+        transaction.execute(
+            "UPDATE messages SET media_json = ?3
+             WHERE chat_jid = ?1 AND id = ?2",
+            params![chat_jid, message_id, updated_json],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn unread_total(&self) -> Result<u32> {
         let connection = self
             .connection
             .lock()
             .expect("history database mutex poisoned");
+        // Muting suppresses desktop notifications only. The badge ignores
+        // archived chats, but every unarchived unread message still counts.
         connection
             .query_row(
                 "SELECT COALESCE(SUM(chats.unread), 0)
@@ -1048,23 +1325,141 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_receipts(&self, message_ids: &[String], receipt: i64) -> Result<()> {
+    pub fn update_receipts(&self, message_ids: &[String], receipt: u8) -> Result<bool> {
         if message_ids.is_empty() {
-            return Ok(());
+            return Ok(false);
+        }
+        let receipt = i64::from(receipt);
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        let transaction = connection.transaction()?;
+        let mut changed = false;
+        for id in message_ids {
+            changed |= transaction.execute(
+                "UPDATE messages SET receipt = ?2
+                 WHERE id = ?1 AND from_me = 1 AND receipt < ?2",
+                params![id, receipt],
+            )? > 0;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn apply_self_read_receipt(
+        &self,
+        chat_jid: &str,
+        message_ids: &[String],
+        receipt_timestamp: i64,
+    ) -> Result<bool> {
+        if message_ids.is_empty() {
+            return Ok(false);
         }
         let mut connection = self
             .connection
             .lock()
             .expect("history database mutex poisoned");
         let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO chat_settings (jid) VALUES (?1)
+             ON CONFLICT(jid) DO NOTHING",
+            [chat_jid],
+        )?;
+        let (old_boundary, boundary_ids_json) = transaction.query_row(
+            "SELECT read_boundary, read_boundary_ids
+             FROM chat_settings WHERE jid = ?1",
+            [chat_jid],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        let mut covered_ids = read_boundary_ids(boundary_ids_json);
+        let mut newest_covered: Option<i64> = None;
         for id in message_ids {
-            transaction.execute(
-                "UPDATE messages SET receipt = MAX(receipt, ?2) WHERE id = ?1 AND from_me = 1",
-                params![id, receipt],
+            let timestamp = transaction
+                .query_row(
+                    "SELECT timestamp FROM messages
+                     WHERE chat_jid = ?1 AND id = ?2",
+                    params![chat_jid, id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            newest_covered = newest_covered.max(timestamp);
+            if !covered_ids.contains(id) {
+                covered_ids.push(id.clone());
+            }
+        }
+        // WhatsApp self-read receipts are a read-through watermark. Stop just
+        // before the boundary second and keep its named IDs separately so an
+        // unlisted message with the same wire timestamp remains unread.
+        let new_boundary = old_boundary.max(
+            newest_covered
+                .unwrap_or(receipt_timestamp)
+                .saturating_sub(1),
+        );
+        let mut extra_ids = Vec::with_capacity(covered_ids.len());
+        for id in covered_ids {
+            let timestamp = transaction
+                .query_row(
+                    "SELECT timestamp > ?3 FROM messages
+                     WHERE chat_jid = ?1 AND id = ?2",
+                    params![chat_jid, id, new_boundary],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?;
+            if timestamp.unwrap_or(true) {
+                extra_ids.push(id);
+            }
+        }
+        if extra_ids.len() > READ_BOUNDARY_IDS_CAP {
+            extra_ids.drain(..extra_ids.len() - READ_BOUNDARY_IDS_CAP);
+        }
+        let covered_ids_json = if extra_ids.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&extra_ids)?)
+        };
+        transaction.execute(
+            "UPDATE chat_settings
+             SET read_boundary = ?2, read_boundary_ids = ?3
+             WHERE jid = ?1",
+            params![chat_jid, new_boundary, covered_ids_json],
+        )?;
+        let mut marked = transaction.execute(
+            "UPDATE messages SET read = 1
+             WHERE chat_jid = ?1 AND from_me = 0 AND read = 0
+               AND timestamp <= ?2",
+            params![chat_jid, new_boundary],
+        )?;
+        for id in message_ids {
+            marked += transaction.execute(
+                "UPDATE messages SET read = 1
+                 WHERE chat_jid = ?1 AND id = ?2 AND from_me = 0 AND read = 0",
+                params![chat_jid, id],
             )?;
         }
+        let unread = transaction.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE chat_jid = ?1 AND from_me = 0 AND read = 0",
+            [chat_jid],
+            |row| row.get::<_, u32>(0),
+        )?;
+        let previous_unread = transaction
+            .query_row(
+                "SELECT unread FROM chats WHERE jid = ?1",
+                [chat_jid],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()?;
+        transaction.execute(
+            "UPDATE chats SET unread = ?2 WHERE jid = ?1",
+            params![chat_jid, unread],
+        )?;
+        transaction.execute(
+            "UPDATE chat_settings SET read_state = ?2 WHERE jid = ?1",
+            params![chat_jid, i64::from(unread == 0)],
+        )?;
         transaction.commit()?;
-        Ok(())
+        Ok(marked > 0 || previous_unread.is_some_and(|previous| previous != unread))
     }
 
     pub fn delete_chat(&self, chat_jid: &str, timestamp: i64) -> Result<()> {
@@ -1073,6 +1468,8 @@ impl Database {
             .lock()
             .expect("history database mutex poisoned");
         let transaction = connection.unchecked_transaction()?;
+        transaction.execute("DELETE FROM poll_votes WHERE chat_jid = ?1", [chat_jid])?;
+        transaction.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM messages WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM reactions WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM chats WHERE jid = ?1", [chat_jid])?;
@@ -1092,6 +1489,8 @@ impl Database {
             .lock()
             .expect("history database mutex poisoned");
         let transaction = connection.unchecked_transaction()?;
+        transaction.execute("DELETE FROM poll_votes WHERE chat_jid = ?1", [chat_jid])?;
+        transaction.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM messages WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM reactions WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute(
@@ -1114,6 +1513,14 @@ impl Database {
             .lock()
             .expect("history database mutex poisoned");
         let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM poll_votes WHERE chat_jid = ?1 AND message_id = ?2",
+            params![chat_jid, message_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM poll_secrets WHERE chat_jid = ?1 AND message_id = ?2",
+            params![chat_jid, message_id],
+        )?;
         transaction.execute(
             "DELETE FROM messages WHERE chat_jid = ?1 AND id = ?2",
             params![chat_jid, message_id],
@@ -1172,6 +1579,36 @@ impl Database {
             }
             if *duration_seconds == 0 {
                 *duration_seconds = previous_duration;
+            }
+        }
+        if let MessageMedia::Poll {
+            options,
+            total_voters,
+            ..
+        } = &mut merged_media
+            && let Some(previous_json) = connection
+                .query_row(
+                    "SELECT media_json FROM messages WHERE chat_jid = ?1 AND id = ?2",
+                    params![chat_jid, message_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+            && let Ok(MessageMedia::Poll {
+                options: previous_options,
+                total_voters: previous_total_voters,
+                ..
+            }) = serde_json::from_str(&previous_json)
+        {
+            *total_voters = previous_total_voters;
+            for option in options {
+                if let Some(previous) = previous_options
+                    .iter()
+                    .find(|previous| previous.name == option.name)
+                {
+                    option.votes = previous.votes;
+                    option.selected_by_me = previous.selected_by_me;
+                }
             }
         }
         let json = serde_json::to_string(&merged_media)?;
@@ -1480,6 +1917,7 @@ impl Database {
                  UNION ALL SELECT 1 FROM chat_settings WHERE jid = ?1
                  UNION ALL SELECT 1 FROM messages WHERE sender_jid = ?1
                  UNION ALL SELECT 1 FROM reactions WHERE reactor_jid = ?1
+                 UNION ALL SELECT 1 FROM poll_votes WHERE voter_jid = ?1
              )",
             [old_jid],
             |row| row.get::<_, bool>(0),
@@ -1505,6 +1943,11 @@ impl Database {
             params![old_jid, new_jid],
         )?;
         transaction.execute("DELETE FROM reactions WHERE reactor_jid = ?1", [old_jid])?;
+        transaction.execute(
+            "UPDATE OR IGNORE poll_votes SET voter_jid = ?2 WHERE voter_jid = ?1",
+            params![old_jid, new_jid],
+        )?;
+        transaction.execute("DELETE FROM poll_votes WHERE voter_jid = ?1", [old_jid])?;
         transaction.execute(
             "INSERT INTO chats
              (jid, name, name_source, phone_number, last_message, last_timestamp, unread, is_group)
@@ -1555,6 +1998,29 @@ impl Database {
         )?;
         transaction.execute("DELETE FROM reactions WHERE chat_jid = ?1", [old_jid])?;
         transaction.execute(
+            "INSERT INTO poll_secrets (chat_jid, message_id, creator_jid, message_secret)
+             SELECT ?2, message_id, creator_jid, message_secret
+             FROM poll_secrets WHERE chat_jid = ?1
+             ON CONFLICT(chat_jid, message_id) DO UPDATE SET
+                creator_jid = excluded.creator_jid,
+                message_secret = excluded.message_secret",
+            params![old_jid, new_jid],
+        )?;
+        transaction.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [old_jid])?;
+        transaction.execute(
+            "INSERT INTO poll_votes
+             (chat_jid, message_id, voter_jid, selected_options, from_me, timestamp)
+             SELECT ?2, message_id, voter_jid, selected_options, from_me, timestamp
+             FROM poll_votes WHERE chat_jid = ?1
+             ON CONFLICT(chat_jid, message_id, voter_jid) DO UPDATE SET
+                selected_options = excluded.selected_options,
+                from_me = excluded.from_me,
+                timestamp = excluded.timestamp
+             WHERE excluded.timestamp >= poll_votes.timestamp",
+            params![old_jid, new_jid],
+        )?;
+        transaction.execute("DELETE FROM poll_votes WHERE chat_jid = ?1", [old_jid])?;
+        transaction.execute(
             "INSERT OR IGNORE INTO message_tombstones (chat_jid, id)
              SELECT ?2, id FROM message_tombstones WHERE chat_jid = ?1",
             params![old_jid, new_jid],
@@ -1571,9 +2037,11 @@ impl Database {
         transaction.execute(
             "INSERT INTO chat_settings
              (jid, pinned, archived, muted, mute_end, read_state, status_muted,
-              disappearing_duration, disappearing_updated_at, deleted, cleared_at)
+              disappearing_duration, disappearing_updated_at, deleted, cleared_at,
+              read_boundary, read_boundary_ids)
              SELECT ?2, pinned, archived, muted, mute_end, read_state, status_muted,
-                    disappearing_duration, disappearing_updated_at, deleted, cleared_at
+                    disappearing_duration, disappearing_updated_at, deleted, cleared_at,
+                    read_boundary, read_boundary_ids
              FROM chat_settings WHERE jid = ?1
              ON CONFLICT(jid) DO UPDATE SET
                 pinned = COALESCE(excluded.pinned, chat_settings.pinned),
@@ -1591,7 +2059,13 @@ impl Database {
                     COALESCE(chat_settings.disappearing_updated_at, 0),
                     COALESCE(excluded.disappearing_updated_at, 0)),
                 deleted = MAX(chat_settings.deleted, excluded.deleted),
-                cleared_at = MAX(chat_settings.cleared_at, excluded.cleared_at)",
+                cleared_at = MAX(chat_settings.cleared_at, excluded.cleared_at),
+                read_boundary_ids = CASE
+                    WHEN excluded.read_boundary > chat_settings.read_boundary
+                    THEN excluded.read_boundary_ids
+                    ELSE chat_settings.read_boundary_ids END,
+                read_boundary = MAX(
+                    chat_settings.read_boundary, excluded.read_boundary)",
             params![old_jid, new_jid],
         )?;
         transaction.execute("DELETE FROM chat_settings WHERE jid = ?1", [old_jid])?;
@@ -1695,7 +2169,8 @@ impl Database {
                 "SELECT id, sender_jid, from_me, timestamp FROM messages
                  WHERE chat_jid = ?1 AND (
                    (media_json IS NULL
-                    AND text IN ('[Image]', '[Video]', '[Voice message]', '[Document]', '[Location]', '[Live location]'))
+                    AND (text IN ('[Image]', '[Video]', '[Voice message]', '[Document]', '[Location]', '[Live location]', '[Poll]')
+                         OR text LIKE '[Poll] %'))
                    OR ((media_json LIKE '%\"kind\":\"image\"%'
                         OR media_json LIKE '%\"kind\":\"video\"%')
                        AND (media_download IS NULL
@@ -1788,6 +2263,7 @@ mod tests {
             text: format!("message {id}"),
             timestamp,
             from_me: false,
+            receipt: 0,
             media: None,
             reactions: Vec::new(),
         }
@@ -1843,6 +2319,116 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn outgoing_receipts_are_loaded_and_advance_monotonically() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut outgoing = message("outgoing", 1);
+        outgoing.sender_jid = "me".into();
+        outgoing.sender_name = "You".into();
+        outgoing.from_me = true;
+        outgoing.receipt = 1;
+        database
+            .insert_message(&outgoing, "Ada", false, false)
+            .unwrap();
+
+        assert_eq!(
+            database.messages("1@s.whatsapp.net", 50).unwrap()[0].receipt,
+            1
+        );
+        assert!(database.update_receipts(&["outgoing".into()], 2).unwrap());
+        assert!(!database.update_receipts(&["outgoing".into()], 1).unwrap());
+        assert!(database.update_receipts(&["outgoing".into()], 3).unwrap());
+        assert_eq!(
+            database.messages("1@s.whatsapp.net", 50).unwrap()[0].receipt,
+            3
+        );
+    }
+
+    #[test]
+    fn self_read_receipts_clear_only_the_phone_read_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        for (id, timestamp) in [("a", 1), ("b", 2), ("c", 2)] {
+            database
+                .insert_message(&message(id, timestamp), "Ada", false, true)
+                .unwrap();
+        }
+
+        assert!(
+            database
+                .apply_self_read_receipt("1@s.whatsapp.net", &["b".into()], 3)
+                .unwrap()
+        );
+        assert_eq!(database.unread_total().unwrap(), 1);
+        assert_eq!(
+            database
+                .first_unread_message_id("1@s.whatsapp.net")
+                .unwrap()
+                .as_deref(),
+            Some("c")
+        );
+
+        assert!(
+            database
+                .apply_self_read_receipt("1@s.whatsapp.net", &["c".into()], 3)
+                .unwrap()
+        );
+        assert_eq!(database.unread_total().unwrap(), 0);
+        assert!(
+            !database
+                .apply_self_read_receipt("1@s.whatsapp.net", &["c".into()], 3)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn delayed_self_read_receipts_cover_messages_inserted_afterward() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        assert!(
+            !database
+                .apply_self_read_receipt("1@s.whatsapp.net", &["boundary".into()], 10)
+                .unwrap()
+        );
+
+        for (id, timestamp) in [("older", 9), ("boundary", 10), ("newer", 11)] {
+            database
+                .insert_message(&message(id, timestamp), "Ada", false, true)
+                .unwrap();
+        }
+        assert_eq!(database.unread_total().unwrap(), 1);
+        assert_eq!(
+            database
+                .first_unread_message_id("1@s.whatsapp.net")
+                .unwrap()
+                .as_deref(),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn muted_unarchived_chats_still_contribute_to_unread_total() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        database
+            .insert_message(&message("muted", 1), "Ada", false, true)
+            .unwrap();
+
+        database.apply_mute("1@s.whatsapp.net", true, -1).unwrap();
+        database.apply_pin("1@s.whatsapp.net", true).unwrap();
+        assert!(database.is_muted("1@s.whatsapp.net", 2).unwrap());
+        assert_eq!(database.unread_total().unwrap(), 1);
+        let chat = &database.list_chats(10).unwrap()[0];
+        assert!(chat.muted);
+        assert!(chat.pinned);
+
+        database.apply_archive("1@s.whatsapp.net", true).unwrap();
+        assert_eq!(database.unread_total().unwrap(), 0);
+        database.apply_archive("1@s.whatsapp.net", false).unwrap();
+        assert_eq!(database.unread_total().unwrap(), 1);
     }
 
     #[test]
@@ -2643,5 +3229,93 @@ mod tests {
         assert!(database.messages(&saved.chat_jid, 10).unwrap().is_empty());
         assert_eq!(database.unread_total().unwrap(), 0);
         assert_eq!(database.contact_name(&saved.sender_jid).unwrap(), None);
+    }
+
+    #[test]
+    fn poll_votes_replace_previous_choices_and_update_public_tallies() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut poll = message("poll-1", 10);
+        poll.text = "[Poll] Lunch?".into();
+        poll.media = Some(MessageMedia::Poll {
+            question: "Lunch?".into(),
+            options: vec![
+                omarchy_whatsapp_protocol::PollOption {
+                    name: "Soup".into(),
+                    votes: 0,
+                    selected_by_me: false,
+                },
+                omarchy_whatsapp_protocol::PollOption {
+                    name: "Salad".into(),
+                    votes: 0,
+                    selected_by_me: false,
+                },
+            ],
+            selectable_count: 2,
+            total_voters: 0,
+            quiz: false,
+            correct_option_index: None,
+            end_timestamp: 0,
+        });
+        database.insert_message(&poll, "Ada", false, false).unwrap();
+        database
+            .store_poll_secret(&poll.chat_jid, &poll.id, "1@s.whatsapp.net", &[7; 32])
+            .unwrap();
+        let stored = database
+            .poll_for_voting(&poll.chat_jid, &poll.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.options, vec!["Soup", "Salad"]);
+        assert_eq!(stored.message_secret, vec![7; 32]);
+
+        database
+            .apply_poll_vote(
+                &poll.chat_jid,
+                &poll.id,
+                "2@s.whatsapp.net",
+                &["Soup".into()],
+                false,
+                100,
+            )
+            .unwrap();
+        database
+            .apply_poll_vote(&poll.chat_jid, &poll.id, "me", &["Salad".into()], true, 101)
+            .unwrap();
+        database
+            .apply_poll_vote(
+                &poll.chat_jid,
+                &poll.id,
+                "2@s.whatsapp.net",
+                &["Salad".into()],
+                false,
+                102,
+            )
+            .unwrap();
+        assert!(
+            !database
+                .apply_poll_vote(
+                    &poll.chat_jid,
+                    &poll.id,
+                    "2@s.whatsapp.net",
+                    &["Soup".into()],
+                    false,
+                    99,
+                )
+                .unwrap()
+        );
+
+        let messages = database.messages(&poll.chat_jid, 10).unwrap();
+        let Some(MessageMedia::Poll {
+            options,
+            total_voters,
+            ..
+        }) = &messages[0].media
+        else {
+            panic!("expected stored poll media");
+        };
+        assert_eq!(*total_voters, 2);
+        assert_eq!(options[0].votes, 0);
+        assert_eq!(options[1].votes, 2);
+        assert!(options[1].selected_by_me);
     }
 }

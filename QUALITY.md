@@ -5,6 +5,8 @@ The repository has one local entry point for its required checks:
 ```bash
 ./scripts/check.sh
 ./scripts/coverage.sh
+./scripts/qml-coverage.sh
+./scripts/qml-mutation.sh
 ./scripts/cargo.sh deny check
 ./scripts/cargo.sh build --release --locked --workspace
 ./tests/smoke.sh
@@ -21,8 +23,10 @@ GitHub repository settings.
 
 Keep the repository's `main` ruleset configured to:
 
-- requires a pull request, resolved conversations, and all six checks named
-  above;
+- requires a pull request, resolved conversations, and the `Quality`,
+  `Coverage`, `Smoke`, `Supply chain`, `Dependency review`, `CodeQL`, four
+  `QML / …` suite checks, `QML / Coverage contract`, and `QML / Mutation`
+  checks;
 - requires the branch to be up to date before merge;
 - blocks force pushes and deletion and requires linear history;
 - requires CodeQL results at the configured security threshold in addition to
@@ -68,7 +72,7 @@ the 100% contract metric and remain visible in the whole-program report:
 | `daemon/assets.rs` | Filesystem/media unit tests, whole-program coverage floor |
 | `daemon/notification.rs` | Message-rendering unit tests, whole-program coverage floor |
 | `ctl/main.rs` | Launcher-generation unit tests and daemon/IPC smoke test |
-| Quickshell QML/JS | `qmlformat`, strict local `qmllint`, portable manifest checks, Omarchy plugin validation locally |
+| Quickshell QML/JS | Qt Quick unit/component/state/workflow tests, 100% portable behavioral-contract coverage, 100% semantic mutation score, `qmlformat`, strict local `qmllint`, and Omarchy plugin validation locally |
 | Installer/service/package | ShellCheck, version and metadata checks, locked release build, packaged plugin discovery test, isolated install/update/uninstall lifecycle test, live install verification |
 
 This boundary is explicit because reporting 100% by silently excluding
@@ -80,6 +84,15 @@ upward. Raise the total baseline whenever new tests improve it.
 Coverage is evidence that lines executed, not proof that every behavior is
 correct. Tests should still cover success, failure, boundary, and regression
 cases rather than executing lines solely to increase the number.
+
+Qt's open-source Quick Test runner does not expose interpreted QML/JavaScript
+line or branch coverage; Qt's QML source-coverage tooling is commercial. The
+portable frontend metric therefore makes a narrower, auditable claim rather
+than reporting fabricated line coverage: every public `Model.js` helper, every
+handled `Service.qml` event, every plugin entry point, and every required UI
+workflow must have a Qt Quick test. `scripts/qml-mutation.sh` complements this
+contract by applying semantic mutants to the actual `Model.js`, `Service.qml`,
+and `Panel.qml` sources and requiring the tests to kill 100% of them.
 
 ## Pull-request expectations
 

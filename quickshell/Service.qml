@@ -37,6 +37,8 @@ Item {
   property var avatarAvailable: ({})
   property var avatarRevisions: ({})
   property int mediaRevision: 0
+  property var mediaOverrides: ({})
+  property var mediaOverrideRevisions: ({})
   property var mediaDownloadRequests: ({})
   property var mediaDownloadRequestIds: ({})
   property var chats: []
@@ -55,6 +57,8 @@ Item {
   property var messagesQueuedRequests: ({})
   property int messageSentSerial: 0
   property int incomingMessageSerial: 0
+  property var pollVoteRequests: ({})
+  property int pollCreateRequestId: 0
   property string selectedChatJid: ""
   property bool panelVisible: false
   property bool panelFocused: false
@@ -164,6 +168,8 @@ Item {
     var output = copyArray(value)
     for (var i = 0; i < output.length; i++) {
       var source = output[i] || {}
+      var receipt = Math.floor(Number(source.receipt || 0))
+      source.receipt = isFinite(receipt) ? Math.max(0, Math.min(4, receipt)) : 0
       var reactions = source.reactions
       var normalized = []
       if (reactions && typeof reactions.length === "number")
@@ -172,6 +178,30 @@ Item {
       output[i] = source
     }
     return output
+  }
+
+  function applyReceipts(frame) {
+    var nextReceipt = Math.floor(Number(frame ? frame.receipt || 0 : 0))
+    if (!isFinite(nextReceipt) || nextReceipt < 1) return false
+    nextReceipt = Math.min(4, nextReceipt)
+    var messageIds = copyArray(frame.message_ids)
+    var wanted = ({})
+    for (var i = 0; i < messageIds.length; i++)
+      wanted[String(messageIds[i] || "")] = true
+    var updated = messages.slice()
+    var changed = false
+    for (var messageIndex = 0; messageIndex < updated.length; messageIndex++) {
+      var message = updated[messageIndex] || {}
+      if (message.from_me === true && wanted[String(message.id || "")] === true
+          && Number(message.receipt || 0) < nextReceipt) {
+        var replacement = Object.assign({}, message)
+        replacement.receipt = nextReceipt
+        updated[messageIndex] = replacement
+        changed = true
+      }
+    }
+    if (changed) messages = updated
+    return changed
   }
 
   function hexKey(value) {
@@ -190,8 +220,9 @@ Item {
       + ".img?v=" + Number(avatarRevisions[key] || 0)
   }
 
-  function fileUrl(path) {
-    return path ? "file://" + String(path) + "?v=" + mediaRevision : ""
+  function fileUrl(path, revision) {
+    var version = revision === undefined ? mediaRevision : revision
+    return path ? "file://" + String(path) + "?v=" + version : ""
   }
 
   function requestAvatar(jid) {
@@ -304,6 +335,38 @@ Item {
     return String(message.chat_jid || "") + "\n" + String(message.id || "")
   }
 
+  function messageMedia(message) {
+    var key = mediaDownloadKey(message)
+    var revision = Number(mediaOverrideRevisions[key] || 0)
+    return revision > 0 ? mediaOverrides[key] : (message ? message.media || null : null)
+  }
+
+  function messageMediaRevision(message) {
+    var key = mediaDownloadKey(message)
+    return String(mediaRevision) + "-"
+      + String(Number(mediaOverrideRevisions[key] || 0))
+  }
+
+  function applyDownloadedMedia(frame) {
+    if (!frame || String(frame.chat_jid || "") !== selectedChatJid) return
+    var messageId = String(frame.message_id || "")
+    var found = false
+    for (var i = 0; i < messages.length; i++) {
+      if (String(messages[i].id || "") === messageId) {
+        found = true
+        break
+      }
+    }
+    if (!found) return
+    var key = String(frame.chat_jid || "") + "\n" + messageId
+    var overrides = Object.assign({}, mediaOverrides)
+    var revisions = Object.assign({}, mediaOverrideRevisions)
+    overrides[key] = frame.media || null
+    revisions[key] = Number(revisions[key] || 0) + 1
+    mediaOverrides = overrides
+    mediaOverrideRevisions = revisions
+  }
+
   function mediaDownloading(message) {
     return mediaDownloadRequests[mediaDownloadKey(message)] === true
   }
@@ -386,6 +449,73 @@ Item {
     return true
   }
 
+  function setChatPinned(jid, pinned) {
+    var value = String(jid || "")
+    if (!value) return false
+    return send("set_chat_pinned", {
+      chat_jid: value,
+      pinned: pinned === true
+    }) > 0
+  }
+
+  function createPoll(question, options, multipleAnswers) {
+    var title = String(question || "").trim()
+    var normalized = []
+    var source = Array.isArray(options) ? options : []
+    for (var i = 0; i < source.length; i++) {
+      var option = String(source[i] || "").trim()
+      if (option && normalized.indexOf(option) < 0) normalized.push(option)
+    }
+    if (!selectedChatJid || !title || normalized.length < 2
+        || normalized.length > 12 || pollCreateRequestId > 0) return false
+    pollCreateRequestId = send("create_poll", {
+      chat_jid: selectedChatJid,
+      question: title,
+      options: normalized,
+      selectable_count: multipleAnswers === true ? normalized.length : 1
+    })
+    return pollCreateRequestId > 0
+  }
+
+  function pollVoteKey(message) {
+    return message ? String(message.chat_jid || selectedChatJid) + "\n"
+      + String(message.id || "") : ""
+  }
+
+  function pollVotePending(message) {
+    return pollVoteRequests[pollVoteKey(message)] !== undefined
+  }
+
+  function votePoll(message, selectedOptions) {
+    if (!message || !message.id || !selectedChatJid || pollVotePending(message))
+      return false
+    var requestId = send("vote_poll", {
+      chat_jid: selectedChatJid,
+      message_id: String(message.id),
+      selected_options: copyArray(selectedOptions)
+    })
+    if (!requestId) return false
+    var requests = Object.assign({}, pollVoteRequests)
+    requests[pollVoteKey(message)] = requestId
+    pollVoteRequests = requests
+    return true
+  }
+
+  function finishPollRequest(frame) {
+    if (!frame || frame.id === undefined || frame.id === null) return
+    var requestId = Number(frame.id)
+    if (requestId === pollCreateRequestId) pollCreateRequestId = 0
+    var requests = Object.assign({}, pollVoteRequests)
+    var changed = false
+    for (var key in requests) {
+      if (Number(requests[key]) === requestId) {
+        delete requests[key]
+        changed = true
+      }
+    }
+    if (changed) pollVoteRequests = requests
+  }
+
   function unlinkDevice() {
     if (connectionState !== "connected") return false
     return send("logout") > 0
@@ -447,6 +577,7 @@ Item {
     var requestedMessagesJid = frameId
       ? String(messagesRequestJids[frameId] || "") : ""
     var requestedGroupParticipantsJid = finishGroupParticipantsRequest(frame)
+    finishPollRequest(frame)
     finishMediaDownloadRequest(frame)
     var queuedMessagesJid = finishMessagesRequest(frame)
     lastError = ""
@@ -468,6 +599,10 @@ Item {
         groupParticipantsChatJid = String(frame.chat_jid || "")
         groupParticipantsError = ""
       }
+    } else if (frame.event === "media_downloaded") {
+      applyDownloadedMedia(frame)
+    } else if (frame.event === "receipts") {
+      applyReceipts(frame)
     } else if (frame.event === "messages") {
       if (String(frame.chat_jid || "") === selectedChatJid) {
         messagesWillChange(requestedMessagesJid === ""
@@ -476,6 +611,8 @@ Item {
         messagesChatJid = String(frame.chat_jid || "")
         messagesFirstUnreadId = String(frame.first_unread_message_id || "")
         mediaRevision++
+        mediaOverrides = ({})
+        mediaOverrideRevisions = ({})
         messages = normalizeMessages(frame.messages)
         messagesResponseSerial++
         var requested = {}
@@ -542,6 +679,8 @@ Item {
           root.messagesRequestIds = ({})
           root.messagesRequestJids = ({})
           root.messagesQueuedRequests = ({})
+          root.pollVoteRequests = ({})
+          root.pollCreateRequestId = 0
           root.reconnectAttempt = 0
           root.lastError = ""
           root.refresh()
