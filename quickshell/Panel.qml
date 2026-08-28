@@ -440,6 +440,15 @@ Item {
     scrollToBottomAnimation.start()
   }
 
+  function conversationViewportNearBottom() {
+    if (!messageList || !conversationReady || !messageList.count) return true
+    var heightRatio = Number(messageList.visibleArea.heightRatio || 0)
+    var gapRatio = 1 - Number(messageList.visibleArea.yPosition || 0)
+      - heightRatio
+    if (heightRatio <= 0 || gapRatio <= 0) return true
+    return gapRatio * messageList.height / heightRatio <= Style.space(48)
+  }
+
   function positionConversationScroll(mode, messageId, serial) {
     if (serial !== conversationScrollSerial
         || !messageList) return
@@ -554,8 +563,12 @@ Item {
       root.preservedConversationContentY = messageList.contentY
       root.restoreConversationAfterMessages = true
     }
-    function onMessageEventSerialChanged() {
+    function onMessageSentSerialChanged() {
       root.scrollToBottomAfterMessages = true
+    }
+    function onIncomingMessageSerialChanged() {
+      if (root.conversationViewportNearBottom())
+        root.scrollToBottomAfterMessages = true
     }
     function onMessagesResponseSerialChanged() {
       if (!root.service
