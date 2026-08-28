@@ -70,7 +70,7 @@ BarWidget {
           layer.smooth: true
           layer.effect: MultiEffect {
             colorization: 1
-            colorizationColor: Color.accent
+            colorizationColor: root.unread > 0 ? Color.accent : button.foreground
           }
         }
       }
