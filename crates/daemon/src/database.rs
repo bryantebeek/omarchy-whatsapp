@@ -3,7 +3,7 @@ use omarchy_whatsapp_protocol::{Chat, Message, MessageMedia, Reaction};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const CHAT_NAME_UNKNOWN: i64 = 0;
@@ -14,6 +14,7 @@ const CHAT_NAME_ADDRESS_BOOK: i64 = 40;
 
 pub struct Database {
     connection: Mutex<Connection>,
+    protocol_db: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +216,7 @@ impl Database {
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
+            protocol_db: path.with_file_name("session.db"),
         })
     }
 
@@ -859,6 +861,9 @@ impl Database {
     }
 
     pub fn reconcile_unread_after_full_sync(&self) -> Result<u64> {
+        if !self.regular_app_state_is_complete()? {
+            return Ok(0);
+        }
         let connection = self
             .connection
             .lock()
@@ -880,6 +885,35 @@ impl Database {
         )?;
         transaction.commit()?;
         Ok(changed as u64)
+    }
+
+    pub fn regular_app_state_is_complete(&self) -> Result<bool> {
+        if !self.protocol_db.exists() {
+            return Ok(false);
+        }
+        let connection = Connection::open(&self.protocol_db).with_context(|| {
+            format!("opening session database at {}", self.protocol_db.display())
+        })?;
+        let has_versions = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'app_state_versions'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        );
+        let has_versions = has_versions?;
+        if !has_versions {
+            return Ok(false);
+        }
+        connection
+            .query_row(
+                "SELECT COUNT(DISTINCT name) = 3 FROM app_state_versions
+                 WHERE name IN ('regular', 'regular_low', 'regular_high')",
+                [],
+                |row| row.get(0),
+            )
+            .context("checking WhatsApp app-state progress")
     }
 
     pub fn apply_pin(&self, chat_jid: &str, pinned: bool) -> Result<()> {
@@ -2300,6 +2334,17 @@ mod tests {
                 .unwrap();
         }
         database.apply_read_state("explicit@g.us", false).unwrap();
+        assert_eq!(database.reconcile_unread_after_full_sync().unwrap(), 0);
+        assert_eq!(database.unread_total().unwrap(), 61);
+
+        let protocol = Connection::open(directory.path().join("session.db")).unwrap();
+        protocol
+            .execute_batch(
+                "CREATE TABLE app_state_versions (name TEXT NOT NULL);
+                 INSERT INTO app_state_versions (name) VALUES
+                    ('regular'), ('regular_low'), ('regular_high');",
+            )
+            .unwrap();
         assert_eq!(database.reconcile_unread_after_full_sync().unwrap(), 1);
         let chats = database.list_chats(10).unwrap();
         let counts = chats

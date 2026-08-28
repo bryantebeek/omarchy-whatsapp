@@ -3,15 +3,26 @@ use std::process::{Command, Stdio};
 
 pub fn send(message: &Message, chat_name: &str, is_group: bool) {
     let body = message_body(message, is_group);
+    let title = positional_text(chat_name);
+    launch(message_command(
+        available_helper(),
+        &title,
+        &body,
+        &message.chat_jid,
+    ));
+}
 
-    let omarchy_helper = [
+fn available_helper() -> Option<&'static str> {
+    [
         "/usr/bin/omarchy-notification-send",
         "/usr/share/omarchy/bin/omarchy-notification-send",
     ]
     .into_iter()
-    .find(|path| std::path::Path::new(path).is_file());
+    .find(|path| std::path::Path::new(path).is_file())
+}
 
-    let mut command = if let Some(helper) = omarchy_helper {
+fn message_command(helper: Option<&str>, title: &str, body: &str, chat_jid: &str) -> Command {
+    if let Some(helper) = helper {
         let mut command = Command::new(helper);
         command.args([
             "--app-name",
@@ -20,32 +31,37 @@ pub fn send(message: &Message, chat_name: &str, is_group: bool) {
             "󰖣",
             "--urgency",
             "normal",
-            chat_name,
-            &body,
+            title,
+            body,
             "--exec",
             "omarchy",
             "shell",
             "-q",
             "io.github.bryantebeek.whatsapp",
             "openChat",
-            &message.chat_jid,
+            chat_jid,
         ]);
         command
     } else {
         let mut command = Command::new("notify-send");
-        command.args(["--app-name=WhatsApp", chat_name, &body]);
+        command.args(["--app-name=WhatsApp", title, body]);
         command
-    };
+    }
+}
 
+fn launch(mut command: Command) {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(not(test))]
     std::thread::spawn(move || {
         if let Err(error) = command.status() {
             tracing::warn!(%error, "could not launch notification helper");
         }
     });
+    #[cfg(test)]
+    drop(command);
 }
 
 fn message_body(message: &Message, is_group: bool) -> String {
@@ -55,24 +71,28 @@ fn message_body(message: &Message, is_group: bool) -> String {
     }
     if is_group {
         body = format!("{}: {}", message.sender_name, body);
-    } else if body.starts_with('-') {
-        // Keep a direct message such as "--exec" in the helper's positional
-        // body slot without adding visible text to the notification.
-        body.insert(0, '\u{2060}');
     }
-    body
+    positional_text(&body)
+}
+
+fn positional_text(value: &str) -> String {
+    let mut value = value.replace(['\r', '\n'], " ");
+    if value.starts_with('-') {
+        // Keep remote text in the helper's positional slots without adding
+        // visible content or allowing it to be parsed as an option.
+        value.insert(0, '\u{2060}');
+    }
+    value
 }
 
 pub fn send_event(title: &str, body: &str, urgency: &str) {
-    let body = body.replace(['\r', '\n'], " ");
-    let omarchy_helper = [
-        "/usr/bin/omarchy-notification-send",
-        "/usr/share/omarchy/bin/omarchy-notification-send",
-    ]
-    .into_iter()
-    .find(|path| std::path::Path::new(path).is_file());
+    let title = positional_text(title);
+    let body = positional_text(body);
+    launch(event_command(available_helper(), &title, &body, urgency));
+}
 
-    let mut command = if let Some(helper) = omarchy_helper {
+fn event_command(helper: Option<&str>, title: &str, body: &str, urgency: &str) -> Command {
+    if let Some(helper) = helper {
         let mut command = Command::new(helper);
         command.args([
             "--app-name",
@@ -82,23 +102,14 @@ pub fn send_event(title: &str, body: &str, urgency: &str) {
             "--urgency",
             urgency,
             title,
-            &body,
+            body,
         ]);
         command
     } else {
         let mut command = Command::new("notify-send");
-        command.args(["--app-name=WhatsApp", title, &body]);
+        command.args(["--app-name=WhatsApp", title, body]);
         command
-    };
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    std::thread::spawn(move || {
-        if let Err(error) = command.status() {
-            tracing::warn!(%error, "could not launch notification helper");
-        }
-    });
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +149,27 @@ mod tests {
         let message = message("joyce@s.whatsapp.net", "joyce@s.whatsapp.net", "--exec");
 
         assert_eq!(message_body(&message, false), "\u{2060}--exec");
+    }
+
+    #[test]
+    fn dash_leading_chat_names_and_event_text_stay_positional() {
+        assert_eq!(
+            positional_text("--urgency=critical"),
+            "\u{2060}--urgency=critical"
+        );
+        assert_eq!(positional_text("Release\nstatus"), "Release status");
+
+        let message = message("joyce@s.whatsapp.net", "joyce@s.whatsapp.net", "--exec");
+        send(&message, "--urgency=critical", false);
+        send_event("--glyph", "--exec", "normal");
+
+        for command in [
+            message_command(Some("helper"), "title", "body", "chat"),
+            message_command(None, "title", "body", "chat"),
+            event_command(Some("helper"), "title", "body", "normal"),
+            event_command(None, "title", "body", "normal"),
+        ] {
+            assert!(!command.get_args().collect::<Vec<_>>().is_empty());
+        }
     }
 }

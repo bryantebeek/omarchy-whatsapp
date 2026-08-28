@@ -25,7 +25,7 @@ use std::sync::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{error, info, warn};
 use whatsapp_rust::prelude::*;
@@ -196,8 +196,14 @@ impl Shared {
         if self.event_sync_marker.exists() {
             return;
         }
-        if let Err(error) = write_private_marker(&self.event_sync_marker) {
-            warn!(%error, "could not mark app-state event sync complete");
+        match self.database.regular_app_state_is_complete() {
+            Ok(true) => {
+                if let Err(error) = write_private_marker(&self.event_sync_marker) {
+                    warn!(%error, "could not mark app-state event sync complete");
+                }
+            }
+            Ok(false) => warn!("WhatsApp app-state sync is incomplete; leaving resync armed"),
+            Err(error) => warn!(%error, "could not inspect WhatsApp app-state progress"),
         }
     }
 
@@ -2298,6 +2304,14 @@ async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()>
     // without a delimiter. Normal commands are only a few kilobytes.
     let mut lines = FramedRead::new(read, LinesCodec::new_with_max_length(128 * 1024));
     let mut events = shared.events.subscribe();
+    let (commands, command_queue) = mpsc::channel::<(Option<u64>, Command)>(32);
+    let (responses, mut response_queue) = mpsc::channel::<ServerFrame>(32);
+    let command_shared = Arc::clone(&shared);
+    tokio::spawn(process_command_queue(
+        command_queue,
+        responses,
+        command_shared,
+    ));
     write_frame(
         &mut write,
         &ServerFrame::event(ServerEvent::Hello {
@@ -2322,18 +2336,39 @@ async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()>
                     }
                 };
                 let id = frame.id;
-                let event = handle_command(frame.command, &shared).await
-                    .unwrap_or_else(|error| ServerEvent::Error { message: error.to_string() });
-                write_frame(&mut write, &ServerFrame::response(id, event)).await?;
-            }
+                if commands.try_send((id, frame.command)).is_err() {
+                    write_frame(&mut write, &ServerFrame::response(id, ServerEvent::Error {
+                        message: "too many queued requests".to_owned(),
+                    })).await?;
+                }
+            },
             event = events.recv() => match event {
                 Ok(event) => write_frame(&mut write, &event).await?,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     write_frame(&mut write, &ServerFrame::event(shared.state_event().await)).await?;
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
-            }
+            },
+            response = response_queue.recv() => {
+                let Some(response) = response else { return Ok(()); };
+                write_frame(&mut write, &response).await?;
+            },
         }
+    }
+}
+
+async fn process_command_queue(
+    mut commands: mpsc::Receiver<(Option<u64>, Command)>,
+    responses: mpsc::Sender<ServerFrame>,
+    shared: Arc<Shared>,
+) {
+    while let Some((id, command)) = commands.recv().await {
+        let event = handle_command(command, &shared)
+            .await
+            .unwrap_or_else(|error| ServerEvent::Error {
+                message: error.to_string(),
+            });
+        let _ = responses.send(ServerFrame::response(id, event)).await;
     }
 }
 
@@ -2868,6 +2903,7 @@ mod tests {
     use buffa::MessageField;
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
+    use tokio::io::AsyncReadExt;
 
     fn test_shared(directory: &tempfile::TempDir) -> Shared {
         let (events, _) = broadcast::channel(8);
@@ -2916,6 +2952,192 @@ mod tests {
 
         shared.write_pairing_qr(&ConnectionStatus::Connected);
         assert!(!shared.pairing_qr.exists());
+    }
+
+    #[test]
+    fn event_sync_marker_requires_every_regular_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut shared = test_shared(&directory);
+
+        shared.mark_event_sync_complete();
+        assert!(!shared.event_sync_marker.exists());
+
+        let protocol_db = directory.path().join("session.db");
+        std::fs::create_dir(&protocol_db).unwrap();
+        shared.mark_event_sync_complete();
+        assert!(!shared.event_sync_marker.exists());
+        std::fs::remove_dir(&protocol_db).unwrap();
+
+        let connection = rusqlite::Connection::open(&protocol_db).unwrap();
+        shared.mark_event_sync_complete();
+        assert!(!shared.event_sync_marker.exists());
+        connection
+            .execute_batch(
+                "CREATE TABLE app_state_versions (
+                    name TEXT NOT NULL,
+                    state_data BLOB NOT NULL,
+                    device_id INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (name, device_id)
+                 );",
+            )
+            .unwrap();
+        for name in ["regular", "regular_low"] {
+            connection
+                .execute(
+                    "INSERT INTO app_state_versions (name, state_data) VALUES (?1, X'00')",
+                    [name],
+                )
+                .unwrap();
+        }
+        shared.mark_event_sync_complete();
+        assert!(!shared.event_sync_marker.exists());
+
+        connection
+            .execute(
+                "INSERT INTO app_state_versions (name, state_data) VALUES ('regular_high', X'00')",
+                [],
+            )
+            .unwrap();
+        let blocked_parent = directory.path().join("blocked");
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+        shared.event_sync_marker = blocked_parent.join("marker");
+        shared.mark_event_sync_complete();
+        assert!(!shared.event_sync_marker.exists());
+        std::fs::remove_file(&blocked_parent).unwrap();
+        shared.event_sync_marker = directory.path().join("event-state-v3");
+        shared.mark_event_sync_complete();
+        assert!(shared.event_sync_marker.exists());
+    }
+
+    #[tokio::test]
+    async fn command_worker_reports_errors_and_closes_with_its_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        let (commands, command_queue) = mpsc::channel(1);
+        let (responses, mut response_queue) = mpsc::channel(1);
+        commands
+            .send((
+                Some(4),
+                Command::SendMessage {
+                    chat_jid: "chat@s.whatsapp.net".into(),
+                    text: "  ".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        drop(commands);
+
+        process_command_queue(command_queue, responses, shared).await;
+
+        let response = response_queue.recv().await.unwrap();
+        assert_eq!(response.id, Some(4));
+        assert_eq!(
+            response.event,
+            ServerEvent::Error {
+                message: "message cannot be empty".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn ipc_broadcasts_continue_while_a_command_is_waiting() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        let client_guard = shared.client.write().await;
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        let server_shared = Arc::clone(&shared);
+        let server =
+            tokio::spawn(async move { serve_connection(server_stream, server_shared).await });
+
+        let mut buffer = Vec::new();
+        for _ in 0..2 {
+            buffer.clear();
+            read_test_frame(&mut client_stream, &mut buffer).await;
+        }
+
+        let request =
+            serde_json::to_vec(&ClientFrame::new(Some(7), Command::ListChats { limit: 10 }))
+                .unwrap();
+        client_stream.write_all(&request).await.unwrap();
+        client_stream.write_all(b"\n").await.unwrap();
+        tokio::task::yield_now().await;
+        shared
+            .events
+            .send(ServerFrame::event(ServerEvent::Unread { total: 9 }))
+            .unwrap();
+
+        buffer.clear();
+        let broadcast = read_test_frame(&mut client_stream, &mut buffer).await;
+        assert_eq!(broadcast.event, ServerEvent::Unread { total: 9 });
+
+        drop(client_guard);
+        buffer.clear();
+        let response = read_test_frame(&mut client_stream, &mut buffer).await;
+        assert_eq!(response.id, Some(7));
+        assert!(matches!(response.event, ServerEvent::Chats { .. }));
+
+        drop(client_stream);
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ipc_command_queue_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        let client_guard = shared.client.write().await;
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        let server_shared = Arc::clone(&shared);
+        let server =
+            tokio::spawn(async move { serve_connection(server_stream, server_shared).await });
+
+        let mut buffer = Vec::new();
+        for _ in 0..2 {
+            buffer.clear();
+            read_test_frame(&mut client_stream, &mut buffer).await;
+        }
+
+        for id in 0..35 {
+            let request = serde_json::to_vec(&ClientFrame::new(
+                Some(id),
+                Command::ListChats { limit: 10 },
+            ))
+            .unwrap();
+            client_stream.write_all(&request).await.unwrap();
+            client_stream.write_all(b"\n").await.unwrap();
+        }
+
+        buffer.clear();
+        let response = read_test_frame(&mut client_stream, &mut buffer).await;
+        assert_eq!(
+            response.event,
+            ServerEvent::Error {
+                message: "too many queued requests".into(),
+            }
+        );
+
+        drop(client_guard);
+        for _ in 1..35 {
+            buffer.clear();
+            read_test_frame(&mut client_stream, &mut buffer).await;
+        }
+        drop(client_stream);
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    async fn read_test_frame(stream: &mut UnixStream, buffer: &mut Vec<u8>) -> ServerFrame {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).await.unwrap();
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buffer.push(byte[0]);
+            }
+        })
+        .await
+        .unwrap();
+        serde_json::from_slice(buffer).unwrap()
     }
 
     #[tokio::test]
