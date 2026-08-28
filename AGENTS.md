@@ -11,11 +11,12 @@ user can immediately see or exercise it.
 
 For changes under `quickshell/`:
 
-1. Run `/usr/lib/qt6/bin/qmlformat -n quickshell/*.qml` and
-   `omarchy plugin validate quickshell`.
-2. Copy the changed QML, JavaScript, and manifest files into
-   `~/.config/omarchy/plugins/io.github.bryantebeek.whatsapp/`, preserving
-   file modes. The repository's `install.sh` shows the canonical file mapping.
+1. Run `/usr/lib/qt6/bin/qmlformat -n quickshell/*.qml`,
+   `./scripts/qml-lint.sh`, and `omarchy plugin validate .`.
+2. Copy the changed QML and JavaScript files into the installed plugin's
+   `quickshell/` directory, preserving file modes. If `manifest.json` changed,
+   copy it to the installed plugin root. The repository's `install.sh` shows
+   the canonical file mapping.
 3. Validate the installed plugin directory.
 4. Run `./scripts/reload-quickshell.sh`. Do not replace it with a raw
    `rescanPlugins` followed by `omarchy restart shell`: plugin reload is

@@ -3,15 +3,15 @@
   "id": "io.github.bryantebeek.whatsapp",
   "name": "WhatsApp",
   "version": "0.3.0",
-  "author": "Omarchy WhatsApp contributors",
+  "author": "bryantebeek",
   "license": "MIT",
   "description": "A low-footprint WhatsApp client built into Omarchy shell.",
   "kinds": ["service", "bar-widget", "panel"],
   "activation": "on-demand",
   "entryPoints": {
-    "service": "Service.qml",
-    "barWidget": "BarWidget.qml",
-    "panel": "Panel.qml"
+    "service": "quickshell/Service.qml",
+    "barWidget": "quickshell/BarWidget.qml",
+    "panel": "quickshell/Panel.qml"
   },
   "barWidget": {
     "displayName": "WhatsApp",

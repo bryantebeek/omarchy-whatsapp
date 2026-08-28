@@ -1,6 +1,6 @@
 //! Exhaustive policy for every event exposed by the pinned whatsapp-rust release.
 //!
-//! The ordered test is intentional: EventKind discriminants are contiguous and
+//! The ordered test is intentional: `EventKind` discriminants are contiguous and
 //! append-only upstream. A newly added kind changes the terminal discriminant and
 //! fails this module's test until we consciously classify it.
 
@@ -296,5 +296,11 @@ mod tests {
             );
             assert!(!reason.is_empty());
         }
+
+        let (app, library, excluded) = counts();
+        assert_eq!(app + library + excluded, EVENT_COVERAGE.len());
+        assert!(app > 0);
+        assert!(library > 0);
+        assert!(excluded > 0);
     }
 }

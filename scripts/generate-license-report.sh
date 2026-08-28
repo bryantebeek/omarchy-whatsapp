@@ -30,10 +30,12 @@ included_packages=$(jq -Rs '
   [split("\n")[] | select(length > 0) | split("\t")
     | {name: .[0], version: .[1]}]
 ' < "$package_list_tmp")
+project_version=$("${cargo_command[@]}" metadata --locked --no-deps --format-version 1 \
+  | jq -er '.packages[] | select(.name == "omarchy-whatsapp-protocol") | .version')
 
 "${cargo_command[@]}" metadata --locked --format-version 1 \
   --filter-platform x86_64-unknown-linux-gnu \
-  | jq --argjson included "$included_packages" '
+  | jq --argjson included "$included_packages" --arg project_version "$project_version" '
   .workspace_members as $workspace
   | {
       schema: 1,
@@ -42,7 +44,7 @@ included_packages=$(jq -Rs '
         {
           kind: "project",
           name: "Omarchy WhatsApp",
-          version: "0.3.0",
+          version: $project_version,
           license: "MIT",
           homepage: "https://github.com/bryantebeek/omarchy-whatsapp"
         },

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -220,7 +221,7 @@ pub fn backfill_message_video_thumbnails(directory: &Path) -> Result<usize> {
             Ok(true) => generated += 1,
             Ok(false) => {}
             Err(error) => {
-                warn!(%error, video = %path.display(), "could not generate video preview")
+                warn!(%error, video = %path.display(), "could not generate video preview");
             }
         }
     }
@@ -244,10 +245,10 @@ fn cache_media_thumbnail(
             || declared_full_length.is_some_and(|length| length > 0 && metadata.len() != length)
     });
     if existing_is_preview {
-        if !thumbnail_path.exists() {
-            std::fs::rename(path, thumbnail_path)?;
-        } else {
+        if thumbnail_path.exists() {
             std::fs::remove_file(path)?;
+        } else {
+            std::fs::rename(path, thumbnail_path)?;
         }
     } else if !thumbnail_path.exists()
         && let Some(thumbnail) = thumbnail
@@ -576,7 +577,6 @@ pub async fn download_message_image(
                 let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded image has invalid size {length}");
             }
-            use std::io::{Read, Seek, SeekFrom};
             file.seek(SeekFrom::Start(0))?;
             let mut header = [0u8; 16];
             let count = file.read(&mut header)?;
@@ -626,7 +626,6 @@ pub async fn download_message_video(
                 let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded video has invalid size {length}");
             }
-            use std::io::{Read, Seek, SeekFrom};
             file.seek(SeekFrom::Start(0))?;
             let mut header = [0u8; 16];
             let count = file.read(&mut header)?;

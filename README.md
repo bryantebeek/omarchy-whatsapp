@@ -5,6 +5,8 @@ interface is a Quickshell service, bar widget, and on-demand app panel; a small
 Rust daemon owns the connection, local history, and native notifications. There
 is no Chromium, Electron, WebKit, or GTK UI process.
 
+![Omarchy WhatsApp preview](preview.png)
+
 This project is unofficial and is not affiliated with or endorsed by WhatsApp
 or Meta. It uses the reverse-engineered WhatsApp Web linked-device protocol via
 [`whatsapp-rust`](https://github.com/oxidezap/whatsapp-rust). Protocol changes or
@@ -24,17 +26,33 @@ mind.
   uninstaller, and Arch `PKGBUILD`.
 
 The app renders contact, group, and group-participant avatars; encrypted image
-messages; static/live-location cards; and synchronized emoji reactions. Reaction
-chips aggregate matching emoji and support adding, changing, and removing your
-reaction. Location cards open in the system browser using OpenStreetMap, avoiding
-an embedded browser engine. Video, audio, documents, stickers, full calling,
-search, and group administration remain lightweight placeholders or out of scope.
+and video messages; documents; static/live-location cards; and synchronized
+emoji reactions. Reaction chips aggregate matching emoji and support adding,
+changing, and removing your reaction. Location cards open in the system browser
+using OpenStreetMap, avoiding an embedded browser engine. Audio, stickers, full
+calling, search, and group administration remain lightweight placeholders or
+out of scope.
 
 ## Install on Omarchy
 
 Requirements are Omarchy 4, Quickshell, SQLite, systemd, and a Rust toolchain.
 The repository pins the nightly used by `whatsapp-rust`; if `mise` is installed,
 the installer selects it automatically.
+
+Install the disabled plugin checkout through Omarchy, then run its reviewed
+installer to build the external Rust daemon, install its user service, and
+enable the plugin:
+
+```bash
+omarchy plugin add https://github.com/bryantebeek/omarchy-whatsapp.git
+~/.config/omarchy/plugins/io.github.bryantebeek.whatsapp/install.sh
+```
+
+Omarchy intentionally never executes plugin install hooks. Running the second
+command is therefore required; `omarchy plugin add ... --enable` by itself only
+installs the shell interface and cannot install the daemon or systemd unit.
+
+For a development checkout elsewhere on disk, run the same installer there:
 
 ```bash
 ./install.sh
@@ -85,6 +103,10 @@ Uninstall application files while preserving the paired session:
 ./uninstall.sh
 ```
 
+Run that script from the installed plugin checkout before using
+`omarchy plugin remove`: it also stops and removes the external daemon, service,
+launcher, and icon that Omarchy's plugin manager does not own.
+
 To also remove the local linked-device keys and history, use
 `./uninstall.sh --purge-data`. That permanently signs this installation out and
 cannot be undone.
@@ -126,18 +148,25 @@ state as built-in panels and widgets. The Rust daemon remains appearance-free.
 ## Development
 
 ```bash
-mise exec rust@nightly-2026-06-16 -- cargo fmt --all -- --check
-mise exec rust@nightly-2026-06-16 -- cargo clippy --workspace --all-targets -- -D warnings
-mise exec rust@nightly-2026-06-16 -- cargo test --workspace
-mise exec rust@nightly-2026-06-16 -- cargo build --release --workspace
-/usr/lib/qt6/bin/qmlformat -n quickshell/*.qml
-omarchy plugin validate quickshell
-./scripts/generate-license-report.sh --check
+./scripts/check.sh
+./scripts/coverage.sh
+./scripts/cargo.sh deny check
+./scripts/cargo.sh build --release --locked --workspace
 ./tests/smoke.sh
 ```
 
 `tests/smoke.sh` uses an isolated temporary state directory and socket. It does
 not touch the installed service or paired account.
+
+The local checks are mirrored by required GitHub Actions jobs for formatting,
+strict Clippy linting, unit tests, coverage, release smoke testing, dependency
+policy, dependency review, and CodeQL. See [QUALITY.md](QUALITY.md) for the exact
+coverage contract and merge-policy setup.
+
+`scripts/check.sh` validates the root marketplace manifest and entry points.
+On Omarchy it also runs strict `qmllint` against the installed shell modules;
+hosted CI, where those private modules are unavailable, still performs QML
+syntax and formatting checks.
 
 The IPC protocol is newline-delimited JSON. Every request may carry an `id`; a
 matching response carries the same value, while broadcasts omit it. For example:

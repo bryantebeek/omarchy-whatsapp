@@ -18,6 +18,7 @@ StateDirectoryMode=0700
 # inherited from the user manager. Everything else is read-only or unavailable.
 NoNewPrivileges=true
 CapabilityBoundingSet=
+KeyringMode=private
 PrivateDevices=true
 PrivateTmp=true
 ProtectClock=true
@@ -37,7 +38,7 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-SystemCallFilter=~@module @mount @obsolete @privileged @raw-io @reboot @swap
+SystemCallFilter=~@cpu-emulation @debug @module @mount @obsolete @privileged @raw-io @reboot @swap
 SystemCallArchitectures=native
 TasksMax=128
 MemoryHigh=256M

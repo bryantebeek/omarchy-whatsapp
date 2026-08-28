@@ -31,9 +31,10 @@ package() {
   cd "$pkgname"
   install -Dm755 target/release/omarchy-whatsappd "$pkgdir/usr/bin/omarchy-whatsappd"
   install -Dm755 target/release/omarchy-whatsappctl "$pkgdir/usr/bin/omarchy-whatsappctl"
+  local packaged_service="$srcdir/omarchy-whatsapp-package.service"
   sed 's|%h/.local/bin/omarchy-whatsappd|/usr/bin/omarchy-whatsappd|' \
-    packaging/systemd/omarchy-whatsapp.service > omarchy-whatsapp.service
-  install -Dm644 omarchy-whatsapp.service \
+    packaging/systemd/omarchy-whatsapp.service > "$packaged_service"
+  install -Dm644 "$packaged_service" \
     "$pkgdir/usr/lib/systemd/user/omarchy-whatsapp.service"
   install -Dm644 packaging/applications/com.omarchy.WhatsApp.desktop \
     "$pkgdir/usr/share/applications/com.omarchy.WhatsApp.desktop"
@@ -42,8 +43,8 @@ package() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 ARCHITECTURE.md "$pkgdir/usr/share/doc/$pkgname/ARCHITECTURE.md"
-  install -Dm644 quickshell/manifest.json \
-    "$pkgdir/usr/share/omarchy-whatsapp/quickshell/manifest.json"
+  install -Dm644 manifest.json \
+    "$pkgdir/usr/share/omarchy-whatsapp/manifest.json"
   install -Dm644 quickshell/BarWidget.qml \
     "$pkgdir/usr/share/omarchy-whatsapp/quickshell/BarWidget.qml"
   install -Dm644 quickshell/Service.qml \

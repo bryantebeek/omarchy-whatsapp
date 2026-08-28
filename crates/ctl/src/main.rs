@@ -51,7 +51,7 @@ enum Action {
         #[arg(long, hide = true)]
         menu_path: Option<PathBuf>,
     },
-    /// Remove generated WhatsApp conversations from Omarchy's menu.
+    /// Remove generated `WhatsApp` conversations from Omarchy's menu.
     LauncherRemove {
         #[arg(long, hide = true)]
         menu_path: Option<PathBuf>,
@@ -245,7 +245,7 @@ fn render_menu_block(chats: &[Chat]) -> String {
     push_menu_entry(
         &mut block,
         "whatsapp",
-        json!({
+        &json!({
             "icon": WHATSAPP_MENU_ICON,
             "label": "WhatsApp",
             "description": "Search conversations",
@@ -254,7 +254,7 @@ fn render_menu_block(chats: &[Chat]) -> String {
     push_menu_entry(
         &mut block,
         "wa-open",
-        json!({
+        &json!({
             "parent": "whatsapp",
             "icon": WHATSAPP_MENU_ICON,
             "label": "Open WhatsApp",
@@ -276,7 +276,7 @@ fn render_menu_block(chats: &[Chat]) -> String {
         push_menu_entry(
             &mut block,
             &id,
-            json!({
+            &json!({
                 "parent": "whatsapp",
                 "icon": WHATSAPP_MENU_ICON,
                 "label": label,
@@ -290,12 +290,12 @@ fn render_menu_block(chats: &[Chat]) -> String {
     block
 }
 
-fn push_menu_entry(block: &mut String, id: &str, value: serde_json::Value) {
+fn push_menu_entry(block: &mut String, id: &str, value: &serde_json::Value) {
     writeln!(
         block,
         "  {}: {},",
         serde_json::to_string(id).expect("serializing a string cannot fail"),
-        serde_json::to_string(&value).expect("serializing a JSON value cannot fail")
+        serde_json::to_string(value).expect("serializing a JSON value cannot fail")
     )
     .expect("writing to a string cannot fail");
 }
@@ -320,9 +320,10 @@ fn write_if_changed(path: &Path, existing: &str, updated: &str) -> Result<bool> 
         .parent()
         .context("Omarchy menu extension path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let permissions = fs::metadata(path)
-        .map(|metadata| metadata.permissions())
-        .unwrap_or_else(|_| Permissions::from_mode(0o644));
+    let permissions = fs::metadata(path).map_or_else(
+        |_| Permissions::from_mode(0o644),
+        |metadata| metadata.permissions(),
+    );
 
     let mut temporary = None;
     for attempt in 0..100_u32 {
@@ -379,6 +380,7 @@ mod tests {
             name: name.to_owned(),
             phone_number: None,
             last_message: "private message text must not be indexed".to_owned(),
+            last_sender_name: "Ada".to_owned(),
             last_timestamp: 123,
             unread: 4,
             is_group,

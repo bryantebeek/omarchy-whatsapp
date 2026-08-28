@@ -59,9 +59,70 @@ struct Shared {
     media_dir: PathBuf,
     avatar_revision: AtomicU64,
     app_state_failed: AtomicBool,
+    logout_requested: AtomicBool,
     group_name_sync: Mutex<()>,
     media_recovery_requested: RwLock<HashSet<String>>,
     media_downloads: Mutex<HashSet<String>>,
+}
+
+fn remove_sqlite_store(path: &Path) -> Result<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut artifact = path.as_os_str().to_os_string();
+        artifact.push(suffix);
+        let artifact = PathBuf::from(artifact);
+        match std::fs::remove_file(&artifact) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", artifact.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reset_private_directory(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("removing {}", path.display()));
+        }
+    }
+    assets::private_dir(path)
+}
+
+async fn clear_local_account_data(paths: &AppPaths, shared: &Shared) -> Result<()> {
+    shared.database.clear_account_data()?;
+    reset_private_directory(&shared.avatar_dir)?;
+    reset_private_directory(&shared.media_dir)?;
+    remove_sqlite_store(&paths.protocol_db)?;
+    for marker in [
+        &shared.contact_sync_marker,
+        &shared.contact_history_marker,
+        &shared.event_sync_marker,
+    ] {
+        match std::fs::remove_file(marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("removing {}", marker.display()));
+            }
+        }
+    }
+    *shared.active_chat.write().await = None;
+    shared.media_recovery_requested.write().await.clear();
+    shared.media_downloads.lock().await.clear();
+    shared.avatar_revision.fetch_add(1, Ordering::Relaxed);
+    broadcast_chats(shared);
+    let _ = shared
+        .events
+        .send(ServerFrame::event(ServerEvent::Unread { total: 0 }));
+    let _ = shared.events.send(ServerFrame::event(ServerEvent::Avatars {
+        revision: shared.avatar_revision.load(Ordering::Relaxed),
+        jids: Vec::new(),
+    }));
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -161,12 +222,18 @@ impl Shared {
         }
         let chat_jid = canonical_contact_jid(self, &context.client, &info.source.chat).await;
         let sender_jid = canonical_contact_jid(self, &context.client, &info.source.sender).await;
-        let sender_name = nonempty(&info.push_name).unwrap_or_else(|| sender_jid.clone());
-        if sender_name != sender_jid
-            && let Err(error) = self.database.update_contact_name(&sender_jid, &sender_name)
+        let push_name = nonempty(&info.push_name).unwrap_or_else(|| sender_jid.clone());
+        if push_name != sender_jid
+            && let Err(error) = self.database.update_contact_name(&sender_jid, &push_name)
         {
             warn!(%error, %sender_jid, "could not persist message push name");
         }
+        let sender_name = self
+            .database
+            .contact_name(&sender_jid)
+            .ok()
+            .flatten()
+            .unwrap_or(push_name);
         let existing_name = self.database.chat_name(&chat_jid).ok().flatten();
         let chat_name = if info.source.is_group {
             match existing_name {
@@ -304,7 +371,7 @@ impl Shared {
                             Ok(true) => broadcast_messages(&shared, &media_chat_jid),
                             Ok(false) => {}
                             Err(error) => {
-                                warn!(%error, chat_jid = %media_chat_jid, "could not cache WhatsApp document")
+                                warn!(%error, chat_jid = %media_chat_jid, "could not cache WhatsApp document");
                             }
                         }
                     });
@@ -366,7 +433,7 @@ impl Shared {
                     if let Some(base) = wire
                         .message
                         .as_option()
-                        .map(|message| message.get_base_message())
+                        .map(whatsapp_rust::prelude::MessageExt::get_base_message)
                         && let Some(message) = &result
                     {
                         if let Some(image) = base.image_message.as_option().cloned() {
@@ -401,12 +468,16 @@ impl Shared {
             let last_timestamp = conversation
                 .conversation_timestamp
                 .or(conversation.last_msg_timestamp)
-                .map(|timestamp| timestamp.min(i64::MAX as u64) as i64)
+                .map(|timestamp| i64::try_from(timestamp).unwrap_or(i64::MAX))
                 .or_else(|| messages.last().map(|message| message.timestamp))
                 .unwrap_or(0);
             let preview = messages
                 .last()
                 .map(|message| message.text.clone())
+                .unwrap_or_default();
+            let last_sender_name = messages
+                .last()
+                .map(|message| message.sender_name.clone())
                 .unwrap_or_default();
             self.database
                 .insert_history_chat(&omarchy_whatsapp_protocol::Chat {
@@ -414,6 +485,7 @@ impl Shared {
                     name: chat_name.clone(),
                     phone_number: None,
                     last_message: preview,
+                    last_sender_name,
                     last_timestamp,
                     unread: conversation.unread_count.unwrap_or(0),
                     is_group,
@@ -589,6 +661,7 @@ fn video_message(message: &wa::Message) -> Option<&wa::message::VideoMessage> {
         .or_else(|| message.ptv_message.as_option())
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn coordinate_e7(value: Option<f64>) -> i64 {
     let value = value.unwrap_or_default();
     if value.is_finite() {
@@ -755,8 +828,7 @@ fn message_media(
 fn normalize_jid(value: &str) -> String {
     value
         .parse::<Jid>()
-        .map(|jid| jid.to_non_ad_string())
-        .unwrap_or_else(|_| value.to_owned())
+        .map_or_else(|_| value.to_owned(), |jid| jid.to_non_ad_string())
 }
 
 async fn canonical_contact_jid(shared: &Shared, client: &Client, jid: &Jid) -> String {
@@ -800,7 +872,7 @@ async fn canonical_contact_jid(shared: &Shared, client: &Client, jid: &Jid) -> S
                     Ok(true) => shared.avatars_changed(),
                     Ok(false) => {}
                     Err(error) => {
-                        warn!(%error, %alias, %canonical, "could not preserve aliased WhatsApp avatar")
+                        warn!(%error, %alias, %canonical, "could not preserve aliased WhatsApp avatar");
                     }
                 }
             }
@@ -1042,13 +1114,13 @@ async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
                                 Ok(true) => updated += 1,
                                 Ok(false) => {}
                                 Err(error) => {
-                                    warn!(%error, %jid, "could not persist recovered WhatsApp group subject")
+                                    warn!(%error, %jid, "could not persist recovered WhatsApp group subject");
                                 }
                             }
                         }
                     }
                     Err(error) => {
-                        warn!(%error, %jid, "could not recover WhatsApp group subject")
+                        warn!(%error, %jid, "could not recover WhatsApp group subject");
                     }
                 }
             }
@@ -1261,7 +1333,7 @@ async fn request_missing_contact_history(shared: Arc<Shared>, client: Arc<Client
         {
             Ok(_) => queued += 1,
             Err(error) => {
-                warn!(%error, jid = %cursor.chat_jid, "could not request WhatsApp history for contact-name recovery")
+                warn!(%error, jid = %cursor.chat_jid, "could not request WhatsApp history for contact-name recovery");
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -1367,7 +1439,7 @@ fn history_reaction(chat_jid: &str, wire: &wa::WebMessageInfo) -> Option<History
         .map(|timestamp| timestamp.div_euclid(1_000))
         .or_else(|| {
             wire.message_timestamp
-                .map(|timestamp| timestamp.min(i64::MAX as u64) as i64)
+                .map(|timestamp| i64::try_from(timestamp).unwrap_or(i64::MAX))
         })
         .unwrap_or(0);
     Some(HistoryReaction {
@@ -1416,8 +1488,7 @@ fn history_message(
     let base = body.get_base_message();
     let timestamp = wire
         .message_timestamp
-        .map(|timestamp| timestamp.min(i64::MAX as u64) as i64)
-        .unwrap_or(0);
+        .map_or(0, |timestamp| i64::try_from(timestamp).unwrap_or(i64::MAX));
     let text = base
         .text_content()
         .or_else(|| base.get_caption())
@@ -1849,7 +1920,7 @@ async fn main() -> Result<()> {
     let options = Options::parse();
     let mut paths = AppPaths::discover();
     if let Some(state_dir) = options.state_dir {
-        paths.state_dir = state_dir.clone();
+        paths.state_dir.clone_from(&state_dir);
         paths.protocol_db = state_dir.join("session.db");
         paths.history_db = state_dir.join("history.db");
     }
@@ -1898,6 +1969,7 @@ async fn main() -> Result<()> {
         media_dir,
         avatar_revision: AtomicU64::new(0),
         app_state_failed: AtomicBool::new(false),
+        logout_requested: AtomicBool::new(false),
         group_name_sync: Mutex::new(()),
         media_recovery_requested: RwLock::new(HashSet::new()),
         media_downloads: Mutex::new(HashSet::new()),
@@ -1949,7 +2021,8 @@ async fn main() -> Result<()> {
                     shared
                         .set_status(ConnectionStatus::Pairing {
                             code,
-                            expires_at: Utc::now().timestamp() + timeout.as_secs() as i64,
+                            expires_at: Utc::now().timestamp()
+                                + i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
                         })
                         .await;
                 }
@@ -2096,7 +2169,7 @@ async fn main() -> Result<()> {
                                 Ok(true) => broadcast_chats(&shared),
                                 Ok(false) => {}
                                 Err(error) => {
-                                    warn!(%error, "could not update WhatsApp group subject")
+                                    warn!(%error, "could not update WhatsApp group subject");
                                 }
                             }
                             let chat_jid = update.group_jid.to_non_ad_string();
@@ -2136,7 +2209,7 @@ async fn main() -> Result<()> {
                 bot_handle.shutdown().await;
                 false
             }
-            _ = &mut bot_handle => true,
+            () = &mut bot_handle => true,
             result = &mut ipc_task => {
                 result.context("IPC task panicked")??;
                 bail!("IPC server stopped unexpectedly");
@@ -2146,12 +2219,20 @@ async fn main() -> Result<()> {
             break;
         }
         *shared.client.write().await = None;
-        shared
-            .set_status(ConnectionStatus::Disconnected {
-                reason: "WhatsApp session ended; retrying".to_owned(),
-            })
-            .await;
-        warn!("WhatsApp run loop ended; starting a fresh connection");
+        if shared.logout_requested.swap(false, Ordering::SeqCst) {
+            clear_local_account_data(&paths, &shared)
+                .await
+                .context("clearing local WhatsApp account data after logout")?;
+            shared.set_status(ConnectionStatus::LoggedOut).await;
+            info!("cleared local WhatsApp account data after logout");
+        } else {
+            shared
+                .set_status(ConnectionStatus::Disconnected {
+                    reason: "WhatsApp session ended; retrying".to_owned(),
+                })
+                .await;
+            warn!("WhatsApp run loop ended; starting a fresh connection");
+        }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
     let _ = std::fs::remove_file(&paths.socket);
@@ -2580,7 +2661,7 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 match preview_result {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
-                        warn!(%error, "could not generate downloaded video preview")
+                        warn!(%error, "could not generate downloaded video preview");
                     }
                     Err(error) => warn!(%error, "video preview worker panicked"),
                 }
@@ -2724,6 +2805,17 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             };
             Ok(ServerEvent::Ack)
         }
+        Command::Logout => {
+            let client = shared
+                .client
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+            shared.logout_requested.store(true, Ordering::SeqCst);
+            client.logout().await;
+            Ok(ServerEvent::Ack)
+        }
         Command::Ping => Ok(ServerEvent::Pong),
     }
 }
@@ -2751,6 +2843,7 @@ mod tests {
             media_dir: directory.path().join("media"),
             avatar_revision: AtomicU64::new(0),
             app_state_failed: AtomicBool::new(false),
+            logout_requested: AtomicBool::new(false),
             group_name_sync: Mutex::new(()),
             media_recovery_requested: RwLock::new(HashSet::new()),
             media_downloads: Mutex::new(HashSet::new()),

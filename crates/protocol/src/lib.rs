@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -29,6 +30,8 @@ pub struct Chat {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone_number: Option<String>,
     pub last_message: String,
+    #[serde(default)]
+    pub last_sender_name: String,
     pub last_timestamp: i64,
     pub unread: u32,
     pub is_group: bool,
@@ -151,6 +154,7 @@ pub enum Command {
     SetActiveChat {
         chat_jid: Option<String>,
     },
+    Logout,
     Ping,
 }
 
@@ -163,6 +167,7 @@ pub struct ClientFrame {
 }
 
 impl ClientFrame {
+    #[must_use]
     pub fn new(id: Option<u64>, command: Command) -> Self {
         Self { id, command }
     }
@@ -220,10 +225,12 @@ pub struct ServerFrame {
 }
 
 impl ServerFrame {
+    #[must_use]
     pub fn response(id: Option<u64>, event: ServerEvent) -> Self {
         Self { id, event }
     }
 
+    #[must_use]
     pub fn event(event: ServerEvent) -> Self {
         Self { id: None, event }
     }
@@ -239,16 +246,14 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    #[must_use]
     pub fn discover() -> Self {
-        let runtime_base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("omarchy-whatsapp-{}", std::process::id()))
-            });
-        let state_base = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .or_else(dirs::state_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let runtime_base = runtime_base(
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            &std::env::temp_dir(),
+            std::process::id(),
+        );
+        let state_base = state_base(std::env::var_os("XDG_STATE_HOME"), dirs::state_dir());
         let runtime_dir = runtime_base.join("omarchy-whatsapp");
         let state_dir = state_base.join("omarchy-whatsapp");
         Self {
@@ -259,6 +264,20 @@ impl AppPaths {
             state_dir,
         }
     }
+}
+
+fn runtime_base(xdg_runtime_dir: Option<OsString>, temp_dir: &Path, pid: u32) -> PathBuf {
+    xdg_runtime_dir.map_or_else(
+        || temp_dir.join(format!("omarchy-whatsapp-{pid}")),
+        PathBuf::from,
+    )
+}
+
+fn state_base(xdg_state_home: Option<OsString>, platform_state_dir: Option<PathBuf>) -> PathBuf {
+    xdg_state_home
+        .map(PathBuf::from)
+        .or(platform_state_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]
@@ -291,6 +310,14 @@ mod tests {
             },
         );
         let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn logout_command_round_trip_is_stable() {
+        let frame = ClientFrame::new(Some(10), Command::Logout);
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(json, r#"{"id":10,"command":"logout"}"#);
         assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
     }
 
@@ -328,6 +355,44 @@ mod tests {
         let frame = ServerFrame::event(ServerEvent::Unread { total: 3 });
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn response_preserves_the_request_id() {
+        let frame = ServerFrame::response(Some(42), ServerEvent::Pong);
+        assert_eq!(frame.id, Some(42));
+        assert_eq!(frame.event, ServerEvent::Pong);
+    }
+
+    #[test]
+    fn discovered_paths_share_private_application_directories() {
+        let paths = AppPaths::discover();
+        assert_eq!(paths.runtime_dir.file_name().unwrap(), "omarchy-whatsapp");
+        assert_eq!(paths.state_dir.file_name().unwrap(), "omarchy-whatsapp");
+        assert_eq!(paths.socket, paths.runtime_dir.join("daemon.sock"));
+        assert_eq!(paths.protocol_db, paths.state_dir.join("session.db"));
+        assert_eq!(paths.history_db, paths.state_dir.join("history.db"));
+    }
+
+    #[test]
+    fn application_base_directories_have_explicit_fallbacks() {
+        assert_eq!(
+            runtime_base(Some(OsString::from("/run/user/1000")), Path::new("/tmp"), 7,),
+            PathBuf::from("/run/user/1000")
+        );
+        assert_eq!(
+            runtime_base(None, Path::new("/tmp"), 7),
+            PathBuf::from("/tmp/omarchy-whatsapp-7")
+        );
+        assert_eq!(
+            state_base(Some(OsString::from("/state")), Some("/fallback".into())),
+            PathBuf::from("/state")
+        );
+        assert_eq!(
+            state_base(None, Some("/fallback".into())),
+            PathBuf::from("/fallback")
+        );
+        assert_eq!(state_base(None, None), PathBuf::from("."));
     }
 
     #[test]

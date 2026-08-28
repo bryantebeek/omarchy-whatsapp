@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install system quality tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq qt6-declarative-dev-tools shellcheck
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-06-16 --profile minimal --component clippy,rustfmt,llvm-tools-preview
+      - name: Lint GitHub Actions workflows
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          actionlint_dir=$(mktemp -d)
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}" \
+            --output "$actionlint_dir/$archive"
+          actual=$(sha256sum "$actionlint_dir/$archive" | awk '{ print $1 }')
+          test "$actual" = "$ACTIONLINT_SHA256"
+          tar -xzf "$actionlint_dir/$archive" -C "$actionlint_dir" actionlint
+          "$actionlint_dir/actionlint" -color
+      - name: Run quality checks
+        run: ./scripts/check.sh
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-06-16 --profile minimal --component llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63 # v2
+        with:
+          tool: cargo-llvm-cov@0.9.0
+      - name: Enforce coverage policy
+        run: ./scripts/coverage.sh
+
+  smoke:
+    name: Smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install smoke-test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes desktop-file-utils jq libxml2-utils socat
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install nightly-2026-06-16 --profile minimal
+      - name: Build release binaries
+        run: cargo build --release --locked --workspace
+      - name: Validate deployment metadata
+        run: |
+          install -Dm755 target/release/omarchy-whatsappd "$HOME/.local/bin/omarchy-whatsappd"
+          systemd-analyze --user verify packaging/systemd/omarchy-whatsapp.service
+          desktop-file-validate packaging/applications/com.omarchy.WhatsApp.desktop
+          xmllint --noout packaging/icons/com.omarchy.WhatsApp.svg
+          bash -n packaging/arch/PKGBUILD
+      - name: Exercise daemon and IPC
+        run: ./tests/smoke.sh
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Audit dependencies, licenses, and sources
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check

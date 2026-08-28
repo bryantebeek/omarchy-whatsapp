@@ -18,11 +18,7 @@ while (($#)); do
 done
 
 if ((skip_build == 0)); then
-  if command -v mise >/dev/null 2>&1; then
-    (cd "$repo_dir" && mise exec rust@nightly-2026-06-16 -- cargo build --release --workspace)
-  else
-    (cd "$repo_dir" && cargo build --release --workspace)
-  fi
+  (cd "$repo_dir" && ./scripts/cargo.sh build --release --locked --workspace)
 fi
 
 for binary in omarchy-whatsappd omarchy-whatsappctl; do
@@ -71,18 +67,36 @@ plugin_dir="$HOME/.config/omarchy/plugins/io.github.bryantebeek.whatsapp"
 if [[ -d "$legacy_plugin_dir" && ! -e "$plugin_dir" ]]; then
   mv -- "$legacy_plugin_dir" "$plugin_dir"
 fi
-mkdir -p "$plugin_dir/icons"
-install -m644 "$repo_dir/quickshell/BarWidget.qml" "$plugin_dir/BarWidget.qml"
-install -m644 "$repo_dir/quickshell/Service.qml" "$plugin_dir/Service.qml"
-install -m644 "$repo_dir/quickshell/Panel.qml" "$plugin_dir/Panel.qml"
-install -m644 "$repo_dir/quickshell/Model.js" "$plugin_dir/Model.js"
-install -m644 "$repo_dir/quickshell/licenses.json" "$plugin_dir/licenses.json"
-install -m644 "$repo_dir/quickshell/icons/brand-whatsapp-filled.svg" \
-  "$plugin_dir/icons/brand-whatsapp-filled.svg"
-install -m644 "$repo_dir/quickshell/icons/LICENSE.tabler" \
-  "$plugin_dir/icons/LICENSE.tabler"
-# The manifest makes the directory visible to the shell, so install it last.
-install -m644 "$repo_dir/quickshell/manifest.json" "$plugin_dir/manifest.json"
+mkdir -p "$plugin_dir/quickshell/icons"
+
+# A marketplace installation is a git checkout at plugin_dir already. A local
+# development checkout lives elsewhere and needs its runtime subset copied in.
+if [[ $(realpath -m -- "$repo_dir") != $(realpath -m -- "$plugin_dir") ]]; then
+  rm -f -- \
+    "$plugin_dir/BarWidget.qml" \
+    "$plugin_dir/Service.qml" \
+    "$plugin_dir/Panel.qml" \
+    "$plugin_dir/Model.js" \
+    "$plugin_dir/licenses.json" \
+    "$plugin_dir/icons/brand-whatsapp-filled.svg" \
+    "$plugin_dir/icons/LICENSE.tabler"
+  install -m644 "$repo_dir/quickshell/BarWidget.qml" \
+    "$plugin_dir/quickshell/BarWidget.qml"
+  install -m644 "$repo_dir/quickshell/Service.qml" \
+    "$plugin_dir/quickshell/Service.qml"
+  install -m644 "$repo_dir/quickshell/Panel.qml" \
+    "$plugin_dir/quickshell/Panel.qml"
+  install -m644 "$repo_dir/quickshell/Model.js" \
+    "$plugin_dir/quickshell/Model.js"
+  install -m644 "$repo_dir/quickshell/licenses.json" \
+    "$plugin_dir/quickshell/licenses.json"
+  install -m644 "$repo_dir/quickshell/icons/brand-whatsapp-filled.svg" \
+    "$plugin_dir/quickshell/icons/brand-whatsapp-filled.svg"
+  install -m644 "$repo_dir/quickshell/icons/LICENSE.tabler" \
+    "$plugin_dir/quickshell/icons/LICENSE.tabler"
+  # The manifest makes the directory visible to the shell, so install it last.
+  install -m644 "$repo_dir/manifest.json" "$plugin_dir/manifest.json"
+fi
 
 systemctl --user daemon-reload
 systemctl --user disable --now omarchy-whatsapp-native.service >/dev/null 2>&1 || true
@@ -100,6 +114,7 @@ fi
 
 if command -v omarchy >/dev/null 2>&1; then
   omarchy plugin validate "$plugin_dir"
+  omarchy plugin enable "$plugin_id"
   "$repo_dir/scripts/reload-quickshell.sh"
 fi
 

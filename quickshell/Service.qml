@@ -383,6 +383,11 @@ Item {
     return true
   }
 
+  function unlinkDevice() {
+    if (connectionState !== "connected") return false
+    return send("logout") > 0
+  }
+
   function reactToMessage(message, emoji) {
     if (!message || !selectedChatJid || !message.id) return false
     send("react", {

@@ -173,6 +173,21 @@ impl Database {
                AND (chats.name_source = ?3 OR chats.name = contacts.name)",
             params![CHAT_NAME_ADDRESS_BOOK, CHAT_NAME_MESSAGE, CHAT_NAME_UNKNOWN],
         )?;
+        // Address-book names are authoritative for every rendering path. Older
+        // builds could store a newer WhatsApp push name on individual messages
+        // even while preserving the saved contact name in `contacts`.
+        connection.execute(
+            "UPDATE messages SET sender_name = (
+                SELECT contacts.name FROM contacts
+                WHERE contacts.jid = messages.sender_jid AND contacts.source = 1
+             )
+             WHERE EXISTS (
+                SELECT 1 FROM contacts
+                WHERE contacts.jid = messages.sender_jid AND contacts.source = 1
+                  AND contacts.name != messages.sender_name
+             )",
+            [],
+        )?;
         Self::restore_legacy_chat_names(&connection, path);
         // Early builds represented protocol/control envelopes and unknown
         // add-ons as user-visible placeholder bubbles. They contain no
@@ -201,6 +216,28 @@ impl Database {
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    pub fn clear_account_data(&self) -> Result<()> {
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("history database mutex poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "
+            DELETE FROM reactions;
+            DELETE FROM message_tombstones;
+            DELETE FROM messages;
+            DELETE FROM chat_labels;
+            DELETE FROM chat_settings;
+            DELETE FROM chats;
+            DELETE FROM contacts;
+            DELETE FROM labels;
+            ",
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn restore_legacy_chat_names(connection: &Connection, database_path: &Path) {
@@ -332,7 +369,9 @@ impl Database {
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO messages
              (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, read, media_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3,
+                COALESCE((SELECT name FROM contacts WHERE jid = ?3 AND source = 1), ?4),
+                ?5, ?6, ?7, ?8, ?9)",
             params![
                 message.chat_jid,
                 message.id,
@@ -374,6 +413,11 @@ impl Database {
             .expect("history database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT chats.jid, chats.name, chats.phone_number, chats.last_message,
+                    COALESCE((
+                        SELECT sender_name FROM messages
+                        WHERE messages.chat_jid = chats.jid
+                        ORDER BY timestamp DESC, rowid DESC LIMIT 1
+                    ), ''),
                     chats.last_timestamp,
                     CASE WHEN COALESCE(chat_settings.archived, 0) = 0
                          THEN chats.unread ELSE 0 END,
@@ -391,9 +435,10 @@ impl Database {
                 name: row.get(1)?,
                 phone_number: row.get(2)?,
                 last_message: row.get(3)?,
-                last_timestamp: row.get(4)?,
-                unread: row.get(5)?,
-                is_group: row.get(6)?,
+                last_sender_name: row.get(4)?,
+                last_timestamp: row.get(5)?,
+                unread: row.get(6)?,
+                is_group: row.get(7)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1578,6 +1623,24 @@ mod tests {
     }
 
     #[test]
+    fn chat_list_includes_the_latest_sender_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut group_message = message("latest", 2);
+        group_message.chat_jid = "123-456@g.us".into();
+        group_message.sender_jid = "2@s.whatsapp.net".into();
+        group_message.sender_name = "Grace".into();
+        database
+            .insert_message(&group_message, "Friends", true, false)
+            .unwrap();
+
+        let chat = database.list_chats(10).unwrap().remove(0);
+        assert!(chat.is_group);
+        assert_eq!(chat.last_message, "message latest");
+        assert_eq!(chat.last_sender_name, "Grace");
+    }
+
+    #[test]
     fn nullable_media_download_metadata_round_trips() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(&directory.path().join("history.db")).unwrap();
@@ -1829,6 +1892,35 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(database.list_chats(10).unwrap()[0].name, "Saved name");
+
+        let mut newer = message("two", 2);
+        newer.sender_name = "New profile name".into();
+        database
+            .insert_message(&newer, "1@s.whatsapp.net", false, false)
+            .unwrap();
+        assert!(
+            database
+                .messages("1@s.whatsapp.net", 10)
+                .unwrap()
+                .iter()
+                .all(|message| message.sender_name == "Saved name")
+        );
+
+        database
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET sender_name = 'Stale profile name' WHERE id = 'two'",
+                [],
+            )
+            .unwrap();
+        drop(database);
+        let reopened = Database::open(&directory.path().join("history.db")).unwrap();
+        assert_eq!(
+            reopened.messages("1@s.whatsapp.net", 10).unwrap()[1].sender_name,
+            "Saved name"
+        );
     }
 
     #[test]
@@ -1932,6 +2024,7 @@ mod tests {
                 name: replayed.chat_jid.clone(),
                 phone_number: None,
                 last_message: replayed.text.clone(),
+                last_sender_name: replayed.sender_name.clone(),
                 last_timestamp: replayed.timestamp,
                 unread: 0,
                 is_group: true,
@@ -2022,6 +2115,7 @@ mod tests {
                 name: "0@s.whatsapp.net".into(),
                 phone_number: None,
                 last_message: "internal".into(),
+                last_sender_name: "WhatsApp".into(),
                 last_timestamp: 2,
                 unread: 0,
                 is_group: false,
@@ -2083,7 +2177,7 @@ mod tests {
             longitude_e7: 48_953_000,
             accuracy_m: 8,
             name: "Amsterdam".into(),
-            address: "".into(),
+            address: String::new(),
             thumbnail_path: None,
             live: true,
             updated_at: 10,
@@ -2112,7 +2206,7 @@ mod tests {
             longitude_e7: 48_954_000,
             accuracy_m: 4,
             name: "Amsterdam".into(),
-            address: "".into(),
+            address: String::new(),
             thumbnail_path: None,
             live: true,
             updated_at: 20,
@@ -2167,6 +2261,7 @@ mod tests {
                     name: jid.into(),
                     phone_number: None,
                     last_message: "history".into(),
+                    last_sender_name: "Ada".into(),
                     last_timestamp: 1,
                     unread,
                     is_group: true,
@@ -2182,5 +2277,23 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(counts["stale@g.us"], 0);
         assert_eq!(counts["explicit@g.us"], 1);
+    }
+
+    #[test]
+    fn clearing_account_data_removes_history_and_account_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let saved = message("saved", 10);
+        database.insert_message(&saved, "Ada", false, true).unwrap();
+        database
+            .update_address_book_name(&saved.sender_jid, "Ada")
+            .unwrap();
+
+        database.clear_account_data().unwrap();
+
+        assert!(database.list_chats(10).unwrap().is_empty());
+        assert!(database.messages(&saved.chat_jid, 10).unwrap().is_empty());
+        assert_eq!(database.unread_total().unwrap(), 0);
+        assert_eq!(database.contact_name(&saved.sender_jid).unwrap(), None);
     }
 }

@@ -107,6 +107,53 @@ Item {
     borderSpec: root.devicePixelBorderSpec(_borderSpec)
   }
 
+  component CrispMenuButton: CrispButton {
+    id: menuButton
+
+    property string menuIconText: ""
+    property string menuText: ""
+
+    iconText: ""
+    text: ""
+    implicitHeight: menuButtonContent.implicitHeight + verticalPadding * 2
+      + _reservedBorderTop + _reservedBorderBottom
+
+    Row {
+      id: menuButtonContent
+
+      anchors.left: parent.left
+      anchors.leftMargin: menuButton._reservedContentLeftInset
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.spacing.controlGap
+
+      Item {
+        width: Style.space(20)
+        height: menuButtonIcon.implicitHeight
+
+        Text {
+          id: menuButtonIcon
+
+          anchors.centerIn: parent
+          text: menuButton.menuIconText
+          color: menuButton.selected
+            ? menuButton._selectedColor : menuButton.foreground
+          font.family: menuButton.fontFamily
+          font.pixelSize: menuButton.iconSize
+        }
+      }
+
+      Text {
+        anchors.verticalCenter: parent.verticalCenter
+        text: menuButton.menuText
+        color: menuButton.selected
+          ? menuButton._selectedColor : menuButton.foreground
+        font.family: menuButton.fontFamily
+        font.pixelSize: menuButton.fontSize
+        font.bold: menuButton.selected
+      }
+    }
+  }
+
   component CrispTextField: TextField {
     id: crispTextField
     background: CrispBorderSurface {
@@ -561,6 +608,10 @@ Item {
       }
 
       Keys.onPressed: function(event) {
+        if (logoutConfirmation.handleKey(event)) {
+          event.accepted = true
+          return
+        }
         if (root.beginControlHold(event)
             || event.key === root.controlActivatorKey) {
           event.accepted = true
@@ -589,6 +640,25 @@ Item {
 
       Keys.onReleased: function(event) {
         if (root.endControlHold(event)) event.accepted = true
+      }
+
+      ConfirmDialog {
+        id: logoutConfirmation
+
+        anchors.fill: parent
+        z: 1000
+        message: "Log out and unlink this workstation?\n\nThis clears its local "
+          + "WhatsApp account data. You’ll need to scan a new QR code to use it again."
+        confirmText: "Log out"
+        background: Color.popups.background
+        foreground: Color.popups.text
+        selectedText: root.accent
+
+        onOpenedChanged: if (opened) selectedIndex = 0
+        onCanceled: opened = false
+        onConfirmed: {
+          if (root.service && root.service.unlinkDevice()) opened = false
+        }
       }
 
       QQC.Popup {
@@ -889,30 +959,44 @@ Item {
 
                   spacing: Style.space(2)
 
-                  CrispButton {
+                  CrispMenuButton {
                     id: headerLicenseAction
 
                     width: parent.width
-                    iconText: ""
-                    text: "Licenses"
+                    menuIconText: ""
+                    menuText: "Licenses"
                     foreground: Color.popups.text
                     accent: root.accent
                     focusable: true
-                    leftAlign: true
                     onClicked: {
                       headerMenu.close()
                       Qt.callLater(function() { licensesPopup.open() })
                     }
                   }
 
-                  CrispButton {
+                  CrispMenuButton {
                     width: parent.width
-                    iconText: "󰅖"
-                    text: "Close"
+                    visible: root.paired
+                    menuIconText: "󰍃"
+                    menuText: "Log out"
+                    foreground: Color.popups.text
+                    accent: Color.urgent
+                    focusable: true
+                    onClicked: {
+                      headerMenu.close()
+                      Qt.callLater(function() {
+                        logoutConfirmation.opened = true
+                      })
+                    }
+                  }
+
+                  CrispMenuButton {
+                    width: parent.width
+                    menuIconText: "󰅖"
+                    menuText: "Close"
                     foreground: Color.popups.text
                     accent: root.accent
                     focusable: true
-                    leftAlign: true
                     onClicked: {
                       headerMenu.close()
                       root.requestClose()
@@ -1194,7 +1278,13 @@ Item {
                           }
                           Text {
                             width: parent.width
-                            text: String(modelData.last_message || "No messages yet")
+                            text: {
+                              var message = String(modelData.last_message || "")
+                              if (!message) return "No messages yet"
+                              var sender = String(modelData.last_sender_name || "")
+                              return modelData.is_group === true && sender
+                                ? sender + ": " + message : message
+                            }
                             color: root.sidebarSecondary
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
@@ -1551,6 +1641,8 @@ Item {
                         readonly property real maximumMediaWidth:
                           Math.min(maximumWidth, Style.space(340))
                             - horizontalPadding
+                        readonly property real locationPreviewWidth:
+                          Math.min(maximumMediaWidth, Style.space(260))
                         readonly property real videoAspectRatio:
                           Number(messageDelegate.mediaData
                             ? messageDelegate.mediaData.width || 1 : 1)
@@ -1563,6 +1655,9 @@ Item {
                         width: messageDelegate.mediaData
                           && messageDelegate.mediaData.kind === "video"
                           ? videoPreviewWidth + horizontalPadding
+                          : messageDelegate.mediaData
+                            && messageDelegate.mediaData.kind === "location"
+                          ? locationPreviewWidth + horizontalPadding
                           : messageDelegate.hasStructuredMedia
                           ? Math.min(maximumWidth, Style.space(340))
                           : Math.min(maximumWidth,
@@ -1891,7 +1986,7 @@ Item {
                             visible: messageDelegate.mediaData
                               && messageDelegate.mediaData.kind === "location"
                             width: parent.width
-                            height: visible ? Style.space(150) : 0
+                            height: visible ? Style.space(120) : 0
                             radius: 0
                             clip: true
                             color: Style.normalFillFor(root.foreground, root.accent)

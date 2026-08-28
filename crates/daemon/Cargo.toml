@@ -5,13 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 buffa.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
-omarchy-whatsapp-protocol = { path = "../protocol" }
+omarchy-whatsapp-protocol = { version = "0.3.0", path = "../protocol" }
 qrcode.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true

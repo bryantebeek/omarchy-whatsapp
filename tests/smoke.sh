@@ -14,10 +14,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-daemon="$repo_dir/target/release/omarchy-whatsappd"
-ctl="$repo_dir/target/release/omarchy-whatsappctl"
+daemon=${OMARCHY_WHATSAPP_DAEMON:-"$repo_dir/target/release/omarchy-whatsappd"}
+ctl=${OMARCHY_WHATSAPP_CTL:-"$repo_dir/target/release/omarchy-whatsappctl"}
 [[ -x $daemon && -x $ctl ]] || {
-  echo "Release binaries are missing; run cargo build --release --workspace first." >&2
+  echo "Release binaries are missing; run cargo build --release --locked --workspace first." >&2
   exit 1
 }
 
@@ -61,7 +61,10 @@ grep -F 'BEGIN omarchy-whatsapp launcher chats' "$menu" >/dev/null
 grep -F '"personal"' "$menu" >/dev/null
 "$ctl" launcher-remove --menu-path "$menu" \
   | jq -e '.launcher == "removed" and .changed == true' >/dev/null
-! grep -F 'BEGIN omarchy-whatsapp launcher chats' "$menu" >/dev/null
+if grep -F 'BEGIN omarchy-whatsapp launcher chats' "$menu" >/dev/null; then
+  echo "launcher-remove left its generated menu block behind" >&2
+  exit 1
+fi
 grep -F '"personal"' "$menu" >/dev/null
 
 # A same-user process can reach the socket, so verify an unterminated oversized
