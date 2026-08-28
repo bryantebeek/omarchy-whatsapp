@@ -24,11 +24,14 @@ mkdir -p -- "$test_home/.local/state/omarchy-whatsapp" "$shim_dir"
 
 # Keep the test independent of a running user manager. The install shim also
 # lets us simulate an interrupted copy before the atomic rename.
+# The single-quoted strings are literal source for the generated shim.
+# shellcheck disable=SC2016
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   'printf "%s\n" "$*" >>"${SYSTEMCTL_LOG:?}"' \
   >"$shim_dir/systemctl"
+# shellcheck disable=SC2016
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
