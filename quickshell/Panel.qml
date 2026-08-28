@@ -15,6 +15,8 @@ Item {
   property var manifest: null
   property var service: null
   property bool opened: false
+  property bool controlHeld: false
+  property int controlActivatorKey: 0
   property bool newChatVisible: false
   property int handledMessagesNavigationSerial: 0
   property string pendingConversationScrollMode: ""
@@ -172,6 +174,8 @@ Item {
 
   function close() {
     opened = false
+    controlHeld = false
+    controlActivatorKey = 0
     if (service) service.setPanelState(false, false)
   }
 
@@ -187,6 +191,58 @@ Item {
       root.revealSelectedChat()
       composer.forceActiveFocus()
     })
+  }
+
+  function firstVisibleChatIndex() {
+    if (!chatList || !chatList.count) return -1
+    var index = chatList.indexAt(1, chatList.contentY + 1)
+    return index >= 0 ? index : 0
+  }
+
+  function chatShortcutSlot(key) {
+    if (key >= Qt.Key_1 && key <= Qt.Key_9) return key - Qt.Key_1
+    if (key === Qt.Key_0) return 9
+    return -1
+  }
+
+  function isControlActivator(event) {
+    if (!event) return false
+    if (event.key === Qt.Key_Control) return true
+    if (!(event.modifiers & Qt.ControlModifier)) return false
+    return event.key === Qt.Key_CapsLock
+      || event.key === Qt.Key_Shift
+      || event.key === Qt.Key_Alt
+      || event.key === Qt.Key_AltGr
+      || event.key === Qt.Key_Meta
+  }
+
+  function beginControlHold(event) {
+    if (controlHeld || event.isAutoRepeat || !isControlActivator(event)) return false
+    controlActivatorKey = event.key
+    controlHeld = true
+    return true
+  }
+
+  function endControlHold(event) {
+    if (!controlHeld || event.isAutoRepeat
+        || event.key !== controlActivatorKey) return false
+    controlHeld = false
+    controlActivatorKey = 0
+    return true
+  }
+
+  function chatShortcutLabelForIndex(index) {
+    var slot = index - firstVisibleChatIndex()
+    if (slot < 0 || slot > 9) return ""
+    return "^" + (slot === 9 ? "0" : String(slot + 1))
+  }
+
+  function chooseChatShortcut(slot) {
+    var firstIndex = firstVisibleChatIndex()
+    var index = firstIndex + slot
+    if (firstIndex < 0 || index < 0 || index >= filteredChats.length) return false
+    chooseChat(filteredChats[index].jid)
+    return true
   }
 
   function revealSelectedChat() {
@@ -299,16 +355,33 @@ Item {
       id: focusScope
       anchors.fill: parent
       focus: true
+      Keys.priority: Keys.BeforeItem
 
       onActiveFocusChanged: if (root.service)
         root.service.setPanelState(root.opened, activeFocus)
 
+      Keys.onShortcutOverride: function(event) {
+        if (root.beginControlHold(event)) event.accepted = true
+      }
+
       Keys.onPressed: function(event) {
-        if ((event.modifiers & Qt.ControlModifier)
-            && (event.key === Qt.Key_K || event.key === Qt.Key_F)) {
+        if (root.beginControlHold(event)
+            || event.key === root.controlActivatorKey) {
+          event.accepted = true
+          return
+        }
+        if (!(event.modifiers & Qt.ControlModifier)) return
+        var shortcutSlot = root.chatShortcutSlot(event.key)
+        if (shortcutSlot >= 0 && root.chooseChatShortcut(shortcutSlot)) {
+          event.accepted = true
+        } else if (event.key === Qt.Key_K || event.key === Qt.Key_F) {
           chatSearch.forceActiveFocus()
           event.accepted = true
         }
+      }
+
+      Keys.onReleased: function(event) {
+        if (root.endControlHold(event)) event.accepted = true
       }
 
       QQC.Popup {
@@ -832,7 +905,7 @@ Item {
                             id: chatTitleRow
                             width: parent.width
                             height: Math.max(chatNameLabel.implicitHeight,
-                              timeLabel.implicitHeight, Style.space(14))
+                              timeLabel.height, Style.space(14))
                             Text {
                               id: chatNameLabel
                               anchors.left: parent.left
@@ -872,16 +945,44 @@ Item {
                                 font.bold: true
                               }
                             }
-                            Text {
+                            Item {
                               id: timeLabel
                               anchors.right: parent.right
                               anchors.verticalCenter: parent.verticalCenter
-                              text: Model.shortTime(modelData.last_timestamp)
-                              color: root.sidebarSecondary
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
-                              maximumLineCount: 1
-                              wrapMode: Text.NoWrap
+                              readonly property string shortcutLabel:
+                                root.chatShortcutLabelForIndex(index)
+                              readonly property string timestampLabel:
+                                Model.shortTime(modelData.last_timestamp)
+                              width: Math.max(timestampText.implicitWidth,
+                                shortcutText.implicitWidth)
+                              height: Math.max(timestampText.implicitHeight,
+                                shortcutText.implicitHeight)
+
+                              Text {
+                                id: timestampText
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: !shortcutText.visible
+                                text: timeLabel.timestampLabel
+                                color: root.sidebarSecondary
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                maximumLineCount: 1
+                                wrapMode: Text.NoWrap
+                              }
+                              Text {
+                                id: shortcutText
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: root.controlHeld
+                                  && timeLabel.shortcutLabel !== ""
+                                text: timeLabel.shortcutLabel
+                                color: root.sidebarSecondary
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                                maximumLineCount: 1
+                                wrapMode: Text.NoWrap
+                              }
                             }
                           }
                           Text {
@@ -960,7 +1061,8 @@ Item {
                           Math.max(1, Style.normalBorderWidth))
                         Text {
                           anchors.centerIn: parent
-                          visible: selectedAvatar.status !== Image.Ready
+                          visible: String(selectedAvatar.source) === ""
+                            || selectedAvatar.status === Image.Error
                           text: root.service && root.service.selectedChat
                             ? Model.initials(root.service.selectedChat.name,
                               root.service.selectedChat.jid) : "?"
@@ -1010,12 +1112,12 @@ Item {
                           id: conversationSubtitle
                           visible: root.service && root.service.selectedChat
                             && conversationSubtitle.text !== ""
-                          text: root.service && root.service.selectedChat
-                            && root.service.selectedChat.is_group
-                            ? "Group conversation"
-                            : Model.contactPhoneNumber(
-                              root.service.selectedChat.phone_number,
-                              root.service.selectedChat.jid)
+                          text: !root.service || !root.service.selectedChat
+                            ? "" : root.service.selectedChat.is_group
+                              ? "Group conversation"
+                              : Model.contactPhoneNumber(
+                                root.service.selectedChat.phone_number,
+                                root.service.selectedChat.jid)
                           color: root.foreground
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.caption
@@ -1194,13 +1296,16 @@ Item {
 
                       Rectangle {
                         id: bubble
+                        readonly property real horizontalPadding: Style.space(22)
+                        readonly property real maximumWidth: messageList.width * 0.72
+
                         width: messageDelegate.hasStructuredMedia
-                          ? Math.min(messageList.width * 0.72, Style.space(340))
-                          : Math.min(messageList.width * 0.72,
+                          ? Math.min(maximumWidth, Style.space(340))
+                          : Math.min(maximumWidth,
                             Math.max(Style.space(36),
-                              messageWidthProbe.implicitWidth + Style.space(22),
+                              messageLayoutProbe.contentWidth + horizontalPadding,
                               messageDelegate.showSenderLabel
-                                ? senderWidthProbe.implicitWidth + Style.space(22) : 0))
+                                ? senderLabel.implicitWidth + horizontalPadding : 0))
                         height: messageColumn.implicitHeight + Style.space(16)
                         x: modelData.from_me
                           ? messageDelegate.width - width - Style.space(18)
@@ -1212,20 +1317,15 @@ Item {
                           : Style.normalFillFor(root.foreground, root.accent)
 
                         Text {
-                          id: messageWidthProbe
+                          id: messageLayoutProbe
                           visible: false
+                          width: Math.max(0,
+                            bubble.maximumWidth - bubble.horizontalPadding)
                           text: messageDelegate.renderedMessageText
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.body
-                          textFormat: Text.RichText
-                        }
-                        Text {
-                          id: senderWidthProbe
-                          visible: false
-                          text: messageDelegate.senderLabelText
-                          font.family: root.fontFamily
-                          font.pixelSize: root.messageMetaFontSize
-                          font.bold: true
+                          wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                          textFormat: Text.StyledText
                         }
                         Column {
                           id: messageColumn
@@ -1257,7 +1357,7 @@ Item {
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.body
                             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                            textFormat: Text.RichText
+                            textFormat: Text.StyledText
                             horizontalAlignment: modelData.from_me
                               ? Text.AlignRight : Text.AlignLeft
 
@@ -1279,7 +1379,7 @@ Item {
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.body
                             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                            textFormat: Text.RichText
+                            textFormat: Text.StyledText
                             horizontalAlignment: modelData.from_me
                               ? Text.AlignRight : Text.AlignLeft
 
