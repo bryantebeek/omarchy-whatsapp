@@ -135,15 +135,19 @@ last-vote-wins semantics per participant, and broadcast as refreshed aggregate
 cards. Voting uses the stored secret through `whatsapp-rust`; Quickshell never
 receives it.
 
-Avatar previews and message images are raster-only and owner-readable. Encrypted
-message images are streamed through the library's authenticated decryptor to a
+Avatar previews, message images, and sticker previews are raster-only and
+owner-readable. Encrypted message images and WebP stickers are streamed through
+the library's authenticated decryptor to a
 temporary file and atomically renamed after verification. Images are limited to
 25 MiB each and the media directory to 256 MiB; avatar responses are limited to
-1 MiB each and 64 MiB total. Location thumbnails use the same private cache.
+1 MiB each and 64 MiB total. The shell automatically requests undownloaded WebP
+stickers as an active conversation loads. Location thumbnails use the same
+private cache.
 
 ## Deliberate exclusions
 
-Stickers, newsletters, embedded maps, and a full VoIP stack are not downloaded
-or hosted by the UI. Their messages remain visible as compact placeholders.
-This keeps the always-on process small and avoids pulling Chromium/WebEngine
-into Omarchy Shell.
+Lottie sticker JSON, newsletters, embedded maps, and a full VoIP stack are not
+hosted by the UI. Lottie stickers use their embedded PNG preview because Qt
+Lottie explicitly treats its input as trusted, while WhatsApp message content
+is sender-controlled. This keeps the always-on process small and avoids pulling
+Chromium/WebEngine into Omarchy Shell.

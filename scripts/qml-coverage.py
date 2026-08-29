@@ -60,6 +60,7 @@ def main() -> int:
         "load_history_and_receive_updates",
         "event_updates_preserve_conversation_viewport",
         "open_media_and_recover_connection",
+        "render_and_download_stickers",
     }
     tested_workflows = names(r"function\s+test_([A-Za-z0-9_]+)\s*\(", workflow_tests)
 

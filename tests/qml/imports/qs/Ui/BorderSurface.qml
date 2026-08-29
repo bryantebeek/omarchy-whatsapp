@@ -1,4 +1,5 @@
 import QtQuick
+import qs.Commons
 
 Rectangle {
   property var borderSpec: ({})
@@ -7,8 +8,12 @@ Rectangle {
   property real rightPadding: padding
   property real bottomPadding: padding
   property real leftPadding: padding
-  readonly property real contentTopInset: topPadding
-  readonly property real contentRightInset: rightPadding
-  readonly property real contentBottomInset: bottomPadding
-  readonly property real contentLeftInset: leftPadding
+  readonly property real borderTop: Border.top(borderSpec)
+  readonly property real borderRight: Border.right(borderSpec)
+  readonly property real borderBottom: Border.bottom(borderSpec)
+  readonly property real borderLeft: Border.left(borderSpec)
+  readonly property real contentTopInset: borderTop + topPadding
+  readonly property real contentRightInset: borderRight + rightPadding
+  readonly property real contentBottomInset: borderBottom + bottomPadding
+  readonly property real contentLeftInset: borderLeft + leftPadding
 }

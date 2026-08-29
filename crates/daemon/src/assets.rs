@@ -11,6 +11,7 @@ use tracing::warn;
 use whatsapp_rust::prelude::{Client, Jid, wa};
 
 pub const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_STICKER_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_VIDEO_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_DOCUMENT_BYTES: u64 = 100 * 1024 * 1024;
@@ -90,6 +91,26 @@ pub fn message_image_path(directory: &Path, chat_jid: &str, message_id: &str) ->
 pub fn message_image_thumbnail_path(directory: &Path, chat_jid: &str, message_id: &str) -> PathBuf {
     directory.join(format!(
         "{}-{}.thumbnail.jpg",
+        hex_key(chat_jid),
+        hex_key(message_id)
+    ))
+}
+
+pub fn message_sticker_path(directory: &Path, chat_jid: &str, message_id: &str) -> PathBuf {
+    directory.join(format!(
+        "{}-{}.sticker.webp",
+        hex_key(chat_jid),
+        hex_key(message_id)
+    ))
+}
+
+pub fn message_sticker_thumbnail_path(
+    directory: &Path,
+    chat_jid: &str,
+    message_id: &str,
+) -> PathBuf {
+    directory.join(format!(
+        "{}-{}.sticker-thumbnail.png",
         hex_key(chat_jid),
         hex_key(message_id)
     ))
@@ -347,6 +368,22 @@ pub fn cache_message_video_thumbnail(
     Ok(thumbnail_path)
 }
 
+pub fn cache_message_sticker_thumbnail(
+    directory: &Path,
+    chat_jid: &str,
+    message_id: &str,
+    thumbnail: Option<&Vec<u8>>,
+) -> Result<PathBuf> {
+    let thumbnail_path = message_sticker_thumbnail_path(directory, chat_jid, message_id);
+    if !thumbnail_path.exists()
+        && let Some(thumbnail) = thumbnail.filter(|bytes| bytes.starts_with(b"\x89PNG\r\n\x1a\n"))
+    {
+        write_private_bytes(&thumbnail_path, thumbnail)?;
+    }
+    prune_media_cache(directory, &thumbnail_path);
+    Ok(thumbnail_path)
+}
+
 fn safe_document_extension(file_name: &str) -> Option<String> {
     let extension = Path::new(file_name).extension()?.to_str()?;
     (!extension.is_empty()
@@ -388,6 +425,10 @@ pub fn remove_message_media(directory: &Path, chat_jid: &str, message_id: &str) 
         directory, chat_jid, message_id,
     ));
     let _ = std::fs::remove_file(message_video_thumbnail_path(
+        directory, chat_jid, message_id,
+    ));
+    let _ = std::fs::remove_file(message_sticker_path(directory, chat_jid, message_id));
+    let _ = std::fs::remove_file(message_sticker_thumbnail_path(
         directory, chat_jid, message_id,
     ));
     let _ = std::fs::remove_file(location_thumbnail_path(directory, chat_jid, message_id));
@@ -486,6 +527,10 @@ fn image_bytes_are_safe(bytes: &[u8]) -> bool {
         || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
         || bytes.starts_with(b"GIF87a")
         || bytes.starts_with(b"GIF89a")
+}
+
+fn sticker_bytes_are_safe(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
 }
 
 fn video_bytes_are_safe(bytes: &[u8]) -> bool {
@@ -660,6 +705,58 @@ pub async fn download_message_image(
     }
 }
 
+pub async fn download_message_sticker(
+    client: Arc<Client>,
+    sticker: wa::message::StickerMessage,
+    path: PathBuf,
+) -> Result<bool> {
+    let declared = sticker.file_length.unwrap_or(0);
+    if declared == 0 || declared > MAX_STICKER_BYTES {
+        bail!("sticker declares an invalid size of {declared} bytes");
+    }
+    if sticker.is_lottie.unwrap_or(false) {
+        bail!("Lottie stickers cannot be decoded safely by the shell");
+    }
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == declared) {
+        return Ok(false);
+    }
+    let temporary = path.with_extension(format!("part-{}", std::process::id()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let result = client.download_to_writer(&sticker, file).await;
+    match result {
+        Ok(mut file) => {
+            let length = file.metadata()?.len();
+            if length != declared || length > MAX_STICKER_BYTES {
+                let _ = std::fs::remove_file(&temporary);
+                bail!("downloaded sticker has invalid size {length}");
+            }
+            file.seek(SeekFrom::Start(0))?;
+            let mut header = [0u8; 16];
+            let count = file.read(&mut header)?;
+            if !sticker_bytes_are_safe(&header[..count]) {
+                let _ = std::fs::remove_file(&temporary);
+                bail!("downloaded sticker is not WebP media");
+            }
+            drop(file);
+            std::fs::rename(&temporary, &path)?;
+            if let Some(directory) = path.parent() {
+                prune_directory(directory, MAX_MEDIA_CACHE_BYTES, &path);
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(anyhow!(error)).context("downloading WhatsApp sticker")
+        }
+    }
+}
+
 pub async fn download_message_video(
     client: Arc<Client>,
     video: wa::message::VideoMessage,
@@ -809,6 +906,34 @@ mod tests {
     fn cache_names_never_contain_jid_punctuation() {
         let path = avatar_path(Path::new("/tmp/cache"), "123-4@g.us");
         assert_eq!(path.file_name().unwrap(), "3132332d3440672e7573.img");
+    }
+
+    #[test]
+    fn sticker_cache_uses_webp_media_and_valid_png_previews() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("media");
+        private_dir(&media).unwrap();
+        let sticker_path = message_sticker_path(&media, "123-4@g.us", "sticker");
+        assert_eq!(
+            sticker_path.file_name().unwrap(),
+            "3132332d3440672e7573-737469636b6572.sticker.webp"
+        );
+        assert!(sticker_bytes_are_safe(b"RIFF\x10\0\0\0WEBPVP8 "));
+        assert!(!sticker_bytes_are_safe(b"\x89PNG\r\n\x1a\n"));
+
+        let thumbnail = b"\x89PNG\r\n\x1a\nsynthetic".to_vec();
+        let thumbnail_path =
+            cache_message_sticker_thumbnail(&media, "123-4@g.us", "sticker", Some(&thumbnail))
+                .unwrap();
+        assert_eq!(std::fs::read(&thumbnail_path).unwrap(), thumbnail);
+        assert_eq!(
+            std::fs::metadata(thumbnail_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]

@@ -42,9 +42,11 @@ TestCase {
     compare(panel.conversationActivitySubtitle(),
       "You, Alice, Bob, Carol + 1 other")
     service.chatStateLabelResult = "Alice is typing…"
+    compare(panel.conversationChatActivity(), "Alice is typing…")
     compare(panel.conversationActivitySubtitle(), "Alice is typing…")
     compare(panel.sidebarChatActivity(service.selectedChat), "Alice is typing…")
     service.chatStateLabelResult = ""
+    compare(panel.conversationChatActivity(), "")
     compare(panel.sidebarChatActivity(service.selectedChat), "")
     service.groupParticipantsError = "failed"
     compare(panel.groupConversationSubtitle(), "Participants unavailable")
@@ -71,22 +73,56 @@ TestCase {
     var delivered = panel.messageReceiptTimestamp(100)
     var read = panel.messageReceiptTimestamp(120)
     compare(panel.messageReceiptTooltip({
+      receipt: 2,
+      delivered_to: [{
+        jid: "dave@s.whatsapp.net", name: "Dave", delivered_at: 100
+      }]
+    }), "Delivered\nDave · " + delivered)
+    compare(panel.messageReceiptTooltip({
       receipt: 3,
       delivered_at: 100,
       read_at: 120,
+      delivered_to: [
+        { jid: "alice@s.whatsapp.net", name: "Alice", delivered_at: 100 }
+      ],
       read_by: [
         { jid: "alice@s.whatsapp.net", name: "Alice", read_at: 120 }
       ]
-    }), "Read\nDelivered at " + delivered + "\nRead at " + read
-      + "\nRead by Alice · " + read)
+    }), "Read\nAlice · " + read)
     compare(panel.messageReceiptTooltip({ receipt: 3, read_by: [
       { jid: "alice@s.whatsapp.net", name: "Alice" }
-    ] }), "Read\nRead by Alice")
+    ] }), "Read\nAlice")
     compare(panel.messageReceiptTooltip({ receipt: 3, read_by: [
       { jid: "bob@s.whatsapp.net", name: "Bob" },
       { jid: "alice@s.whatsapp.net", name: "Alice" },
       { jid: "alice@s.whatsapp.net", name: "Duplicate" }
-    ] }), "Read\nRead by:\nAlice\nBob")
+    ] }), "Read\nAlice\nBob")
+    var mixedGroups = panel.messageReceiptGroups({
+      receipt: 3,
+      delivered_to: [
+        { jid: "alice@s.whatsapp.net", name: "Alice", delivered_at: 100 },
+        { jid: "dave@s.whatsapp.net", name: "Dave", delivered_at: 100 },
+        { jid: "dave@s.whatsapp.net", name: "Duplicate", delivered_at: 101 }
+      ],
+      read_by: [
+        { jid: "alice@s.whatsapp.net", name: "Alice", read_at: 120 }
+      ]
+    })
+    compare(mixedGroups.length, 2)
+    compare(mixedGroups[0].label, "Read")
+    compare(mixedGroups[0].entries[0], "Alice · " + read)
+    compare(mixedGroups[1].label, "Delivered")
+    compare(mixedGroups[1].entries[0], "Dave · " + delivered)
+    compare(panel.messageReceiptTooltip({
+      receipt: 3,
+      delivered_to: [
+        { jid: "alice@s.whatsapp.net", name: "Alice", delivered_at: 100 },
+        { jid: "dave@s.whatsapp.net", name: "Dave", delivered_at: 100 }
+      ],
+      read_by: [
+        { jid: "alice@s.whatsapp.net", name: "Alice", read_at: 120 }
+      ]
+    }), "Read\nAlice · " + read + "\n\nDelivered\nDave · " + delivered)
 
     service.chats = [{
       jid: "alice@s.whatsapp.net", name: "Alice", phone_number: "316123",

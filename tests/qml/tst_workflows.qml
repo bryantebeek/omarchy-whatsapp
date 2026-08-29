@@ -134,6 +134,8 @@ TestCase {
     tryCompare(subtitle, "text", "online")
     service.chatStateLabels = ({ "alice@s.whatsapp.net": "typing…" })
     tryCompare(subtitle, "text", "typing…")
+    compare(subtitle.showingChatActivity, true)
+    compare(subtitle.color, panel.accent)
     tryCompare(alicePreview, "text", "Typing…")
     compare(alicePreview.color, panel.accent)
     compare(teamPreview.text, "Release ready")
@@ -141,12 +143,15 @@ TestCase {
     service.chatStateLabels = ({})
     service.presenceLabelResult = "last seen today at 13:07"
     tryCompare(subtitle, "text", "last seen today at 13:07")
+    compare(subtitle.showingChatActivity, false)
+    compare(subtitle.color, panel.foreground)
     tryCompare(alicePreview, "text", "Lunch?")
     compare(String(alicePreview.color), String(panel.sidebarSecondary))
 
     panel.chooseChat("team@g.us")
     service.chatStateLabels = ({ "team@g.us": "Alice and Bob are typing…" })
     tryCompare(subtitle, "text", "Alice and Bob are typing…")
+    compare(subtitle.color, panel.accent)
     tryCompare(teamPreview, "text", "Alice and Bob are typing…")
     compare(teamPreview.color, panel.accent)
   }
@@ -206,6 +211,11 @@ TestCase {
         receipt: 3,
         delivered_at: 102,
         read_at: 103,
+        delivered_to: [{
+          jid: "alice@s.whatsapp.net", name: "Alice", delivered_at: 102
+        }, {
+          jid: "bob@s.whatsapp.net", name: "Bob", delivered_at: 102
+        }],
         read_by: [{
           jid: "alice@s.whatsapp.net", name: "Alice", read_at: 103
         }]
@@ -215,12 +225,12 @@ TestCase {
     var receiptStatus = control("messageReceiptStatus-m2")
     compare(receiptStatus.text, "✓✓")
     compare(receiptStatus.color, panel.accent)
-    compare(receiptStatus.font.pixelSize, 13)
-    compare(receiptStatus.parent.parent.spacing, 4)
+    compare(receiptStatus.font.pixelSize, 14)
+    compare(receiptStatus.font.letterSpacing, -3)
+    compare(receiptStatus.parent.parent.spacing, 8)
     compare(receiptStatus.receiptTooltipText,
-      "Read\nDelivered at " + panel.messageReceiptTimestamp(102)
-      + "\nRead at " + panel.messageReceiptTimestamp(103)
-      + "\nRead by Alice · " + panel.messageReceiptTimestamp(103))
+      "Read\nAlice · " + panel.messageReceiptTimestamp(103)
+      + "\n\nDelivered\nBob · " + panel.messageReceiptTimestamp(102))
     var receiptHoverTarget = control("messageReceiptHoverTarget-m2")
     verify(receiptHoverTarget.width > 0,
       "Receipt hover target must have a positive width")
@@ -236,13 +246,24 @@ TestCase {
     compare(receiptTooltip.padding, 0)
     compare(receiptTooltip.background.color, Color.tooltip.background)
     compare(receiptTooltip.background.radius, 0)
-    compare(receiptTooltip.contentItem.color, Color.tooltip.text)
-    compare(receiptTooltip.contentItem.font.family, panel.fontFamily)
-    compare(receiptTooltip.contentItem.font.pixelSize, Style.font.bodySmall)
-    compare(receiptTooltip.contentItem.leftPadding,
+    compare(receiptTooltip.contentItem.groups.length, 2)
+    compare(receiptTooltip.contentItem.groups[0].label, "Read")
+    compare(receiptTooltip.contentItem.groups[0].entries[0],
+      "Alice · " + panel.messageReceiptTimestamp(103))
+    compare(receiptTooltip.contentItem.groups[1].label, "Delivered")
+    compare(receiptTooltip.contentItem.groups[1].entries[0],
+      "Bob · " + panel.messageReceiptTimestamp(102))
+    compare(receiptTooltip.contentItem.groupSpacing, Style.space(6))
+    compare(receiptTooltip.contentItem.headerColor, Qt.rgba(
+      Color.tooltip.text.r, Color.tooltip.text.g, Color.tooltip.text.b,
+      Color.tooltip.text.a * 0.72))
+    compare(receiptTooltip.contentItem.detailColor, Color.tooltip.text)
+    compare(receiptTooltip.contentItem.contentFontFamily, panel.fontFamily)
+    compare(receiptTooltip.contentItem.contentFontSize, Style.font.bodySmall)
+    compare(receiptTooltip.contentItem.leftInset,
       Border.left(receiptTooltip.tooltipBorderSpec)
       + Style.spacing.controlPaddingX)
-    compare(receiptTooltip.contentItem.topPadding,
+    compare(receiptTooltip.contentItem.topInset,
       Border.top(receiptTooltip.tooltipBorderSpec)
       + Style.spacing.controlPaddingY)
     compare(control("messageTimestamp-m2").font.pixelSize, 10)
@@ -397,6 +418,68 @@ TestCase {
     service.connectionState = "connected"
     service.lastError = ""
     tryCompare(panel, "paired", true)
+  }
+
+  function test_render_and_download_stickers() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var previewPath = String(Qt.resolvedUrl("fixtures/pixel.svg"))
+    previewPath = decodeURIComponent(previewPath.substring("file://".length))
+    service.loadMessages([{
+      id: "sticker-1",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "alice@s.whatsapp.net",
+      sender_name: "Alice",
+      text: "[Sticker]",
+      timestamp: 100,
+      media: {
+        kind: "sticker",
+        path: "/private/sticker.webp",
+        thumbnail_path: previewPath,
+        downloaded: false,
+        mime_type: "image/webp",
+        width: 512,
+        height: 512,
+        animated: true,
+        lottie: false,
+        accessibility_label: "Dancing parrot"
+      }
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    var stickerDelegate = control("messageDelegate-sticker-1")
+    compare(stickerDelegate.isSticker, true)
+    compare(control("stickerCard-sticker-1").active, true)
+    verify(String(control("stickerImage-sticker-1").source)
+      .indexOf("/fixtures/pixel.svg") >= 0)
+    compare(findChild(panel, "stickerDownloadButton-sticker-1"), null)
+    compare(service.downloadedMessages.length, 1)
+    compare(service.downloadedMessages[0].id, "sticker-1")
+    compare(control("stickerDownloadStatus-sticker-1").active, true)
+
+    service.loadMessages([{
+      id: "lottie-1",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "alice@s.whatsapp.net",
+      sender_name: "Alice",
+      text: "[Sticker]",
+      timestamp: 101,
+      media: {
+        kind: "sticker",
+        path: "",
+        thumbnail_path: previewPath,
+        downloaded: false,
+        mime_type: "application/json",
+        width: 512,
+        height: 512,
+        animated: true,
+        lottie: true,
+        accessibility_label: "Waving hand"
+      }
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    tryCompare(control("stickerCard-lottie-1"), "lottie", true)
+    compare(findChild(panel, "stickerDownloadButton-lottie-1"), null)
+    compare(service.downloadedMessages.length, 1)
+    compare(control("stickerDownloadStatus-lottie-1").active, false)
   }
 
   function test_unread_filter_preserves_selected_chat() {

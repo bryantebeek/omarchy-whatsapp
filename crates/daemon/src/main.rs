@@ -14,7 +14,8 @@ use database::Database;
 use futures::StreamExt;
 use omarchy_whatsapp_protocol::{
     AppPaths, Chat, ChatParticipant, ChatState, ClientFrame, Command, ConnectionStatus, Message,
-    MessageMedia, MessageReader, PROTOCOL_VERSION, PollOption, ServerEvent, ServerFrame,
+    MessageDelivery, MessageMedia, MessageReader, PROTOCOL_VERSION, PollOption, ServerEvent,
+    ServerFrame,
 };
 use qrcode::{QrCode, render::svg};
 use std::collections::{HashMap, HashSet};
@@ -135,6 +136,11 @@ async fn clear_local_account_data(paths: &AppPaths, shared: &Shared) -> Result<(
 enum PendingMedia {
     Image {
         image: wa::message::ImageMessage,
+        chat_jid: String,
+        message_id: String,
+    },
+    Sticker {
+        sticker: wa::message::StickerMessage,
         chat_jid: String,
         message_id: String,
     },
@@ -469,6 +475,7 @@ impl Shared {
             receipt: u8::from(info.source.is_from_me),
             delivered_at: None,
             read_at: None,
+            delivered_to: Vec::new(),
             read_by: Vec::new(),
             media,
             reactions: Vec::new(),
@@ -514,6 +521,19 @@ impl Shared {
         {
             warn!(%error, %chat_jid, message_id = %info.id,
                 "could not persist WhatsApp audio download metadata");
+        }
+        if let Some((sticker, lottie)) = sticker_message(base) {
+            let mut sticker = sticker.clone();
+            if lottie {
+                sticker.is_lottie = Some(true);
+            }
+            if let Err(error) =
+                self.database
+                    .store_media_download(&chat_jid, &info.id, &sticker.encode_to_vec())
+            {
+                warn!(%error, %chat_jid, message_id = %info.id,
+                    "could not persist WhatsApp sticker download metadata");
+            }
         }
         if insert_result.is_ok()
             && info.source.is_group
@@ -675,6 +695,16 @@ impl Shared {
                         if let Some(image) = base.image_message.as_option().cloned() {
                             pending_media.push(PendingMedia::Image {
                                 image,
+                                chat_jid: chat_jid.clone(),
+                                message_id: message.id.clone(),
+                            });
+                        } else if let Some((sticker, lottie)) = sticker_message(base) {
+                            let mut sticker = sticker.clone();
+                            if lottie {
+                                sticker.is_lottie = Some(true);
+                            }
+                            pending_media.push(PendingMedia::Sticker {
+                                sticker,
                                 chat_jid: chat_jid.clone(),
                                 message_id: message.id.clone(),
                             });
@@ -989,6 +1019,18 @@ fn video_message(message: &wa::Message) -> Option<&wa::message::VideoMessage> {
         .or_else(|| message.ptv_message.as_option())
 }
 
+fn sticker_message(message: &wa::Message) -> Option<(&wa::message::StickerMessage, bool)> {
+    if let Some(sticker) = message.sticker_message.as_option() {
+        return Some((sticker, sticker.is_lottie.unwrap_or(false)));
+    }
+    let inner = message
+        .lottie_sticker_message
+        .as_option()?
+        .message
+        .as_option()?;
+    sticker_message(inner).map(|(sticker, _)| (sticker, true))
+}
+
 fn poll_creation_message(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
     message
         .poll_creation_message_v6
@@ -1124,6 +1166,44 @@ fn message_media(
                 .unwrap_or_else(|| "image/jpeg".to_owned()),
             width: image.width.unwrap_or(0),
             height: image.height.unwrap_or(0),
+        });
+    }
+    if let Some((sticker, lottie)) = sticker_message(message) {
+        let path = assets::message_sticker_path(directory, chat_jid, message_id);
+        let thumbnail_path = assets::cache_message_sticker_thumbnail(
+            directory,
+            chat_jid,
+            message_id,
+            sticker.png_thumbnail.as_ref(),
+        )
+        .unwrap_or_else(|error| {
+            warn!(%error, "could not cache WhatsApp sticker thumbnail");
+            assets::message_sticker_thumbnail_path(directory, chat_jid, message_id)
+        });
+        assets::prune_media_cache(
+            directory,
+            if path.exists() {
+                &path
+            } else {
+                &thumbnail_path
+            },
+        );
+        return Some(MessageMedia::Sticker {
+            path: path.to_string_lossy().into_owned(),
+            thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+            downloaded: !lottie && path.exists(),
+            mime_type: sticker.mimetype.clone().unwrap_or_else(|| {
+                if lottie {
+                    "application/json".to_owned()
+                } else {
+                    "image/webp".to_owned()
+                }
+            }),
+            width: sticker.width.unwrap_or(0),
+            height: sticker.height.unwrap_or(0),
+            animated: sticker.is_animated.unwrap_or(false) || lottie,
+            lottie,
+            accessibility_label: sticker.accessibility_label.clone().unwrap_or_default(),
         });
     }
     if let Some(video) = video_message(message) {
@@ -1682,6 +1762,15 @@ async fn download_pending_media(
                     &message_id,
                     &image.encode_to_vec(),
                 ),
+                PendingMedia::Sticker {
+                    sticker,
+                    chat_jid,
+                    message_id,
+                } => shared.database.store_media_download(
+                    &chat_jid,
+                    &message_id,
+                    &sticker.encode_to_vec(),
+                ),
                 PendingMedia::Video {
                     video,
                     chat_jid,
@@ -2012,6 +2101,7 @@ fn history_message(
         receipt: u8::from(from_me),
         delivered_at: None,
         read_at: None,
+        delivered_to: Vec::new(),
         read_by: Vec::new(),
         media,
         reactions: Vec::new(),
@@ -2111,7 +2201,7 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
             };
             if state > 0 {
                 let chat_jid = canonical_contact_jid(&shared, &client, &receipt.source.chat).await;
-                let reader = if state >= 3
+                let recipient = if state >= 2
                     && (!receipt.source.chat.is_group()
                         || receipt.source.sender != receipt.source.chat)
                 {
@@ -2124,9 +2214,23 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                         .or_else(|| shared.database.chat_name(&jid).ok().flatten())
                         .filter(|name| name != &jid)
                         .unwrap_or_default();
-                    Some(MessageReader {
-                        jid,
-                        name,
+                    Some((jid, name))
+                } else {
+                    None
+                };
+                let delivery = if state == 2 {
+                    recipient.as_ref().map(|(jid, name)| MessageDelivery {
+                        jid: jid.clone(),
+                        name: name.clone(),
+                        delivered_at: Some(receipt.timestamp.timestamp()),
+                    })
+                } else {
+                    None
+                };
+                let reader = if state >= 3 {
+                    recipient.as_ref().map(|(jid, name)| MessageReader {
+                        jid: jid.clone(),
+                        name: name.clone(),
                         read_at: Some(receipt.timestamp.timestamp()),
                     })
                 } else {
@@ -2136,7 +2240,7 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                     &chat_jid,
                     &receipt.message_ids,
                     state,
-                    reader.as_ref().map(|reader| reader.jid.as_str()),
+                    recipient.as_ref().map(|(jid, _)| jid.as_str()),
                     receipt.timestamp.timestamp(),
                 ) {
                     Ok(true) => {
@@ -2146,6 +2250,7 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                                 message_ids: receipt.message_ids.clone(),
                                 receipt: state,
                                 timestamp: receipt.timestamp.timestamp(),
+                                delivery,
                                 reader,
                             }));
                     }
@@ -3230,6 +3335,7 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 receipt: 1,
                 delivered_at: None,
                 read_at: None,
+                delivered_to: Vec::new(),
                 read_by: Vec::new(),
                 media: None,
                 reactions: Vec::new(),
@@ -3306,6 +3412,7 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 receipt: 1,
                 delivered_at: None,
                 read_at: None,
+                delivered_to: Vec::new(),
                 read_by: Vec::new(),
                 media: Some(MessageMedia::Poll {
                     question,
@@ -3477,6 +3584,83 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                     .update_message_media(&chat_jid, &message_id, &media)?;
                 assets::download_message_image(client, image, path).await?;
                 if let MessageMedia::Image { downloaded, .. } = &mut media {
+                    *downloaded = true;
+                }
+                Result::<MessageMedia>::Ok(media)
+            }
+            .await;
+            shared.media_downloads.lock().await.remove(&key);
+            Ok(ServerEvent::MediaDownloaded {
+                media: result?,
+                chat_jid,
+                message_id,
+            })
+        }
+        Command::DownloadSticker {
+            chat_jid,
+            message_id,
+        } => {
+            if message_id.is_empty() || message_id.len() > 512 {
+                bail!("invalid sticker message ID");
+            }
+            let client = shared
+                .client
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+            let chat_jid = canonical_requested_jid(shared, &chat_jid).await;
+            if shared
+                .database
+                .message_media_kind(&chat_jid, &message_id)?
+                .as_deref()
+                != Some("sticker")
+            {
+                bail!("message is not a sticker");
+            }
+            let key = format!("{chat_jid}\0{message_id}");
+            {
+                let mut downloads = shared.media_downloads.lock().await;
+                if !downloads.insert(key.clone()) {
+                    bail!("this sticker is already downloading");
+                }
+            }
+
+            let result = async {
+                let payload =
+                    media_download_payload(shared, &client, &chat_jid, &message_id, "sticker")
+                        .await?;
+                let sticker = wa::message::StickerMessage::decode_from_slice(&payload)
+                    .context("reading sticker download metadata")?;
+                if sticker.is_lottie.unwrap_or(false) {
+                    bail!("Lottie sticker animation is not supported safely");
+                }
+                let path = assets::message_sticker_path(&shared.media_dir, &chat_jid, &message_id);
+                let thumbnail_path = assets::cache_message_sticker_thumbnail(
+                    &shared.media_dir,
+                    &chat_jid,
+                    &message_id,
+                    sticker.png_thumbnail.as_ref(),
+                )?;
+                let mut media = MessageMedia::Sticker {
+                    path: path.to_string_lossy().into_owned(),
+                    thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+                    downloaded: path.exists(),
+                    mime_type: sticker
+                        .mimetype
+                        .clone()
+                        .unwrap_or_else(|| "image/webp".to_owned()),
+                    width: sticker.width.unwrap_or(0),
+                    height: sticker.height.unwrap_or(0),
+                    animated: sticker.is_animated.unwrap_or(false),
+                    lottie: false,
+                    accessibility_label: sticker.accessibility_label.clone().unwrap_or_default(),
+                };
+                shared
+                    .database
+                    .update_message_media(&chat_jid, &message_id, &media)?;
+                assets::download_message_sticker(client, sticker, path).await?;
+                if let MessageMedia::Sticker { downloaded, .. } = &mut media {
                     *downloaded = true;
                 }
                 Result::<MessageMedia>::Ok(media)
@@ -4408,6 +4592,87 @@ mod tests {
         };
         assert_eq!(media_text(&control, ""), None);
         assert_eq!(media_placeholder("unknown"), None);
+    }
+
+    #[test]
+    fn static_animated_and_lottie_stickers_become_structured_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_dir = directory.path().join("media");
+        assets::private_dir(&media_dir).unwrap();
+        let sticker = wa::message::StickerMessage {
+            mimetype: Some("image/webp".into()),
+            file_length: Some(1_024),
+            width: Some(512),
+            height: Some(384),
+            is_animated: Some(true),
+            png_thumbnail: Some(b"\x89PNG\r\n\x1a\nthumbnail".to_vec()),
+            accessibility_label: Some("Dancing parrot".into()),
+            ..Default::default()
+        };
+        let direct = wa::Message {
+            sticker_message: MessageField::some(sticker.clone()),
+            ..Default::default()
+        };
+        let direct_media =
+            message_media(&direct, &media_dir, "1@s.whatsapp.net", "sticker", 10, 0).unwrap();
+        let MessageMedia::Sticker {
+            path,
+            thumbnail_path,
+            downloaded,
+            animated,
+            lottie,
+            accessibility_label,
+            width,
+            height,
+            ..
+        } = direct_media
+        else {
+            panic!("expected sticker media")
+        };
+        assert!(path.ends_with(".sticker.webp"));
+        assert_eq!(
+            std::fs::read(thumbnail_path).unwrap(),
+            b"\x89PNG\r\n\x1a\nthumbnail"
+        );
+        assert!(!downloaded);
+        assert!(animated);
+        assert!(!lottie);
+        assert_eq!((width, height), (512, 384));
+        assert_eq!(accessibility_label, "Dancing parrot");
+
+        let lottie_message = wa::Message {
+            lottie_sticker_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message {
+                    sticker_message: MessageField::some(sticker),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let MessageMedia::Sticker {
+            downloaded,
+            animated,
+            lottie,
+            ..
+        } = message_media(
+            &lottie_message,
+            &media_dir,
+            "1@s.whatsapp.net",
+            "lottie",
+            11,
+            0,
+        )
+        .unwrap()
+        else {
+            panic!("expected Lottie sticker media")
+        };
+        assert!(!downloaded);
+        assert!(animated);
+        assert!(lottie);
+        assert_eq!(
+            media_text(&lottie_message, "sticker"),
+            Some("[Sticker]".into())
+        );
     }
 
     #[test]

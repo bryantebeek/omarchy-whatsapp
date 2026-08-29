@@ -128,6 +128,7 @@ mod tests {
             receipt: 0,
             delivered_at: None,
             read_at: None,
+            delivered_to: Vec::new(),
             read_by: Vec::new(),
             media: None,
             reactions: Vec::new(),

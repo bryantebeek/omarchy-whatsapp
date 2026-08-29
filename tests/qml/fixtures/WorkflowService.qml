@@ -126,6 +126,11 @@ QtObject {
     messagesFirstUnreadId = String(firstUnreadId || "")
     messagesResponseHasFollowup = false
     messagesResponseSerial++
+    for (var i = 0; i < messages.length; i++) {
+      var media = messages[i] ? messages[i].media || null : null
+      if (media && media.kind === "sticker" && media.downloaded !== true
+          && media.lottie !== true) downloadMedia(messages[i])
+    }
   }
 
   function replaceMessages(items, preservePosition) {
@@ -140,7 +145,12 @@ QtObject {
 
   function messageMedia(message) { return message ? message.media || null : null }
   function messageMediaRevision() { return "0-0" }
-  function mediaDownloading() { return false }
+  function mediaDownloading(message) {
+    var id = String(message ? message.id || "" : "")
+    for (var i = 0; i < downloadedMessages.length; i++)
+      if (String((downloadedMessages[i] || {}).id || "") === id) return true
+    return false
+  }
   function fileUrl(path, revision) {
     return path ? "file://" + String(path) + "?v=" + String(revision || 0) : ""
   }

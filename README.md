@@ -29,12 +29,15 @@ mind.
 The app renders contact, group, and group-participant avatars; online and
 last-seen presence; direct and group typing/recording indicators; encrypted
 image, video, and voice messages; documents; static/live-location cards; and
-synchronized emoji reactions. Poll cards show live vote totals and let you vote
-or revise your selection; new single- or multiple-answer polls can be created
-from the composer. Voice notes download on demand and play inline. Reaction
+static and animated WebP stickers, downloaded automatically when their
+conversation loads. It also synchronizes emoji reactions. Lottie
+stickers show their embedded static preview without passing sender-controlled
+animation JSON to Qt's in-process Lottie renderer. Poll cards show live vote
+totals and let you vote or revise your selection; new single- or multiple-answer
+polls can be created from the composer. Voice notes download on demand and play inline. Reaction
 chips aggregate matching emoji and support adding, changing, and removing your
 reaction. Location cards open in the system browser using OpenStreetMap,
-avoiding an embedded browser engine. Stickers, full calling, search, and group
+avoiding an embedded browser engine. Full calling, search, and group
 administration are not yet implemented. The roadmap below separates
 package-backed work from app-specific scope.
 
@@ -66,8 +69,11 @@ live-deployment work required by this repository's quality gates.
 - [ ] Keep or unkeep messages in disappearing chats.
 - [ ] Pin and unpin individual messages, with supported pin durations.
 - [ ] Send played receipts after voice and video messages are actually played.
-- [ ] Render and download static, animated, and Lottie stickers instead of a
-  placeholder.
+- [x] Render and automatically download static and animated WebP stickers, with
+  private PNG previews and accessibility-label fallbacks.
+- [ ] Render Lottie sticker animation in a sandboxed helper. Until then, show
+  its embedded PNG preview rather than loading untrusted animation JSON in the
+  shell process.
 - [ ] Fetch first-party sticker packs and create, upload, and send custom
   sticker packs.
 - [ ] Create structured events with descriptions, times, locations, call

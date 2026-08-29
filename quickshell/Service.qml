@@ -337,6 +337,24 @@ Item {
         ? deliveredAt : 0
       var readAt = Math.floor(Number(source.read_at || 0))
       source.read_at = isFinite(readAt) && readAt > 0 ? readAt : 0
+      var deliveries = copyArray(source.delivered_to)
+      var normalizedDeliveries = []
+      var seenDeliveries = ({})
+      for (var deliveryIndex = 0;
+          deliveryIndex < deliveries.length; deliveryIndex++) {
+        var delivery = deliveries[deliveryIndex] || {}
+        var deliveryJid = String(delivery.jid || "")
+        if (!deliveryJid || seenDeliveries[deliveryJid] === true) continue
+        seenDeliveries[deliveryJid] = true
+        var recipientDeliveredAt = Math.floor(Number(delivery.delivered_at || 0))
+        normalizedDeliveries.push({
+          jid: deliveryJid,
+          name: String(delivery.name || ""),
+          delivered_at: isFinite(recipientDeliveredAt) && recipientDeliveredAt > 0
+            ? recipientDeliveredAt : 0
+        })
+      }
+      source.delivered_to = normalizedDeliveries
       var readers = copyArray(source.read_by)
       var normalizedReaders = []
       var seenReaders = ({})
@@ -381,6 +399,8 @@ Item {
     var changed = false
     var eventTimestamp = Math.floor(Number(frame ? frame.timestamp || 0 : 0))
     if (!isFinite(eventTimestamp) || eventTimestamp <= 0) eventTimestamp = 0
+    var eventDelivery = frame && frame.delivery ? frame.delivery : null
+    var eventDeliveryJid = String(eventDelivery ? eventDelivery.jid || "" : "")
     var eventReader = frame && frame.reader ? frame.reader : null
     var eventReaderJid = String(eventReader ? eventReader.jid || "" : "")
     for (var messageIndex = 0; messageIndex < updated.length; messageIndex++) {
@@ -403,6 +423,52 @@ Item {
           && (!readAt || eventTimestamp < readAt)) {
         if (!replacement) replacement = Object.assign({}, message)
         replacement.read_at = eventTimestamp
+      }
+      if (nextReceipt === 2 && eventDeliveryJid) {
+        var deliveredTo = copyArray(message.delivered_to)
+        var existingDelivery = -1
+        for (var deliveryIndex = 0;
+            deliveryIndex < deliveredTo.length; deliveryIndex++) {
+          if (String((deliveredTo[deliveryIndex] || {}).jid || "")
+              === eventDeliveryJid) {
+            existingDelivery = deliveryIndex
+            break
+          }
+        }
+        var nextDeliveredAt = Math.floor(Number(
+          eventDelivery.delivered_at || eventTimestamp || 0))
+        if (!isFinite(nextDeliveredAt) || nextDeliveredAt <= 0)
+          nextDeliveredAt = 0
+        var nextDelivery = {
+          jid: eventDeliveryJid,
+          name: String(eventDelivery.name || ""),
+          delivered_at: nextDeliveredAt
+        }
+        if (existingDelivery < 0) {
+          deliveredTo.push(nextDelivery)
+          if (!replacement) replacement = Object.assign({}, message)
+          replacement.delivered_to = deliveredTo
+        } else {
+          var currentDelivery = deliveredTo[existingDelivery] || {}
+          var currentDeliveredAt = Math.floor(Number(
+            currentDelivery.delivered_at || 0))
+          var deliveryNameChanged = nextDelivery.name
+            && String(currentDelivery.name || "") !== nextDelivery.name
+          var deliveryTimeChanged = nextDelivery.delivered_at
+            && (!currentDeliveredAt
+              || nextDelivery.delivered_at < currentDeliveredAt)
+          if (deliveryNameChanged || deliveryTimeChanged) {
+            deliveredTo[existingDelivery] = {
+              jid: eventDeliveryJid,
+              name: deliveryNameChanged ? nextDelivery.name
+                : String(currentDelivery.name || ""),
+              delivered_at: deliveryTimeChanged
+                ? nextDelivery.delivered_at : currentDeliveredAt
+            }
+            if (!replacement) replacement = Object.assign({}, message)
+            replacement.delivered_to = deliveredTo
+          }
+        }
       }
       if (nextReceipt >= 3 && eventReaderJid) {
         var readBy = copyArray(message.read_by)
@@ -622,9 +688,11 @@ Item {
     if (!message || !message.chat_jid || !message.id || mediaDownloading(message))
       return false
     var kind = String(message.media ? message.media.kind || "" : "")
+    if (kind === "sticker" && message.media.lottie === true) return false
     var command = kind === "image" ? "download_image"
-      : (kind === "video" ? "download_video"
-        : (kind === "audio" ? "download_audio" : ""))
+      : (kind === "sticker" ? "download_sticker"
+        : (kind === "video" ? "download_video"
+          : (kind === "audio" ? "download_audio" : "")))
     if (!command) return false
     var requestId = send(command, {
       chat_jid: String(message.chat_jid),
@@ -639,6 +707,19 @@ Item {
     mediaDownloadRequests = requests
     mediaDownloadRequestIds = requestIds
     return true
+  }
+
+  function autoDownloadStickers(value) {
+    var items = copyArray(value)
+    var started = 0
+    for (var i = 0; i < items.length; i++) {
+      var message = items[i] || {}
+      var media = message.media || null
+      if (!media || media.kind !== "sticker" || media.downloaded === true
+          || media.lottie === true) continue
+      if (downloadMedia(message)) started++
+    }
+    return started
   }
 
   function finishMediaDownloadRequest(frame) {
@@ -876,6 +957,7 @@ Item {
         mediaRevision++
         mediaOverrides = ({})
         mediaOverrideRevisions = ({})
+        autoDownloadStickers(messages)
         messagesResponseSerial++
         var requested = {}
         for (var i = messages.length - 1; i >= 0 && i >= messages.length - 40; i--) {

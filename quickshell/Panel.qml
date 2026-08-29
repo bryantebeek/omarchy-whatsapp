@@ -255,11 +255,17 @@ Item {
       ? " + " + remaining + (remaining === 1 ? " other" : " others") : "")
   }
 
+  function conversationChatActivity() {
+    if (!service || !service.selectedChat) return ""
+    var chat = service.selectedChat
+    return typeof service.chatStateLabel === "function"
+      ? service.chatStateLabel(chat.jid, chat.is_group === true) : ""
+  }
+
   function conversationActivitySubtitle() {
     if (!service || !service.selectedChat) return ""
     var chat = service.selectedChat
-    var activity = typeof service.chatStateLabel === "function"
-      ? service.chatStateLabel(chat.jid, chat.is_group === true) : ""
+    var activity = conversationChatActivity()
     if (activity) return activity
     if (chat.is_group === true) return groupConversationSubtitle()
     var presence = typeof service.presenceLabel === "function"
@@ -814,42 +820,76 @@ Item {
     return value > 0 ? Model.messageTime(value, root.messageTimeFormat) : ""
   }
 
-  function messageReceiptTooltip(message) {
-    var lines = [root.messageReceiptLabel(message ? message.receipt : 0)]
-    var deliveredAt = root.messageReceiptTimestamp(
-      message ? message.delivered_at : 0)
-    var readAt = root.messageReceiptTimestamp(message ? message.read_at : 0)
-    if (deliveredAt) lines.push("Delivered at " + deliveredAt)
-    if (readAt) lines.push("Read at " + readAt)
-    var readers = message ? message.read_by : null
-    if (!readers || typeof readers.length !== "number") return lines.join("\n")
-    var entries = []
-    var seen = ({})
-    for (var i = 0; i < readers.length; i++) {
-      var reader = readers[i] || {}
-      var jid = String(reader.jid || "")
-      if (!jid || seen[jid] === true) continue
-      seen[jid] = true
-      entries.push({
-        name: Model.friendlyName(reader.name, jid),
-        read_at: root.messageReceiptTimestamp(reader.read_at)
-      })
+  function messageReceiptGroups(message) {
+    var value = message || {}
+    var readJids = ({})
+    var readEntries = []
+    var readers = value.read_by
+    if (readers && typeof readers.length === "number") {
+      for (var readerIndex = 0; readerIndex < readers.length; readerIndex++) {
+        var reader = readers[readerIndex] || {}
+        var readerJid = String(reader.jid || "")
+        if (!readerJid || readJids[readerJid] === true) continue
+        readJids[readerJid] = true
+        var readerName = Model.friendlyName(reader.name, readerJid)
+        var readerTime = root.messageReceiptTimestamp(reader.read_at)
+        readEntries.push({
+          name: readerName,
+          text: readerName + (readerTime ? " · " + readerTime : "")
+        })
+      }
     }
-    entries.sort(function (left, right) {
+    readEntries.sort(function (left, right) {
       return left.name.localeCompare(right.name)
     })
-    if (!entries.length) return lines.join("\n")
-    if (entries.length === 1) {
-      lines.push("Read by " + entries[0].name
-        + (entries[0].read_at ? " · " + entries[0].read_at : ""))
-      return lines.join("\n")
+
+    var deliveredJids = ({})
+    var deliveredEntries = []
+    var deliveries = value.delivered_to
+    if (deliveries && typeof deliveries.length === "number") {
+      for (var deliveryIndex = 0;
+          deliveryIndex < deliveries.length; deliveryIndex++) {
+        var delivery = deliveries[deliveryIndex] || {}
+        var deliveryJid = String(delivery.jid || "")
+        if (!deliveryJid || readJids[deliveryJid] === true
+            || deliveredJids[deliveryJid] === true) continue
+        deliveredJids[deliveryJid] = true
+        var deliveryName = Model.friendlyName(delivery.name, deliveryJid)
+        var deliveryTime = root.messageReceiptTimestamp(delivery.delivered_at)
+        deliveredEntries.push({
+          name: deliveryName,
+          text: deliveryName + (deliveryTime ? " · " + deliveryTime : "")
+        })
+      }
     }
-    lines.push("Read by:")
-    for (var entryIndex = 0; entryIndex < entries.length; entryIndex++)
-      lines.push(entries[entryIndex].name
-        + (entries[entryIndex].read_at
-          ? " · " + entries[entryIndex].read_at : ""))
-    return lines.join("\n")
+    deliveredEntries.sort(function (left, right) {
+      return left.name.localeCompare(right.name)
+    })
+
+    var groups = []
+    if (readEntries.length) groups.push({
+      label: Number(value.receipt || 0) >= 4 ? "Played" : "Read",
+      entries: readEntries.map(function (entry) { return entry.text })
+    })
+    if (deliveredEntries.length) groups.push({
+      label: "Delivered",
+      entries: deliveredEntries.map(function (entry) { return entry.text })
+    })
+    if (!groups.length) groups.push({
+      label: root.messageReceiptLabel(value.receipt),
+      entries: []
+    })
+    return groups
+  }
+
+  function messageReceiptTooltip(message) {
+    var groups = root.messageReceiptGroups(message)
+    var sections = []
+    for (var groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+      var group = groups[groupIndex]
+      sections.push([group.label].concat(group.entries).join("\n"))
+    }
+    return sections.join("\n\n")
   }
 
   Timer {
@@ -2163,10 +2203,13 @@ Item {
                         Text {
                           id: conversationSubtitle
                           objectName: "conversationSubtitle"
+                          readonly property bool showingChatActivity:
+                            root.conversationChatActivity() !== ""
                           visible: root.service && root.service.selectedChat
                             && conversationSubtitle.text !== ""
                           text: root.conversationActivitySubtitle()
-                          color: root.foreground
+                          color: showingChatActivity
+                            ? root.accent : root.foreground
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.caption
                           width: Math.min(implicitWidth,
@@ -2241,8 +2284,11 @@ Item {
                         ? reactionsData.length : 0
                       readonly property bool isPoll: mediaData
                         && mediaData.kind === "poll"
+                      readonly property bool isSticker: mediaData
+                        && mediaData.kind === "sticker"
                       readonly property bool hasStructuredMedia: mediaData
                         && (mediaData.kind === "image"
+                          || mediaData.kind === "sticker"
                           || mediaData.kind === "video"
                           || mediaData.kind === "audio"
                           || mediaData.kind === "document"
@@ -2427,6 +2473,8 @@ Item {
 
                       CrispBorderSurface {
                         id: bubble
+                        readonly property bool stickerOnlyMedia:
+                          messageDelegate.isSticker
                         readonly property bool borderOnlyMedia:
                           messageDelegate.mediaData
                           && (messageDelegate.mediaData.kind === "image"
@@ -2438,7 +2486,8 @@ Item {
                           return Qt.rgba(base.r, base.g, base.b, base.a * 0.55)
                         }
                         readonly property real horizontalPadding: borderOnlyMedia
-                          ? borderLeft + borderRight : Style.space(22)
+                          ? borderLeft + borderRight
+                          : (stickerOnlyMedia ? 0 : Style.space(22))
                         readonly property real maximumWidth: messageList.width * 0.72
                         readonly property real maximumMediaWidth:
                           Math.min(maximumWidth, Style.space(340))
@@ -2463,6 +2512,11 @@ Item {
                         readonly property real videoPreviewWidth: Math.max(
                           Style.space(40), Math.min(maximumMediaWidth,
                             Style.space(280) * mediaAspectRatio))
+                        readonly property real stickerAspectRatio: Math.max(
+                          0.5, Math.min(2, mediaAspectRatio))
+                        readonly property real stickerPreviewWidth: Math.max(
+                          Style.space(72), Math.min(maximumMediaWidth,
+                            Style.space(180) * stickerAspectRatio))
 
                         width: messageDelegate.mediaData
                           && messageDelegate.mediaData.kind === "video"
@@ -2470,6 +2524,8 @@ Item {
                           : messageDelegate.mediaData
                             && messageDelegate.mediaData.kind === "image"
                           ? imagePreviewWidth + horizontalPadding
+                          : messageDelegate.isSticker
+                          ? stickerPreviewWidth
                           : messageDelegate.mediaData
                             && messageDelegate.mediaData.kind === "location"
                           ? locationPreviewWidth + horizontalPadding
@@ -2483,14 +2539,15 @@ Item {
                                   + horizontalPadding : 0))
                         height: messageColumn.implicitHeight
                           + (borderOnlyMedia
-                            ? borderTop + borderBottom : Style.space(16))
+                            ? borderTop + borderBottom
+                            : (stickerOnlyMedia ? 0 : Style.space(16)))
                         x: modelData.from_me
                           ? messageDelegate.width - width - Style.space(18)
                           : (messageDelegate.showSenderAvatar
                             ? Style.space(56) : Style.space(18))
-                        radius: borderOnlyMedia
+                        radius: borderOnlyMedia || stickerOnlyMedia
                           ? 0 : Style.cornerRadius + Style.space(6)
-                        color: borderOnlyMedia ? "transparent"
+                        color: borderOnlyMedia || stickerOnlyMedia ? "transparent"
                           : (modelData.from_me
                             ? Style.selectedFillFor(root.foreground, root.accent)
                             : Style.normalFillFor(root.foreground, root.accent))
@@ -2504,9 +2561,11 @@ Item {
                           anchors.left: parent.left
                           anchors.right: parent.right
                           anchors.leftMargin: bubble.borderOnlyMedia
-                            ? bubble.borderLeft : Style.space(11)
+                            ? bubble.borderLeft
+                            : (bubble.stickerOnlyMedia ? 0 : Style.space(11))
                           anchors.rightMargin: bubble.borderOnlyMedia
-                            ? bubble.borderRight : Style.space(11)
+                            ? bubble.borderRight
+                            : (bubble.stickerOnlyMedia ? 0 : Style.space(11))
                           anchors.verticalCenter: parent.verticalCenter
                           spacing: Style.space(3)
                           Text {
@@ -2697,6 +2756,88 @@ Item {
                                 font.family: root.fontFamily
                                 font.pixelSize: root.messageMetaFontSize
                               }
+                            }
+                          }
+                          Item {
+                            id: stickerCard
+                            objectName: "stickerCard-" + String(modelData.id || "")
+                            readonly property bool active: messageDelegate.isSticker
+                            readonly property bool downloaded:
+                              messageDelegate.mediaData
+                              ? messageDelegate.mediaData.downloaded === true : false
+                            readonly property bool lottie: messageDelegate.mediaData
+                              ? messageDelegate.mediaData.lottie === true : false
+                            readonly property string mediaPath:
+                              messageDelegate.mediaData
+                              ? String(messageDelegate.mediaData.path || "") : ""
+                            readonly property string thumbnailPath:
+                              messageDelegate.mediaData
+                              ? String(messageDelegate.mediaData.thumbnail_path || "") : ""
+                            readonly property string displayPath: downloaded
+                              ? mediaPath : thumbnailPath
+                            visible: active
+                            width: parent.width
+                            height: active ? width / bubble.stickerAspectRatio : 0
+
+                            AnimatedImage {
+                              id: stickerImage
+                              objectName: "stickerImage-" + String(modelData.id || "")
+                              anchors.fill: parent
+                              source: stickerCard.active && root.service
+                                ? root.service.fileUrl(stickerCard.displayPath,
+                                  root.service.messageMediaRevision(modelData)) : ""
+                              asynchronous: true
+                              cache: false
+                              fillMode: Image.PreserveAspectFit
+                              onStatusChanged: {
+                                if (status === AnimatedImage.Ready)
+                                  root.scheduleMediaDownloadAnchorRestore(
+                                    modelData.id)
+                              }
+                            }
+
+                            Text {
+                              anchors.centerIn: parent
+                              width: parent.width
+                              visible: String(stickerImage.source) === ""
+                                || stickerImage.status === AnimatedImage.Error
+                              text: messageDelegate.mediaData
+                                && messageDelegate.mediaData.accessibility_label
+                                ? String(messageDelegate.mediaData.accessibility_label)
+                                : (stickerCard.lottie
+                                  ? "Lottie sticker unavailable" : "Sticker unavailable")
+                              color: root.muted
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.caption
+                              wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+                              horizontalAlignment: Text.AlignHCenter
+                            }
+
+                            Text {
+                              anchors.right: parent.right
+                              anchors.bottom: parent.bottom
+                              anchors.margins: Style.space(4)
+                              visible: stickerCard.lottie
+                                && stickerImage.status === AnimatedImage.Ready
+                              text: "Animated sticker"
+                              color: root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: root.messageMetaFontSize
+                            }
+
+                            Text {
+                              objectName: "stickerDownloadStatus-"
+                                + String(modelData.id || "")
+                              readonly property bool active: stickerCard.active
+                                && !stickerCard.lottie && !stickerCard.downloaded
+                                && root.service
+                                && root.service.mediaDownloading(modelData)
+                              anchors.centerIn: parent
+                              visible: active
+                              text: "󰔟"
+                              color: root.foreground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.icon * 1.5
                             }
                           }
                           Item {
@@ -3481,7 +3622,7 @@ Item {
                         x: modelData.from_me
                           ? bubble.x + bubble.width - width - Style.space(4)
                           : bubble.x + Style.space(4)
-                        spacing: 4
+                        spacing: 8
 
                         Item {
                           id: messageReceiptHoverTarget
@@ -3498,6 +3639,8 @@ Item {
                               + String(modelData.id || "")
                             readonly property string receiptTooltipText:
                               root.messageReceiptTooltip(modelData)
+                            readonly property var receiptTooltipGroups:
+                              root.messageReceiptGroups(modelData)
                             readonly property bool receiptTooltipVisible:
                               messageReceiptTooltipPopup.visible
                             readonly property var receiptTooltipControl:
@@ -3509,7 +3652,11 @@ Item {
                             color: Number(modelData.receipt || 0) >= 3
                               ? root.accent : root.timestamp
                             font.family: root.fontFamily
-                            font.pixelSize: 13
+                            font.pixelSize: 14
+                            font.letterSpacing:
+                              Number(modelData.receipt || 0) >= 2
+                                && Number(modelData.receipt || 0) < 4
+                              ? -3 : 0
                             font.bold: Number(modelData.receipt || 0) > 0
                             Accessible.name:
                               root.messageReceiptLabel(modelData.receipt)
@@ -3552,24 +3699,85 @@ Item {
                               radius: 0
                             }
 
-                            contentItem: Text {
-                              text: messageReceiptTooltipPopup.text
-                              color:
+                            contentItem: Item {
+                              id: messageReceiptTooltipBody
+                              readonly property var groups:
+                                messageReceiptStatus.receiptTooltipGroups
+                              readonly property color headerColor: Qt.rgba(
+                                messageReceiptTooltipPopup.tooltipForeground.r,
+                                messageReceiptTooltipPopup.tooltipForeground.g,
+                                messageReceiptTooltipPopup.tooltipForeground.b,
+                                messageReceiptTooltipPopup.tooltipForeground.a
+                                  * 0.72)
+                              readonly property color detailColor:
                                 messageReceiptTooltipPopup.tooltipForeground
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.bodySmall
-                              leftPadding: Border.left(
+                              readonly property real groupSpacing: Style.space(6)
+                              readonly property string contentFontFamily:
+                                root.fontFamily
+                              readonly property real contentFontSize:
+                                Style.font.bodySmall
+                              readonly property real leftInset: Border.left(
                                 messageReceiptTooltipPopup.tooltipBorderSpec)
                                 + Style.spacing.controlPaddingX
-                              rightPadding: Border.right(
+                              readonly property real rightInset: Border.right(
                                 messageReceiptTooltipPopup.tooltipBorderSpec)
                                 + Style.spacing.controlPaddingX
-                              topPadding: Border.top(
+                              readonly property real topInset: Border.top(
                                 messageReceiptTooltipPopup.tooltipBorderSpec)
                                 + Style.spacing.controlPaddingY
-                              bottomPadding: Border.bottom(
+                              readonly property real bottomInset: Border.bottom(
                                 messageReceiptTooltipPopup.tooltipBorderSpec)
                                 + Style.spacing.controlPaddingY
+
+                              implicitWidth:
+                                messageReceiptTooltipContent.implicitWidth
+                                + leftInset + rightInset
+                              implicitHeight:
+                                messageReceiptTooltipContent.implicitHeight
+                                  + topInset + bottomInset
+
+                              Column {
+                                id: messageReceiptTooltipContent
+                                x: parent.leftInset
+                                y: parent.topInset
+                                spacing: messageReceiptTooltipBody.groupSpacing
+
+                                Repeater {
+                                  model: messageReceiptTooltipBody.groups
+
+                                  delegate: Column {
+                                    required property var modelData
+                                    spacing: 0
+
+                                    Text {
+                                      text: parent.modelData.label
+                                      textFormat: Text.PlainText
+                                      color:
+                                        messageReceiptTooltipBody.headerColor
+                                      font.family: messageReceiptTooltipBody
+                                        .contentFontFamily
+                                      font.pixelSize: messageReceiptTooltipBody
+                                        .contentFontSize
+                                    }
+
+                                    Repeater {
+                                      model: parent.modelData.entries
+
+                                      delegate: Text {
+                                        required property var modelData
+                                        text: String(modelData || "")
+                                        textFormat: Text.PlainText
+                                        color:
+                                          messageReceiptTooltipBody.detailColor
+                                        font.family: messageReceiptTooltipBody
+                                          .contentFontFamily
+                                        font.pixelSize: messageReceiptTooltipBody
+                                          .contentFontSize
+                                      }
+                                    }
+                                  }
+                                }
+                              }
                             }
                           }
                         }

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 19;
+pub const PROTOCOL_VERSION: u16 = 21;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -73,11 +73,21 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_to: Vec<MessageDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_by: Vec<MessageReader>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MessageMedia>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<Reaction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageDelivery {
+    pub jid: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +126,22 @@ pub enum MessageMedia {
         mime_type: String,
         width: u32,
         height: u32,
+    },
+    Sticker {
+        path: String,
+        #[serde(default)]
+        thumbnail_path: String,
+        #[serde(default)]
+        downloaded: bool,
+        mime_type: String,
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        animated: bool,
+        #[serde(default)]
+        lottie: bool,
+        #[serde(default)]
+        accessibility_label: String,
     },
     Video {
         path: String,
@@ -202,6 +228,10 @@ pub enum Command {
         selected_options: Vec<String>,
     },
     DownloadImage {
+        chat_jid: String,
+        message_id: String,
+    },
+    DownloadSticker {
         chat_jid: String,
         message_id: String,
     },
@@ -299,6 +329,8 @@ pub enum ServerEvent {
         receipt: u8,
         #[serde(default)]
         timestamp: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<MessageDelivery>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reader: Option<MessageReader>,
     },
@@ -409,6 +441,33 @@ mod tests {
         );
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn sticker_command_and_media_round_trip_are_stable() {
+        let frame = ClientFrame::new(
+            Some(8),
+            Command::DownloadSticker {
+                chat_jid: "1@s.whatsapp.net".into(),
+                message_id: "sticker-1".into(),
+            },
+        );
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+
+        let media = MessageMedia::Sticker {
+            path: "/private/cache/sticker-1.sticker.webp".into(),
+            thumbnail_path: "/private/cache/sticker-1.sticker-thumbnail.png".into(),
+            downloaded: true,
+            mime_type: "image/webp".into(),
+            width: 512,
+            height: 512,
+            animated: true,
+            lottie: false,
+            accessibility_label: "Dancing parrot".into(),
+        };
+        let json = serde_json::to_string(&media).unwrap();
+        assert_eq!(serde_json::from_str::<MessageMedia>(&json).unwrap(), media);
     }
 
     #[test]
@@ -663,6 +722,11 @@ mod tests {
             receipt: 3,
             delivered_at: Some(40),
             read_at: Some(41),
+            delivered_to: vec![MessageDelivery {
+                jid: "2@s.whatsapp.net".into(),
+                name: "Grace".into(),
+                delivered_at: Some(40),
+            }],
             read_by: vec![MessageReader {
                 jid: "1@s.whatsapp.net".into(),
                 name: "Ada".into(),
@@ -695,6 +759,7 @@ mod tests {
         assert_eq!(message.receipt, 0);
         assert_eq!(message.delivered_at, None);
         assert_eq!(message.read_at, None);
+        assert!(message.delivered_to.is_empty());
         assert!(message.read_by.is_empty());
     }
 
@@ -704,11 +769,29 @@ mod tests {
             message_ids: vec!["message-1".into(), "message-2".into()],
             receipt: 3,
             timestamp: 42,
+            delivery: None,
             reader: Some(MessageReader {
                 jid: "1@s.whatsapp.net".into(),
                 name: "Ada".into(),
                 read_at: Some(42),
             }),
+        });
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn delivery_event_round_trip_includes_the_recipient() {
+        let frame = ServerFrame::event(ServerEvent::Receipts {
+            message_ids: vec!["message-1".into()],
+            receipt: 2,
+            timestamp: 40,
+            delivery: Some(MessageDelivery {
+                jid: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                delivered_at: Some(40),
+            }),
+            reader: None,
         });
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);

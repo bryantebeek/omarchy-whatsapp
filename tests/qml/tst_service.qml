@@ -98,6 +98,11 @@ TestCase {
         receipt: 9,
         delivered_at: "123.9",
         read_at: "invalid",
+        delivered_to: [
+          { jid: "bob@s.whatsapp.net", name: "Bob", delivered_at: "234.9" },
+          { jid: "bob@s.whatsapp.net", name: "Duplicate" },
+          { name: "Missing address" }
+        ],
         read_by: [
           { jid: "alice@s.whatsapp.net", name: "Alice", read_at: "456.8" },
           { jid: "alice@s.whatsapp.net", name: "Duplicate" },
@@ -115,6 +120,9 @@ TestCase {
     compare(normalized[0].receipt, 4)
     compare(normalized[0].delivered_at, 123)
     compare(normalized[0].read_at, 0)
+    compare(normalized[0].delivered_to.length, 1)
+    compare(normalized[0].delivered_to[0].name, "Bob")
+    compare(normalized[0].delivered_to[0].delivered_at, 234)
     compare(normalized[0].read_by.length, 1)
     compare(normalized[0].read_by[0].name, "Alice")
     compare(normalized[0].read_by[0].read_at, 456)
@@ -122,6 +130,7 @@ TestCase {
     compare(normalized[1].receipt, 0)
     compare(normalized[1].delivered_at, 0)
     compare(normalized[1].read_at, 0)
+    compare(normalized[1].delivered_to.length, 0)
     compare(normalized[1].read_by.length, 0)
     compare(service.hexKey("Aé"), "41c3a9")
   }
@@ -130,29 +139,44 @@ TestCase {
     service.messages = [
       {
         id: "outgoing", from_me: true, receipt: 1,
-        delivered_at: 0, read_at: 0, read_by: []
+        delivered_at: 0, read_at: 0, delivered_to: [], read_by: []
       },
       {
         id: "direct-read", from_me: true, receipt: 1,
-        delivered_at: 0, read_at: 0, read_by: []
+        delivered_at: 0, read_at: 0, delivered_to: [], read_by: []
       },
-      { id: "incoming", from_me: false, receipt: 0, read_by: [] }
+      {
+        id: "incoming", from_me: false, receipt: 0,
+        delivered_to: [], read_by: []
+      }
     ]
     compare(service.applyReceipts(null), false)
     compare(service.applyReceipts({
-      message_ids: ["outgoing"], receipt: 2, timestamp: 20
+      message_ids: ["outgoing"], receipt: 2, timestamp: 20,
+      delivery: {
+        jid: "alice@s.whatsapp.net", name: "Alice", delivered_at: 19
+      }
     }), true)
     compare(messagesWillChangeCount, 1)
     compare(lastPreservePosition, true)
     compare(service.messages[0].delivered_at, 20)
+    compare(service.messages[0].delivered_to.length, 1)
+    compare(service.messages[0].delivered_to[0].name, "Alice")
+    compare(service.messages[0].delivered_to[0].delivered_at, 19)
     compare(service.applyReceipts({
-      message_ids: ["outgoing"], receipt: 2, timestamp: 30
+      message_ids: ["outgoing"], receipt: 2, timestamp: 30,
+      delivery: { jid: "alice@s.whatsapp.net", name: "Alice" }
     }), false)
     compare(messagesWillChangeCount, 1)
     compare(service.applyReceipts({
-      message_ids: ["outgoing"], receipt: 2, timestamp: 10
+      message_ids: ["outgoing"], receipt: 2, timestamp: 10,
+      delivery: {
+        jid: "alice@s.whatsapp.net", name: "Alice Updated", delivered_at: 9
+      }
     }), true)
     compare(service.messages[0].delivered_at, 10)
+    compare(service.messages[0].delivered_to[0].name, "Alice Updated")
+    compare(service.messages[0].delivered_to[0].delivered_at, 9)
     compare(service.applyReceipts({
       message_ids: ["outgoing"],
       receipt: 3,
@@ -306,6 +330,40 @@ TestCase {
     service.finishMediaDownloadRequest({ id: 999 })
     service.finishMediaDownloadRequest({ id: requestId })
     compare(service.mediaDownloading(message), false)
+
+    var sticker = { id: "s1", chat_jid: "chat", media: {
+      kind: "sticker", lottie: false
+    } }
+    compare(service.downloadMedia(sticker), true)
+    compare(lastFrame().command, "download_sticker")
+    compare(service.downloadMedia({ id: "l1", chat_jid: "chat", media: {
+      kind: "sticker", lottie: true
+    } }), false)
+    requestId = Number(Object.keys(service.mediaDownloadRequestIds)[0])
+    service.finishMediaDownloadRequest({ id: requestId })
+    compare(service.mediaDownloading(sticker), false)
+
+    var automatic = { id: "s2", chat_jid: "chat", media: {
+      kind: "sticker", downloaded: false, lottie: false
+    } }
+    compare(service.autoDownloadStickers(null), 0)
+    compare(service.autoDownloadStickers([
+      { id: "done", chat_jid: "chat", media: {
+        kind: "sticker", downloaded: true, lottie: false
+      } },
+      { id: "lottie", chat_jid: "chat", media: {
+        kind: "sticker", downloaded: false, lottie: true
+      } },
+      { id: "image", chat_jid: "chat", media: {
+        kind: "image", downloaded: false
+      } },
+      automatic
+    ]), 1)
+    compare(lastFrame().command, "download_sticker")
+    compare(service.mediaDownloading(automatic), true)
+    compare(service.autoDownloadStickers([automatic]), 0)
+    requestId = Number(Object.keys(service.mediaDownloadRequestIds)[0])
+    service.finishMediaDownloadRequest({ id: requestId })
 
     service.selectedChatJid = "chat"
     service.messages = [message]
@@ -527,12 +585,19 @@ TestCase {
     service.handleLine(JSON.stringify({ event: "messages", chat_jid: "one", first_unread_message_id: "m1", messages: [
       { id: "m1", sender_jid: "sender", reactions: null },
       { id: "m2", sender_jid: "sender", reactions: ["👍"] },
-      { id: "m3", sender_jid: "me" }
+      { id: "m3", sender_jid: "me" },
+      { id: "m4", chat_jid: "one", sender_jid: "sender", media: {
+        kind: "sticker", downloaded: false, lottie: false
+      } }
     ] }))
-    compare(service.messages.length, 3)
+    compare(service.messages.length, 4)
     compare(service.messagesFirstUnreadId, "m1")
     compare(service.messagesResponseSerial, 1)
     compare(service.mediaRevision, 1)
+    compare(service.mediaDownloading(service.messages[3]), true)
+    verify(sentFrames().some(function(frame) {
+      return frame.command === "download_sticker" && frame.message_id === "m4"
+    }))
 
     requestId = service.requestMessages("one")
     service.handleLine(JSON.stringify({

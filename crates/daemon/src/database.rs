@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use omarchy_whatsapp_protocol::{Chat, Message, MessageMedia, MessageReader, Reaction};
+use omarchy_whatsapp_protocol::{
+    Chat, Message, MessageDelivery, MessageMedia, MessageReader, Reaction,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::fs;
@@ -101,6 +103,7 @@ impl Database {
                 message_id TEXT NOT NULL,
                 reader_jid TEXT NOT NULL,
                 read_at    INTEGER NOT NULL DEFAULT 0,
+                delivered_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (chat_jid, message_id, reader_jid)
             );
             CREATE INDEX IF NOT EXISTS message_reads_by_reader
@@ -204,6 +207,34 @@ impl Database {
             "ALTER TABLE messages ADD COLUMN receipt_read_at INTEGER",
             [],
         );
+        let _ = connection.execute(
+            "ALTER TABLE message_reads ADD COLUMN delivered_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        connection.execute(
+            "INSERT INTO message_reads
+             (chat_jid, message_id, reader_jid, read_at, delivered_at)
+             SELECT messages.chat_jid, messages.id, messages.chat_jid,
+                    COALESCE(messages.receipt_read_at, 0),
+                    COALESCE(messages.delivered_at, 0)
+             FROM messages
+             JOIN chats ON chats.jid = messages.chat_jid
+             WHERE messages.from_me = 1 AND chats.is_group = 0
+               AND (COALESCE(messages.delivered_at, 0) > 0
+                    OR COALESCE(messages.receipt_read_at, 0) > 0)
+             ON CONFLICT(chat_jid, message_id, reader_jid) DO UPDATE SET
+                read_at = CASE
+                    WHEN excluded.read_at > 0
+                         AND (message_reads.read_at <= 0
+                              OR excluded.read_at < message_reads.read_at)
+                    THEN excluded.read_at ELSE message_reads.read_at END,
+                delivered_at = CASE
+                    WHEN excluded.delivered_at > 0
+                         AND (message_reads.delivered_at <= 0
+                              OR excluded.delivered_at < message_reads.delivered_at)
+                    THEN excluded.delivered_at ELSE message_reads.delivered_at END",
+            [],
+        )?;
         let _ = connection.execute("ALTER TABLE messages ADD COLUMN media_json TEXT", []);
         let _ = connection.execute("ALTER TABLE messages ADD COLUMN media_download BLOB", []);
         let _ = connection.execute("ALTER TABLE chats ADD COLUMN phone_number TEXT", []);
@@ -785,6 +816,18 @@ impl Database {
                             thumbnail_path.clear();
                         }
                     }
+                    Some(MessageMedia::Sticker {
+                        path,
+                        thumbnail_path,
+                        downloaded,
+                        lottie,
+                        ..
+                    }) => {
+                        *downloaded = !*lottie && Path::new(path).is_file();
+                        if !thumbnail_path.is_empty() && !Path::new(thumbnail_path).is_file() {
+                            thumbnail_path.clear();
+                        }
+                    }
                     Some(MessageMedia::Video {
                         path,
                         thumbnail_path,
@@ -814,6 +857,7 @@ impl Database {
                     receipt: u8::try_from(row.get::<_, i64>(7)?.clamp(0, 4)).unwrap_or_default(),
                     delivered_at: row.get(8)?,
                     read_at: row.get(9)?,
+                    delivered_to: Vec::new(),
                     read_by: Vec::new(),
                     media,
                     reactions: Vec::new(),
@@ -846,11 +890,12 @@ impl Database {
                 .or_default()
                 .push(reaction);
         }
+        let mut deliveries_by_message: HashMap<String, Vec<MessageDelivery>> = HashMap::new();
         let mut readers_by_message: HashMap<String, Vec<MessageReader>> = HashMap::new();
-        let mut reader_statement = connection.prepare(
+        let mut receipt_statement = connection.prepare(
             "SELECT message_reads.message_id, message_reads.reader_jid,
                     COALESCE(NULLIF(contacts.name, ''), NULLIF(chats.name, ''), ''),
-                    message_reads.read_at
+                    message_reads.delivered_at, message_reads.read_at
              FROM message_reads
              LEFT JOIN contacts ON contacts.jid = message_reads.reader_jid
              LEFT JOIN chats ON chats.jid = message_reads.reader_jid
@@ -858,28 +903,43 @@ impl Database {
              ORDER BY LOWER(COALESCE(NULLIF(contacts.name, ''), NULLIF(chats.name, ''), '')),
                       message_reads.reader_jid",
         )?;
-        let reader_rows = reader_statement.query_map([chat_jid], |row| {
+        let receipt_rows = receipt_statement.query_map([chat_jid], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                MessageReader {
-                    jid: row.get(1)?,
-                    name: row.get(2)?,
-                    read_at: match row.get::<_, i64>(3)? {
-                        value if value > 0 => Some(value),
-                        _ => None,
-                    },
-                },
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
-        for row in reader_rows {
-            let (message_id, reader) = row?;
-            readers_by_message
-                .entry(message_id)
-                .or_default()
-                .push(reader);
+        for row in receipt_rows {
+            let (message_id, jid, name, delivered_at, read_at) = row?;
+            if delivered_at > 0 {
+                deliveries_by_message
+                    .entry(message_id.clone())
+                    .or_default()
+                    .push(MessageDelivery {
+                        jid: jid.clone(),
+                        name: name.clone(),
+                        delivered_at: Some(delivered_at),
+                    });
+            }
+            if read_at > 0 {
+                readers_by_message
+                    .entry(message_id)
+                    .or_default()
+                    .push(MessageReader {
+                        jid,
+                        name,
+                        read_at: Some(read_at),
+                    });
+            }
         }
         for message in &mut messages {
             message.reactions = reactions_by_message.remove(&message.id).unwrap_or_default();
+            message.delivered_to = deliveries_by_message
+                .remove(&message.id)
+                .unwrap_or_default();
             message.read_by = readers_by_message.remove(&message.id).unwrap_or_default();
         }
         Ok(messages)
@@ -1390,8 +1450,8 @@ impl Database {
         chat_jid: &str,
         message_ids: &[String],
         receipt: u8,
-        reader_jid: Option<&str>,
-        read_at: i64,
+        recipient_jid: Option<&str>,
+        receipt_at: i64,
     ) -> Result<bool> {
         if message_ids.is_empty() {
             return Ok(false);
@@ -1421,26 +1481,42 @@ impl Database {
                          AND (delivered_at IS NULL OR ?4 < delivered_at))
                      OR (?2 >= 3 AND ?4 > 0
                          AND (receipt_read_at IS NULL OR ?4 < receipt_read_at)))",
-                params![id, receipt, chat_jid, read_at],
+                params![id, receipt, chat_jid, receipt_at],
             )? > 0;
-            if receipt >= 3
-                && let Some(reader_jid) = reader_jid.filter(|jid| !jid.is_empty())
-            {
-                changed |= transaction.execute(
-                    "INSERT INTO message_reads
-                     (chat_jid, message_id, reader_jid, read_at)
-                     SELECT ?1, ?2, ?3, ?4
-                     WHERE EXISTS (
-                        SELECT 1 FROM messages
-                        WHERE chat_jid = ?1 AND id = ?2 AND from_me = 1
-                     )
-                     ON CONFLICT(chat_jid, message_id, reader_jid) DO UPDATE SET
-                        read_at = excluded.read_at
-                     WHERE excluded.read_at > 0
-                       AND (message_reads.read_at <= 0
-                            OR excluded.read_at < message_reads.read_at)",
-                    params![chat_jid, id, reader_jid, read_at],
-                )? > 0;
+            if let Some(recipient_jid) = recipient_jid.filter(|jid| !jid.is_empty()) {
+                if receipt == 2 {
+                    changed |= transaction.execute(
+                        "INSERT INTO message_reads
+                         (chat_jid, message_id, reader_jid, read_at, delivered_at)
+                         SELECT ?1, ?2, ?3, 0, ?4
+                         WHERE EXISTS (
+                            SELECT 1 FROM messages
+                            WHERE chat_jid = ?1 AND id = ?2 AND from_me = 1
+                         )
+                         ON CONFLICT(chat_jid, message_id, reader_jid) DO UPDATE SET
+                            delivered_at = excluded.delivered_at
+                         WHERE excluded.delivered_at > 0
+                           AND (message_reads.delivered_at <= 0
+                                OR excluded.delivered_at < message_reads.delivered_at)",
+                        params![chat_jid, id, recipient_jid, receipt_at],
+                    )? > 0;
+                } else if receipt >= 3 {
+                    changed |= transaction.execute(
+                        "INSERT INTO message_reads
+                         (chat_jid, message_id, reader_jid, read_at, delivered_at)
+                         SELECT ?1, ?2, ?3, ?4, 0
+                         WHERE EXISTS (
+                            SELECT 1 FROM messages
+                            WHERE chat_jid = ?1 AND id = ?2 AND from_me = 1
+                         )
+                         ON CONFLICT(chat_jid, message_id, reader_jid) DO UPDATE SET
+                            read_at = excluded.read_at
+                         WHERE excluded.read_at > 0
+                           AND (message_reads.read_at <= 0
+                                OR excluded.read_at < message_reads.read_at)",
+                        params![chat_jid, id, recipient_jid, receipt_at],
+                    )? > 0;
+                }
             }
         }
         transaction.commit()?;
@@ -2289,10 +2365,11 @@ impl Database {
                 "SELECT id, sender_jid, from_me, timestamp FROM messages
                  WHERE chat_jid = ?1 AND (
                    (media_json IS NULL
-                    AND (text IN ('[Image]', '[Video]', '[Voice message]', '[Document]', '[Location]', '[Live location]', '[Poll]')
+                    AND (text IN ('[Image]', '[Video]', '[Voice message]', '[Document]', '[Sticker]', '[Location]', '[Live location]', '[Poll]')
                          OR text LIKE '[Poll] %'))
                    OR ((media_json LIKE '%\"kind\":\"image\"%'
-                        OR media_json LIKE '%\"kind\":\"video\"%')
+                        OR media_json LIKE '%\"kind\":\"video\"%'
+                        OR media_json LIKE '%\"kind\":\"sticker\"%')
                        AND (media_download IS NULL
                             OR media_json NOT LIKE '%\"thumbnail_path\"%'))
                    OR (media_json LIKE '%\"kind\":\"location\"%'
@@ -2386,6 +2463,7 @@ mod tests {
             receipt: 0,
             delivered_at: None,
             read_at: None,
+            delivered_to: Vec::new(),
             read_by: Vec::new(),
             media: None,
             reactions: Vec::new(),
@@ -2463,7 +2541,13 @@ mod tests {
         );
         assert!(
             database
-                .update_receipts("1@s.whatsapp.net", &["outgoing".into()], 2, None, 2)
+                .update_receipts(
+                    "1@s.whatsapp.net",
+                    &["outgoing".into()],
+                    2,
+                    Some("ada@s.whatsapp.net"),
+                    2,
+                )
                 .unwrap()
         );
         assert!(
@@ -2501,6 +2585,14 @@ mod tests {
         assert_eq!(stored[0].delivered_at, Some(2));
         assert_eq!(stored[0].read_at, Some(4));
         assert_eq!(
+            stored[0].delivered_to,
+            [MessageDelivery {
+                jid: "ada@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                delivered_at: Some(2),
+            }]
+        );
+        assert_eq!(
             stored[0].read_by,
             [MessageReader {
                 jid: "ada@s.whatsapp.net".into(),
@@ -2508,6 +2600,98 @@ mod tests {
                 read_at: Some(4),
             }]
         );
+    }
+
+    #[test]
+    fn direct_receipt_participants_are_backfilled_from_aggregate_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        {
+            let database = Database::open(&path).unwrap();
+            let mut outgoing = message("legacy-outgoing", 1);
+            outgoing.sender_jid = "me".into();
+            outgoing.sender_name = "You".into();
+            outgoing.from_me = true;
+            outgoing.receipt = 3;
+            outgoing.delivered_at = Some(2);
+            outgoing.read_at = Some(4);
+            database
+                .insert_message(&outgoing, "Ada", false, false)
+                .unwrap();
+        }
+
+        let database = Database::open(&path).unwrap();
+        let stored = database.messages("1@s.whatsapp.net", 50).unwrap();
+        assert_eq!(
+            stored[0].delivered_to,
+            [MessageDelivery {
+                jid: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                delivered_at: Some(2),
+            }]
+        );
+        assert_eq!(
+            stored[0].read_by,
+            [MessageReader {
+                jid: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                read_at: Some(4),
+            }]
+        );
+    }
+
+    #[test]
+    fn group_receipts_preserve_delivered_and_read_participants() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut outgoing = message("group-outgoing", 1);
+        outgoing.chat_jid = "team@g.us".into();
+        outgoing.sender_jid = "me".into();
+        outgoing.sender_name = "You".into();
+        outgoing.from_me = true;
+        outgoing.receipt = 1;
+        database
+            .insert_message(&outgoing, "Team", true, false)
+            .unwrap();
+        database
+            .update_contact_name("alice@s.whatsapp.net", "Alice")
+            .unwrap();
+        database
+            .update_contact_name("bob@s.whatsapp.net", "Bob")
+            .unwrap();
+
+        for (jid, timestamp) in [("alice@s.whatsapp.net", 2), ("bob@s.whatsapp.net", 3)] {
+            assert!(
+                database
+                    .update_receipts(
+                        "team@g.us",
+                        &["group-outgoing".into()],
+                        2,
+                        Some(jid),
+                        timestamp,
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(
+            database
+                .update_receipts(
+                    "team@g.us",
+                    &["group-outgoing".into()],
+                    3,
+                    Some("alice@s.whatsapp.net"),
+                    4,
+                )
+                .unwrap()
+        );
+
+        let stored = database.messages("team@g.us", 50).unwrap();
+        assert_eq!(stored[0].delivered_to.len(), 2);
+        assert_eq!(stored[0].delivered_to[0].name, "Alice");
+        assert_eq!(stored[0].delivered_to[1].name, "Bob");
+        assert_eq!(stored[0].read_by.len(), 1);
+        assert_eq!(stored[0].read_by[0].name, "Alice");
+        assert_eq!(stored[0].read_by[0].read_at, Some(4));
     }
 
     #[test]
@@ -2782,6 +2966,85 @@ mod tests {
                 timestamp_ms: voice.timestamp * 1_000,
             })
         );
+    }
+
+    #[test]
+    fn sticker_cache_state_and_recovery_are_refreshed_from_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let sticker_path = directory.path().join("sticker.webp");
+        let thumbnail_path = directory.path().join("sticker.png");
+        std::fs::write(&thumbnail_path, b"preview").unwrap();
+        let mut sticker = message("sticker", 4);
+        sticker.text = "[Sticker]".into();
+        sticker.media = Some(MessageMedia::Sticker {
+            path: sticker_path.to_string_lossy().into_owned(),
+            thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+            downloaded: false,
+            mime_type: "image/webp".into(),
+            width: 512,
+            height: 512,
+            animated: true,
+            lottie: false,
+            accessibility_label: String::new(),
+        });
+        database
+            .insert_message(&sticker, "Ada", false, false)
+            .unwrap();
+
+        let stored = database.messages(&sticker.chat_jid, 10).unwrap();
+        let Some(MessageMedia::Sticker {
+            downloaded,
+            thumbnail_path: stored_thumbnail,
+            ..
+        }) = &stored[0].media
+        else {
+            panic!("expected stored sticker")
+        };
+        assert!(!downloaded);
+        assert_eq!(stored_thumbnail, thumbnail_path.to_string_lossy().as_ref());
+        assert_eq!(
+            database.media_recovery_cursor(&sticker.chat_jid).unwrap(),
+            Some(HistoryCursor {
+                chat_jid: sticker.chat_jid.clone(),
+                message_id: sticker.id.clone(),
+                sender_jid: sticker.sender_jid.clone(),
+                from_me: sticker.from_me,
+                timestamp_ms: sticker.timestamp * 1_000,
+            })
+        );
+
+        std::fs::write(&sticker_path, b"full sticker").unwrap();
+        std::fs::remove_file(&thumbnail_path).unwrap();
+        let stored = database.messages(&sticker.chat_jid, 10).unwrap();
+        let Some(MessageMedia::Sticker {
+            downloaded,
+            thumbnail_path: stored_thumbnail,
+            ..
+        }) = &stored[0].media
+        else {
+            panic!("expected stored sticker")
+        };
+        assert!(downloaded);
+        assert!(stored_thumbnail.is_empty());
+
+        let mut lottie = sticker;
+        lottie.id = "lottie".into();
+        if let Some(MessageMedia::Sticker { lottie, .. }) = &mut lottie.media {
+            *lottie = true;
+        }
+        database
+            .insert_message(&lottie, "Ada", false, false)
+            .unwrap();
+        let stored = database.messages(&lottie.chat_jid, 10).unwrap();
+        let stored_lottie = stored
+            .iter()
+            .find(|message| message.id == "lottie")
+            .unwrap();
+        let Some(MessageMedia::Sticker { downloaded, .. }) = &stored_lottie.media else {
+            panic!("expected stored Lottie sticker")
+        };
+        assert!(!downloaded);
     }
 
     #[test]
