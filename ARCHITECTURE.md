@@ -59,6 +59,10 @@ latest poll selection, and unread handling. Only aggregate poll results and the
 local user's selected options cross IPC. Inserts are idempotent on
 `(chat_jid, id)`, so offline replay does not duplicate messages or unread
 counts. Retention is capped per chat and never deletes protocol state.
+Schema upgrades inspect existing columns before applying migrations, so an
+already-applied migration is idempotent while storage, permission, and corruption
+errors remain fatal and visible. A panicked database worker rolls back its active
+transaction and later callers recover the mutex instead of cascading the panic.
 
 The active chat is ephemeral daemon state. The focused, visible Quickshell panel
 sets it and clears it when hidden or unfocused. Live incoming messages in that

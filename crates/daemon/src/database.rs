@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 const CHAT_NAME_UNKNOWN: i64 = 0;
 const CHAT_NAME_HISTORY: i64 = 10;
@@ -19,6 +19,36 @@ fn read_boundary_ids(value: Option<String>) -> Vec<String> {
     value
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default()
+}
+
+fn quoted_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<()> {
+    let mut statement =
+        connection.prepare(&format!("PRAGMA table_info({})", quoted_identifier(table)))?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(());
+        }
+    }
+    drop(rows);
+    drop(statement);
+    connection.execute(
+        &format!(
+            "ALTER TABLE {} ADD COLUMN {declaration}",
+            quoted_identifier(table)
+        ),
+        [],
+    )?;
+    Ok(())
 }
 
 pub struct Database {
@@ -59,6 +89,16 @@ pub struct StoredPoll {
 }
 
 impl Database {
+    fn connection(&self) -> MutexGuard<'_, Connection> {
+        // Every multi-statement write uses a rusqlite transaction, whose Drop
+        // implementation rolls back during unwinding. Recovering the guard
+        // therefore keeps a transient panic from turning every later database
+        // access into another daemon panic.
+        self.connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let connection = Connection::open(path)
             .with_context(|| format!("opening history database at {}", path.display()))?;
@@ -186,31 +226,50 @@ impl Database {
             ",
         )?;
         // Forward-compatible migration for databases created by early builds.
-        let _ = connection.execute(
-            "ALTER TABLE messages ADD COLUMN read INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = connection.execute(
-            "ALTER TABLE contacts ADD COLUMN source INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = connection.execute(
-            "ALTER TABLE messages ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = connection.execute(
-            "ALTER TABLE messages ADD COLUMN receipt INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = connection.execute("ALTER TABLE messages ADD COLUMN delivered_at INTEGER", []);
-        let _ = connection.execute(
-            "ALTER TABLE messages ADD COLUMN receipt_read_at INTEGER",
-            [],
-        );
-        let _ = connection.execute(
-            "ALTER TABLE message_reads ADD COLUMN delivered_at INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+        // Inspecting the schema first distinguishes an already-applied migration
+        // from disk, permission, or corruption errors that must remain visible.
+        ensure_column(
+            &connection,
+            "messages",
+            "read",
+            "read INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "contacts",
+            "source",
+            "source INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "messages",
+            "starred",
+            "starred INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "messages",
+            "receipt",
+            "receipt INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "messages",
+            "delivered_at",
+            "delivered_at INTEGER",
+        )?;
+        ensure_column(
+            &connection,
+            "messages",
+            "receipt_read_at",
+            "receipt_read_at INTEGER",
+        )?;
+        ensure_column(
+            &connection,
+            "message_reads",
+            "delivered_at",
+            "delivered_at INTEGER NOT NULL DEFAULT 0",
+        )?;
         connection.execute(
             "INSERT INTO message_reads
              (chat_jid, message_id, reader_jid, read_at, delivered_at)
@@ -235,29 +294,44 @@ impl Database {
                     THEN excluded.delivered_at ELSE message_reads.delivered_at END",
             [],
         )?;
-        let _ = connection.execute("ALTER TABLE messages ADD COLUMN media_json TEXT", []);
-        let _ = connection.execute("ALTER TABLE messages ADD COLUMN media_download BLOB", []);
-        let _ = connection.execute("ALTER TABLE chats ADD COLUMN phone_number TEXT", []);
-        let _ = connection.execute(
-            "ALTER TABLE chats ADD COLUMN name_source INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = connection.execute(
-            "ALTER TABLE chat_settings ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = connection.execute(
-            "ALTER TABLE chat_settings ADD COLUMN cleared_at INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = connection.execute(
-            "ALTER TABLE chat_settings ADD COLUMN read_boundary INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = connection.execute(
-            "ALTER TABLE chat_settings ADD COLUMN read_boundary_ids TEXT",
-            [],
-        );
+        ensure_column(&connection, "messages", "media_json", "media_json TEXT")?;
+        ensure_column(
+            &connection,
+            "messages",
+            "media_download",
+            "media_download BLOB",
+        )?;
+        ensure_column(&connection, "chats", "phone_number", "phone_number TEXT")?;
+        ensure_column(
+            &connection,
+            "chats",
+            "name_source",
+            "name_source INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "chat_settings",
+            "deleted",
+            "deleted INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "chat_settings",
+            "cleared_at",
+            "cleared_at INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "chat_settings",
+            "read_boundary",
+            "read_boundary INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "chat_settings",
+            "read_boundary_ids",
+            "read_boundary_ids TEXT",
+        )?;
         // A JID is an identifier, never a chat name. Legacy databases stored
         // it in `name` as a rendering fallback, which made later syncs unable
         // to distinguish missing metadata from a real title.
@@ -295,7 +369,7 @@ impl Database {
              )",
             [],
         )?;
-        Self::restore_legacy_chat_names(&connection, path);
+        Self::restore_legacy_chat_names(&connection, path)?;
         // Early builds represented protocol/control envelopes and unknown
         // add-ons as user-visible placeholder bubbles. They contain no
         // recoverable user content and must not survive after renderability is
@@ -327,10 +401,7 @@ impl Database {
     }
 
     pub fn clear_account_data(&self) -> Result<()> {
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let transaction = connection.transaction()?;
         transaction.execute_batch(
             "
@@ -352,18 +423,18 @@ impl Database {
         Ok(())
     }
 
-    fn restore_legacy_chat_names(connection: &Connection, database_path: &Path) {
+    fn restore_legacy_chat_names(connection: &Connection, database_path: &Path) -> Result<()> {
         let Some(state_dir) = database_path.parent() else {
-            return;
+            return Ok(());
         };
         let Ok(contents) = fs::read(state_dir.join("store.json")) else {
-            return;
+            return Ok(());
         };
         let Ok(store) = serde_json::from_slice::<serde_json::Value>(&contents) else {
-            return;
+            return Ok(());
         };
         let Some(chats) = store.get("chats").and_then(serde_json::Value::as_array) else {
-            return;
+            return Ok(());
         };
         for chat in chats {
             let Some(jid) = chat.get("jid").and_then(serde_json::Value::as_str) else {
@@ -377,12 +448,13 @@ impl Database {
             else {
                 continue;
             };
-            let _ = connection.execute(
+            connection.execute(
                 "UPDATE chats SET name = ?2, name_source = ?3
                  WHERE jid = ?1 AND name_source = ?4",
                 params![jid, name, CHAT_NAME_HISTORY, CHAT_NAME_UNKNOWN],
-            );
+            )?;
         }
+        Ok(())
     }
 
     pub fn insert_message(
@@ -420,10 +492,7 @@ impl Database {
         } else {
             (candidate, CHAT_NAME_MESSAGE)
         };
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let transaction = connection.transaction()?;
         let tombstoned = transaction
             .query_row(
@@ -552,10 +621,7 @@ impl Database {
     }
 
     pub fn list_chats(&self, limit: u32) -> Result<Vec<Chat>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let mut statement = connection.prepare(
             "SELECT chats.jid, chats.name, chats.phone_number, chats.last_message,
                     COALESCE((
@@ -597,10 +663,7 @@ impl Database {
     }
 
     pub fn update_chat_phone_number(&self, jid: &str, phone_number: &str) -> Result<bool> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         Ok(connection.execute(
             "UPDATE chats SET phone_number = ?2
              WHERE jid = ?1 AND phone_number IS NOT ?2",
@@ -609,10 +672,7 @@ impl Database {
     }
 
     pub fn direct_chat_jids(&self, limit: u32) -> Result<Vec<String>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let mut statement = connection.prepare(
             "SELECT jid FROM chats
              WHERE is_group = 0 AND jid LIKE '%@lid'
@@ -627,10 +687,7 @@ impl Database {
         if replacements.is_empty() {
             return Ok(());
         }
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let transaction = connection.transaction()?;
         for (old, new) in replacements {
             transaction.execute(
@@ -650,10 +707,7 @@ impl Database {
         } else {
             (candidate, CHAT_NAME_HISTORY)
         };
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let transaction = connection.transaction()?;
         let suppressed = transaction
             .query_row(
@@ -714,10 +768,7 @@ impl Database {
         if name.trim().is_empty() {
             return Ok(false);
         }
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let transaction = connection.transaction()?;
         let existing_source = transaction
             .query_row("SELECT source FROM contacts WHERE jid = ?1", [jid], |row| {
@@ -757,10 +808,7 @@ impl Database {
         if name.trim().is_empty() {
             return Ok(false);
         }
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         Ok(connection.execute(
             "UPDATE chats SET name = ?2, name_source = ?3
              WHERE jid = ?1 AND is_group = 1
@@ -770,10 +818,7 @@ impl Database {
     }
 
     pub fn contact_name(&self, jid: &str) -> Result<Option<String>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection
             .query_row("SELECT name FROM contacts WHERE jid = ?1", [jid], |row| {
                 row.get(0)
@@ -783,10 +828,7 @@ impl Database {
     }
 
     pub fn messages(&self, chat_jid: &str, limit: u32) -> Result<Vec<Message>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let mut statement = connection.prepare(
             "SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me,
                     receipt, delivered_at, receipt_read_at, media_json
@@ -961,10 +1003,7 @@ impl Database {
         from_me: bool,
         timestamp: i64,
     ) -> Result<bool> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         if emoji.is_empty() {
             return Ok(connection.execute(
                 "DELETE FROM reactions
@@ -1000,10 +1039,7 @@ impl Database {
                 message_secret.len()
             );
         }
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection.execute(
             "INSERT INTO poll_secrets
              (chat_jid, message_id, creator_jid, message_secret)
@@ -1017,10 +1053,7 @@ impl Database {
     }
 
     pub fn poll_for_voting(&self, chat_jid: &str, message_id: &str) -> Result<Option<StoredPoll>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let row = connection
             .query_row(
                 "SELECT poll_secrets.creator_jid, poll_secrets.message_secret,
@@ -1069,10 +1102,7 @@ impl Database {
         from_me: bool,
         timestamp: i64,
     ) -> Result<bool> {
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let transaction = connection.transaction()?;
         let Some(media_json) = transaction
             .query_row(
@@ -1188,10 +1218,7 @@ impl Database {
     }
 
     pub fn unread_total(&self) -> Result<u32> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         // Muting suppresses desktop notifications only. The badge ignores
         // archived chats, but every unarchived unread message still counts.
         connection
@@ -1207,10 +1234,7 @@ impl Database {
     }
 
     pub fn unread_receipts(&self, chat_jid: &str) -> Result<Vec<UnreadReceipt>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let is_group = connection
             .query_row(
                 "SELECT is_group FROM chats WHERE jid = ?1",
@@ -1236,10 +1260,7 @@ impl Database {
     }
 
     pub fn first_unread_message_id(&self, chat_jid: &str) -> Result<Option<String>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection
             .query_row(
                 "SELECT id FROM messages
@@ -1253,10 +1274,7 @@ impl Database {
     }
 
     pub fn mark_read(&self, chat_jid: &str) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
         transaction.execute("UPDATE chats SET unread = 0 WHERE jid = ?1", [chat_jid])?;
         transaction.execute(
@@ -1276,10 +1294,7 @@ impl Database {
         if read {
             return self.mark_read(chat_jid);
         }
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO chat_settings (jid, read_state) VALUES (?1, 0)
@@ -1295,10 +1310,7 @@ impl Database {
         if !self.regular_app_state_is_complete()? {
             return Ok(0);
         }
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
         let changed = transaction.execute(
             "UPDATE chats SET unread = 0
@@ -1356,10 +1368,7 @@ impl Database {
     }
 
     pub fn apply_mute(&self, chat_jid: &str, muted: bool, mute_end: i64) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection.execute(
             "INSERT INTO chat_settings (jid, muted, mute_end) VALUES (?1, ?2, ?3)
              ON CONFLICT(jid) DO UPDATE SET muted = excluded.muted, mute_end = excluded.mute_end",
@@ -1369,10 +1378,7 @@ impl Database {
     }
 
     pub fn is_muted(&self, chat_jid: &str, now: i64) -> Result<bool> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection
             .query_row(
                 "SELECT COALESCE(muted, 0), COALESCE(mute_end, 0)
@@ -1401,19 +1407,13 @@ impl Database {
             }
             _ => unreachable!("fixed internal chat-setting column"),
         };
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection.execute(sql, params![chat_jid, value])?;
         Ok(())
     }
 
     pub fn apply_status_mute(&self, jid: &str, muted: bool) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection.execute(
             "INSERT INTO chat_settings (jid, status_muted) VALUES (?1, ?2)
              ON CONFLICT(jid) DO UPDATE SET status_muted = excluded.status_muted",
@@ -1423,10 +1423,7 @@ impl Database {
     }
 
     pub fn apply_disappearing_mode(&self, jid: &str, duration: u32, updated_at: i64) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection.execute(
             "INSERT INTO chat_settings
              (jid, disappearing_duration, disappearing_updated_at)
@@ -1441,10 +1438,7 @@ impl Database {
     }
 
     pub fn star_message(&self, chat_jid: &str, message_id: &str, starred: bool) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection.execute(
             "UPDATE messages SET starred = ?3 WHERE chat_jid = ?1 AND id = ?2",
             params![chat_jid, message_id, starred],
@@ -1464,10 +1458,7 @@ impl Database {
             return Ok(false);
         }
         let receipt = i64::from(receipt);
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let transaction = connection.transaction()?;
         let mut changed = false;
         for id in message_ids {
@@ -1539,10 +1530,7 @@ impl Database {
         if message_ids.is_empty() {
             return Ok(false);
         }
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO chat_settings (jid) VALUES (?1)
@@ -1646,10 +1634,7 @@ impl Database {
     }
 
     pub fn delete_chat(&self, chat_jid: &str, timestamp: i64) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
         transaction.execute("DELETE FROM poll_votes WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [chat_jid])?;
@@ -1668,10 +1653,7 @@ impl Database {
     }
 
     pub fn clear_chat(&self, chat_jid: &str, timestamp: i64) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
         transaction.execute("DELETE FROM poll_votes WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [chat_jid])?;
@@ -1693,10 +1675,7 @@ impl Database {
     }
 
     pub fn delete_message(&self, chat_jid: &str, message_id: &str) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
         transaction.execute(
             "DELETE FROM poll_votes WHERE chat_jid = ?1 AND message_id = ?2",
@@ -1739,10 +1718,7 @@ impl Database {
         message_id: &str,
         media: &MessageMedia,
     ) -> Result<bool> {
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let mut merged_media = media.clone();
         if let MessageMedia::Location {
             thumbnail_path,
@@ -1842,10 +1818,7 @@ impl Database {
     ) -> Result<Vec<ActiveLiveLocation>> {
         const MAX_LIVE_LOCATION_SECONDS: i64 = 8 * 60 * 60;
 
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let mut statement = connection.prepare(
             "SELECT chat_jid, id, timestamp, media_json FROM messages
              WHERE sender_jid = ?1
@@ -1890,10 +1863,7 @@ impl Database {
     pub fn active_live_location_targets(&self, now: i64) -> Result<Vec<(String, bool)>> {
         const MAX_LIVE_LOCATION_SECONDS: i64 = 8 * 60 * 60;
 
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let mut statement = connection.prepare(
             "SELECT messages.chat_jid, chats.is_group, messages.timestamp, messages.media_json
              FROM messages JOIN chats ON chats.jid = messages.chat_jid
@@ -1936,10 +1906,7 @@ impl Database {
         sender_id: &str,
         state: &crate::live_location::FastRatchetState,
     ) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection.execute(
             "INSERT INTO fast_ratchet_sender_keys
                 (sender_id, key_id, iteration, chain_keys, signing_key)
@@ -1965,10 +1932,7 @@ impl Database {
         sender_id: &str,
         key_id: u32,
     ) -> Result<Option<crate::live_location::FastRatchetState>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let row = connection
             .query_row(
                 "SELECT iteration, chain_keys, signing_key
@@ -2001,10 +1965,7 @@ impl Database {
         message_id: &str,
         payload: &[u8],
     ) -> Result<bool> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         Ok(connection.execute(
             "UPDATE messages SET media_download = ?3
              WHERE chat_jid = ?1 AND id = ?2
@@ -2014,10 +1975,7 @@ impl Database {
     }
 
     pub fn media_download(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let payload = connection
             .query_row(
                 "SELECT media_download FROM messages WHERE chat_jid = ?1 AND id = ?2",
@@ -2029,10 +1987,7 @@ impl Database {
     }
 
     pub fn message_media_kind(&self, chat_jid: &str, message_id: &str) -> Result<Option<String>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let kind = connection
             .query_row(
                 "SELECT json_extract(media_json, '$.kind') FROM messages
@@ -2051,10 +2006,7 @@ impl Database {
         color: Option<i32>,
         deleted: bool,
     ) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO labels (id, name, color, deleted) VALUES (?1, COALESCE(?2, ''), ?3, ?4)
@@ -2072,10 +2024,7 @@ impl Database {
     }
 
     pub fn associate_label(&self, chat_jid: &str, label_id: &str, labeled: bool) -> Result<()> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         if labeled {
             connection.execute(
                 "INSERT OR IGNORE INTO chat_labels (chat_jid, label_id) VALUES (?1, ?2)",
@@ -2094,10 +2043,7 @@ impl Database {
         if old_jid == new_jid {
             return Ok(false);
         }
-        let mut connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let mut connection = self.connection();
         let transaction = connection.transaction()?;
         let source_exists = transaction.query_row(
             "SELECT EXISTS(
@@ -2294,10 +2240,7 @@ impl Database {
     }
 
     pub fn chat_name(&self, chat_jid: &str) -> Result<Option<String>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection
             .query_row(
                 "SELECT name FROM chats WHERE jid = ?1 AND name_source > ?2 AND name != ''",
@@ -2309,10 +2252,7 @@ impl Database {
     }
 
     pub fn unresolved_chat_jids(&self, is_group: bool, limit: u32) -> Result<Vec<String>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let mut statement = connection.prepare(
             "SELECT jid FROM chats
              WHERE is_group = ?1
@@ -2328,10 +2268,7 @@ impl Database {
     }
 
     pub fn unresolved_contact_history_cursors(&self, limit: u32) -> Result<Vec<HistoryCursor>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let mut statement = connection.prepare(
             "SELECT c.jid, m.id, m.sender_jid, m.from_me, m.timestamp
              FROM chats c
@@ -2363,10 +2300,7 @@ impl Database {
     }
 
     pub fn media_recovery_cursor(&self, chat_jid: &str) -> Result<Option<HistoryCursor>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection
             .query_row(
                 "SELECT id, sender_jid, from_me, timestamp FROM messages
@@ -2405,10 +2339,7 @@ impl Database {
         chat_jid: &str,
         message_id: &str,
     ) -> Result<Option<HistoryCursor>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         connection
             .query_row(
                 "SELECT id, sender_jid, from_me, timestamp FROM messages
@@ -2430,10 +2361,7 @@ impl Database {
     }
 
     pub fn avatar_jids(&self, limit: u32) -> Result<Vec<String>> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("history database mutex poisoned");
+        let connection = self.connection();
         let mut statement = connection.prepare(
             "WITH candidates AS (
                  SELECT jid, last_timestamp AS rank, 0 AS priority FROM chats
@@ -2475,6 +2403,40 @@ mod tests {
             media: None,
             reactions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn schema_migrations_are_idempotent_but_do_not_hide_errors() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute("CREATE TABLE legacy (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+
+        ensure_column(&connection, "legacy", "value", "value TEXT").unwrap();
+        ensure_column(&connection, "legacy", "value", "value TEXT").unwrap();
+        connection
+            .execute("INSERT INTO legacy (value) VALUES ('kept')", [])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM legacy", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "kept"
+        );
+        assert!(ensure_column(&connection, "missing", "value", "value TEXT").is_err());
+    }
+
+    #[test]
+    fn database_access_recovers_after_a_poisoned_mutex() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _connection = database.connection.lock().unwrap();
+            panic!("synthetic database worker panic");
+        }));
+        assert!(panic.is_err());
+        assert!(database.list_chats(1).unwrap().is_empty());
     }
 
     #[test]
