@@ -28,7 +28,9 @@ WhatsApp linked-device servers
 There is exactly one protocol owner. Quickshell never opens the session database
 and never connects directly to WhatsApp. This prevents competing device sessions,
 keeps notification ownership unambiguous, and lets the shell or panel restart
-without signing out. The daemon reconnects independently.
+without signing out. The daemon reconnects independently. Startup refuses to
+replace a live daemon socket or a non-socket path; only a confirmed stale Unix
+socket is removed, preventing two processes from owning the same linked session.
 
 The plugin service owns the single shell-side IPC connection and normalized UI
 state. Both the bar widget and app panel consume it. The service is on-demand and
@@ -83,10 +85,13 @@ appearance-agnostic.
   additionally capped at 64 KiB at its semantic boundary.
 - Requests optionally contain a numeric `id`. Direct responses copy it;
   broadcasts use no `id`.
-- Connecting always yields `hello` and current state, allowing the shell service
-  to recover after a daemon restart without reconstructing event streams.
-- Slow clients may lose broadcasts. The daemon then sends fresh state, and the
-  service refreshes chat/message snapshots when needed.
+- Connecting always yields a versioned `hello` and current state. The shell does
+  not issue commands until the protocol version matches; a partial or mismatched
+  installation therefore reports an actionable error instead of corrupting UI
+  request state.
+- Slow clients may lose broadcasts. The daemon repeats the versioned `hello` and
+  current state after lag, which explicitly makes the service refresh chats,
+  messages, avatars, and outbox state from authoritative snapshots.
 
 The shared Rust types in `crates/protocol` are the canonical wire contract.
 

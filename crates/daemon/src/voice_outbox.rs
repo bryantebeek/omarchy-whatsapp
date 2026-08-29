@@ -446,6 +446,7 @@ fn ogg_opus_duration_ms(bytes: &[u8]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     fn ogg_page(sequence: u32, granule: u64, body: &[u8]) -> Vec<u8> {
         assert!(body.len() <= 255);
@@ -485,13 +486,152 @@ mod tests {
     fn parses_structured_ogg_opus_duration_and_rejects_malformed_streams() {
         assert_eq!(ogg_opus_duration_ms(&recording(2_400)).unwrap(), 2_400);
         assert!(ogg_opus_duration_ms(b"OggS OpusHead").is_err());
+        let mut wrong_container = recording(1_000);
+        wrong_container[0] = b'X';
+        assert!(ogg_opus_duration_ms(&wrong_container).is_err());
         let mut wrong_codec = recording(1_000);
         wrong_codec[28..36].copy_from_slice(b"Vorbis!!");
         assert!(ogg_opus_duration_ms(&wrong_codec).is_err());
+        let mut unsupported_header = recording(1_000);
+        unsupported_header[28 + 8] = 2;
+        assert!(ogg_opus_duration_ms(&unsupported_header).is_err());
         let mut broken_sequence = recording(1_000);
         let second_page = 28 + 19;
         broken_sequence[second_page + 18..second_page + 22].copy_from_slice(&4u32.to_le_bytes());
         assert!(ogg_opus_duration_ms(&broken_sequence).is_err());
+        assert!(ogg_opus_duration_ms(&recording(MIN_DURATION_MS - 1)).is_err());
+        assert!(ogg_opus_duration_ms(&recording(MAX_DURATION_MS + 1)).is_err());
+    }
+
+    #[test]
+    fn preparation_rejects_untrusted_paths_sizes_and_changed_recordings() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = directory.path();
+        assert!(job_path(outbox, "../escape").is_err());
+        assert!(prepare(outbox, "empty-chat", "", 1).is_err());
+
+        let empty_id = "empty-recording";
+        fs::write(recording_path(outbox, empty_id).unwrap(), []).unwrap();
+        assert!(prepare(outbox, empty_id, "chat@s.whatsapp.net", 2).is_err());
+
+        let large_id = "large-recording";
+        let large_path = recording_path(outbox, large_id).unwrap();
+        fs::File::create(&large_path)
+            .unwrap()
+            .set_len(assets::MAX_AUDIO_BYTES + 1)
+            .unwrap();
+        assert!(prepare(outbox, large_id, "chat@s.whatsapp.net", 3).is_err());
+
+        let external = directory.path().with_extension("external-voice.ogg");
+        fs::write(&external, recording(1_000)).unwrap();
+        let linked_id = "linked-recording";
+        symlink(&external, recording_path(outbox, linked_id).unwrap()).unwrap();
+        assert!(prepare(outbox, linked_id, "chat@s.whatsapp.net", 4).is_err());
+        fs::remove_file(external).unwrap();
+
+        let changed_id = "changed-recording";
+        let changed_path = recording_path(outbox, changed_id).unwrap();
+        fs::write(&changed_path, recording(1_000)).unwrap();
+        prepare(outbox, changed_id, "chat@s.whatsapp.net", 5).unwrap();
+        fs::write(&changed_path, recording(2_000)).unwrap();
+        assert!(prepare(outbox, changed_id, "chat@s.whatsapp.net", 6).is_err());
+    }
+
+    #[test]
+    fn delivery_identity_is_stable_and_stored_jobs_are_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = directory.path();
+        let recording_id = "delivery-1";
+        fs::write(
+            recording_path(outbox, recording_id).unwrap(),
+            recording(1_000),
+        )
+        .unwrap();
+        let mut prepared = prepare(outbox, recording_id, "chat@s.whatsapp.net", 10).unwrap();
+        assert!(assign_delivery(outbox, &mut prepared.job, "", "MSG-1", 11).is_err());
+        assign_delivery(
+            outbox,
+            &mut prepared.job,
+            "chat@s.whatsapp.net",
+            "MSG-1",
+            12,
+        )
+        .unwrap();
+        assign_delivery(
+            outbox,
+            &mut prepared.job,
+            "chat@s.whatsapp.net",
+            "MSG-1",
+            13,
+        )
+        .unwrap();
+        assert!(
+            assign_delivery(
+                outbox,
+                &mut prepared.job,
+                "chat@s.whatsapp.net",
+                "MSG-2",
+                14,
+            )
+            .is_err()
+        );
+
+        let mut invalid = prepared.job.clone();
+        invalid.version = JOB_VERSION + 1;
+        assert!(validate_job(&invalid, recording_id).is_err());
+        prepared.job.status = StoredStatus::Sent;
+        assert!(prepared.job.entry().is_none());
+        save_job(outbox, &prepared.job).unwrap();
+        assert!(recover_interrupted(outbox, 15).unwrap().is_empty());
+        assert!(!recording_path(outbox, recording_id).unwrap().exists());
+    }
+
+    #[test]
+    fn cleanup_discards_invalid_entries_and_never_removes_unrelated_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = directory.path();
+        fs::write(outbox.join("unrelated.txt"), b"keep").unwrap();
+        fs::create_dir(outbox.join("voice-directory-1.ogg")).unwrap();
+
+        let missing_audio_id = "missing-audio";
+        fs::write(
+            recording_path(outbox, missing_audio_id).unwrap(),
+            recording(1_000),
+        )
+        .unwrap();
+        prepare(outbox, missing_audio_id, "chat@s.whatsapp.net", 20).unwrap();
+        fs::remove_file(recording_path(outbox, missing_audio_id).unwrap()).unwrap();
+
+        let invalid_id = "invalid-job";
+        fs::write(
+            recording_path(outbox, invalid_id).unwrap(),
+            recording(1_000),
+        )
+        .unwrap();
+        fs::write(job_path(outbox, invalid_id).unwrap(), b"not json").unwrap();
+        cleanup(outbox, 21).unwrap();
+        assert!(outbox.join("unrelated.txt").exists());
+        assert!(outbox.join("voice-directory-1.ogg").is_dir());
+        assert!(!job_path(outbox, missing_audio_id).unwrap().exists());
+        assert!(!job_path(outbox, invalid_id).unwrap().exists());
+
+        let preserved_id = "preserved-large";
+        let preserved_path = recording_path(outbox, preserved_id).unwrap();
+        fs::write(&preserved_path, recording(1_000)).unwrap();
+        prepare(outbox, preserved_id, "chat@s.whatsapp.net", 22).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&preserved_path)
+            .unwrap()
+            .set_len(MAX_OUTBOX_BYTES + 1)
+            .unwrap();
+        cleanup_inner(outbox, 23, Some(preserved_id)).unwrap();
+        assert!(preserved_path.exists());
+
+        let blocked_id = "blocked-removal";
+        fs::create_dir(recording_path(outbox, blocked_id).unwrap()).unwrap();
+        assert!(discard(outbox, blocked_id).is_err());
+        assert!(outbox_name("voice-invalid!.ogg").is_none());
     }
 
     #[test]
@@ -533,6 +673,8 @@ mod tests {
                 .unwrap()
                 .contains("retry is safe")
         );
+        let recovered_again = recover_interrupted(outbox, retry_time + 2).unwrap();
+        assert_eq!(recovered_again[0].status, VoiceOutboxStatus::Failed);
     }
 
     #[test]

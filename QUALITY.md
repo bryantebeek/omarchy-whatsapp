@@ -59,8 +59,9 @@ approval dismissal when a second maintainer with write access is added.
 1. Total Rust line coverage may not fall below 54.8%, the measured
    whole-program baseline when this policy was last ratcheted.
 2. Every line in the deterministic contract layer must be covered. This is the
-   protocol crate and the exhaustive upstream-event policy in
-   `event_coverage.rs`; the threshold is both 100% overall and 100% per file.
+   protocol crate, the durable voice-outbox state machine, and the exhaustive
+   upstream-event policy in `event_coverage.rs`; the threshold is both 100%
+   overall and 100% per file.
 3. In CI, every executable Rust line added or changed relative to the pull
    request base (or previous pushed commit) must be covered. Diff coverage is
    therefore 100%, preventing new coverage debt while legacy integration

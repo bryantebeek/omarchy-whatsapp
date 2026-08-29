@@ -20,7 +20,7 @@ use omarchy_whatsapp_protocol::{
 };
 use qrcode::{QrCode, render::svg};
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, LazyLock, Mutex as StdMutex,
@@ -77,6 +77,7 @@ struct Shared {
     group_name_sync: Mutex<()>,
     media_recovery_requested: RwLock<HashSet<String>>,
     media_downloads: Mutex<HashSet<String>>,
+    voice_outbox_gate: Mutex<()>,
 }
 
 fn remove_sqlite_store(path: &Path) -> Result<()> {
@@ -107,6 +108,7 @@ fn reset_private_directory(path: &Path) -> Result<()> {
 }
 
 async fn clear_local_account_data(paths: &AppPaths, shared: &Shared) -> Result<()> {
+    let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
     shared.database.clear_account_data()?;
     reset_private_directory(&shared.avatar_dir)?;
     reset_private_directory(&shared.media_dir)?;
@@ -166,10 +168,20 @@ enum PendingMedia {
 }
 
 impl Shared {
+    fn unread_total_or_zero(&self) -> u32 {
+        match self.database.unread_total() {
+            Ok(total) => total,
+            Err(error) => {
+                warn!(%error, "could not read WhatsApp unread total");
+                0
+            }
+        }
+    }
+
     async fn set_status(&self, status: ConnectionStatus) {
         self.write_pairing_qr(&status);
         *self.status.write().await = status.clone();
-        let total = self.database.unread_total().unwrap_or(0);
+        let total = self.unread_total_or_zero();
         let _ = self.events.send(ServerFrame::event(ServerEvent::State {
             status,
             unread_total: total,
@@ -270,7 +282,7 @@ impl Shared {
     async fn state_event(&self) -> ServerEvent {
         ServerEvent::State {
             status: self.status.read().await.clone(),
-            unread_total: self.database.unread_total().unwrap_or(0),
+            unread_total: self.unread_total_or_zero(),
         }
     }
 
@@ -552,7 +564,7 @@ impl Shared {
                 let _ = self.events.send(ServerFrame::event(ServerEvent::Message {
                     message: message.clone(),
                 }));
-                let total = self.database.unread_total().unwrap_or(0);
+                let total = self.unread_total_or_zero();
                 let _ = self
                     .events
                     .send(ServerFrame::event(ServerEvent::Unread { total }));
@@ -1335,8 +1347,10 @@ async fn canonical_contact_jid(shared: &Shared, client: &Client, jid: &Jid) -> S
     let mapping = match client.get_lid_pn_entry(jid).await {
         Ok(Some(mapping)) => mapping,
         Ok(None) => {
-            if jid.is_pn() {
-                let _ = shared.database.update_chat_phone_number(&raw, &jid.user);
+            if jid.is_pn()
+                && let Err(error) = shared.database.update_chat_phone_number(&raw, &jid.user)
+            {
+                warn!(%error, %raw, "could not persist WhatsApp phone number");
             }
             return raw;
         }
@@ -1520,32 +1534,44 @@ fn metadata_jid(value: &str, server: &str) -> String {
 }
 
 fn broadcast_chats(shared: &Shared) {
-    if let Ok(chats) = shared.database.list_chats(CHAT_LIST_LIMIT) {
-        let _ = shared
-            .events
-            .send(ServerFrame::event(ServerEvent::Chats { chats }));
+    match shared.database.list_chats(CHAT_LIST_LIMIT) {
+        Ok(chats) => {
+            let _ = shared
+                .events
+                .send(ServerFrame::event(ServerEvent::Chats { chats }));
+        }
+        Err(error) => warn!(%error, "could not publish WhatsApp chat state"),
     }
 }
 
 fn broadcast_unread(shared: &Shared) {
-    let total = shared.database.unread_total().unwrap_or(0);
-    let _ = shared
-        .events
-        .send(ServerFrame::event(ServerEvent::Unread { total }));
+    match shared.database.unread_total() {
+        Ok(total) => {
+            let _ = shared
+                .events
+                .send(ServerFrame::event(ServerEvent::Unread { total }));
+        }
+        Err(error) => warn!(%error, "could not publish WhatsApp unread state"),
+    }
 }
 
 fn broadcast_messages(shared: &Shared, chat_jid: &str) {
-    if let (Ok(messages), Ok(first_unread_message_id)) = (
+    match (
         shared.database.messages(chat_jid, 300),
         shared.database.first_unread_message_id(chat_jid),
     ) {
-        let _ = shared
-            .events
-            .send(ServerFrame::event(ServerEvent::Messages {
-                chat_jid: chat_jid.to_owned(),
-                messages,
-                first_unread_message_id,
-            }));
+        (Ok(messages), Ok(first_unread_message_id)) => {
+            let _ = shared
+                .events
+                .send(ServerFrame::event(ServerEvent::Messages {
+                    chat_jid: chat_jid.to_owned(),
+                    messages,
+                    first_unread_message_id,
+                }));
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            warn!(%error, %chat_jid, "could not publish WhatsApp message state");
+        }
     }
 }
 
@@ -1627,10 +1653,13 @@ async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
             // Participating metadata covers current groups in one request. Old
             // conversations can be absent from that response, so make a small
             // best-effort pass over the few unresolved subjects as well.
-            let unresolved = shared
-                .database
-                .unresolved_chat_jids(true, 32)
-                .unwrap_or_default();
+            let unresolved = match shared.database.unresolved_chat_jids(true, 32) {
+                Ok(unresolved) => unresolved,
+                Err(error) => {
+                    warn!(%error, "could not select unresolved WhatsApp group subjects");
+                    return;
+                }
+            };
             for raw_jid in unresolved {
                 let Ok(jid) = raw_jid.parse::<Jid>() else {
                     continue;
@@ -1667,10 +1696,14 @@ async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
 }
 
 async fn sync_missing_contact_names(shared: Arc<Shared>, client: Arc<Client>) {
-    let jids = shared
-        .database
-        .unresolved_chat_jids(false, 100)
-        .unwrap_or_default()
+    let unresolved = match shared.database.unresolved_chat_jids(false, 100) {
+        Ok(unresolved) => unresolved,
+        Err(error) => {
+            warn!(%error, "could not select unresolved WhatsApp contact names");
+            return;
+        }
+    };
+    let jids = unresolved
         .into_iter()
         .filter_map(|raw| raw.parse::<Jid>().ok())
         .filter(|jid| (jid.is_pn() || jid.is_lid()) && jid.user.as_str() != "0")
@@ -1696,12 +1729,12 @@ async fn sync_missing_contact_names(shared: Arc<Shared>, client: Arc<Client>) {
                     candidates.push(lid.to_non_ad_string());
                 }
                 for jid in candidates {
-                    if shared
-                        .database
-                        .update_contact_name(&jid, &name)
-                        .unwrap_or(false)
-                    {
-                        updated += 1;
+                    match shared.database.update_contact_name(&jid, &name) {
+                        Ok(true) => updated += 1,
+                        Ok(false) => {}
+                        Err(error) => {
+                            warn!(%error, %jid, "could not persist WhatsApp business profile name");
+                        }
                     }
                 }
             }
@@ -1738,10 +1771,14 @@ async fn sync_avatars(shared: Arc<Shared>, client: Arc<Client>) {
     // sync passes serialized so a pass queued by each history chunk observes
     // the chats imported by the preceding pass without fetching duplicates.
     let _sync_guard = shared.avatar_sync.lock().await;
-    let jids = shared
-        .database
-        .avatar_jids(AVATAR_SYNC_LIMIT)
-        .unwrap_or_default()
+    let avatar_jids = match shared.database.avatar_jids(AVATAR_SYNC_LIMIT) {
+        Ok(jids) => jids,
+        Err(error) => {
+            warn!(%error, "could not select WhatsApp avatars to synchronize");
+            return;
+        }
+    };
+    let jids = avatar_jids
         .into_iter()
         .filter_map(|raw| raw.parse::<Jid>().ok())
         .filter(|jid| !jid.is_status_broadcast() && !jid.is_newsletter())
@@ -1772,7 +1809,7 @@ async fn download_pending_media(
         let client = Arc::clone(&client);
         let shared = Arc::clone(&shared);
         async move {
-            match pending {
+            let result = match pending {
                 PendingMedia::Image {
                     image,
                     chat_jid,
@@ -1812,8 +1849,14 @@ async fn download_pending_media(
                 PendingMedia::Document { document, path } => {
                     assets::download_message_document(client, document, path).await
                 }
+            };
+            match result {
+                Ok(changed) => changed,
+                Err(error) => {
+                    warn!(%error, "could not cache WhatsApp history media");
+                    false
+                }
             }
-            .unwrap_or(false)
         }
     }))
     .buffer_unordered(3)
@@ -1863,10 +1906,16 @@ async fn request_missing_contact_history(shared: Arc<Shared>, client: Arc<Client
         // On a fresh link, Connected can arrive before the first history chunk.
         // Do not consume the one-time recovery until at least one real chat is
         // present; the HistorySync handler will retry after importing it.
-        if !shared.database.list_chats(1).unwrap_or_default().is_empty()
-            && let Err(error) = write_private_marker(&shared.contact_history_marker)
-        {
-            warn!(%error, "could not mark contact history recovery complete");
+        match shared.database.list_chats(1) {
+            Ok(chats) if !chats.is_empty() => {
+                if let Err(error) = write_private_marker(&shared.contact_history_marker) {
+                    warn!(%error, "could not mark contact history recovery complete");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, "could not inspect chats after contact history recovery");
+            }
         }
         return;
     }
@@ -2703,6 +2752,43 @@ async fn maintain_live_location_subscriptions(shared: Arc<Shared>) {
     }
 }
 
+async fn bind_private_listener(socket: &Path) -> Result<UnixListener> {
+    match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                bail!(
+                    "refusing to replace non-socket IPC path {}",
+                    socket.display()
+                );
+            }
+            match UnixStream::connect(socket).await {
+                Ok(_) => bail!("another omarchy-whatsapp daemon is already running"),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    std::fs::remove_file(socket)
+                        .with_context(|| format!("removing stale socket {}", socket.display()))?;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("checking existing socket {}", socket.display()));
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting socket {}", socket.display()));
+        }
+    }
+    let listener =
+        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -2754,13 +2840,7 @@ async fn main() -> Result<()> {
         library_events, excluded_events, "loaded exhaustive WhatsApp event policy"
     );
 
-    if paths.socket.exists() {
-        std::fs::remove_file(&paths.socket)
-            .with_context(|| format!("removing stale socket {}", paths.socket.display()))?;
-    }
-    let listener = UnixListener::bind(&paths.socket)
-        .with_context(|| format!("binding {}", paths.socket.display()))?;
-    std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
+    let listener = bind_private_listener(&paths.socket).await?;
 
     let (events, _) = broadcast::channel(256);
     let shared = Arc::new(Shared {
@@ -2784,6 +2864,7 @@ async fn main() -> Result<()> {
         group_name_sync: Mutex::new(()),
         media_recovery_requested: RwLock::new(HashSet::new()),
         media_downloads: Mutex::new(HashSet::new()),
+        voice_outbox_gate: Mutex::new(()),
     });
 
     tokio::spawn(backfill_video_previews(Arc::clone(&shared)));
@@ -2948,7 +3029,7 @@ async fn main() -> Result<()> {
                                     .events
                                     .send(ServerFrame::event(ServerEvent::Chats { chats }));
                             }
-                            let total = shared.database.unread_total().unwrap_or(0);
+                            let total = shared.unread_total_or_zero();
                             let _ = shared
                                 .events
                                 .send(ServerFrame::event(ServerEvent::Unread { total }));
@@ -3096,6 +3177,20 @@ async fn serve(listener: UnixListener, shared: Arc<Shared>) -> Result<()> {
     }
 }
 
+async fn write_connection_sync(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    shared: &Shared,
+) -> Result<()> {
+    write_frame(
+        write,
+        &ServerFrame::event(ServerEvent::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        }),
+    )
+    .await?;
+    write_frame(write, &ServerFrame::event(shared.state_event().await)).await
+}
+
 async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()> {
     let (read, mut write) = stream.into_split();
     // Bound memory even if another process owned by the same user sends a line
@@ -3110,14 +3205,7 @@ async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()>
         responses,
         command_shared,
     ));
-    write_frame(
-        &mut write,
-        &ServerFrame::event(ServerEvent::Hello {
-            protocol_version: PROTOCOL_VERSION,
-        }),
-    )
-    .await?;
-    write_frame(&mut write, &ServerFrame::event(shared.state_event().await)).await?;
+    write_connection_sync(&mut write, &shared).await?;
 
     loop {
         tokio::select! {
@@ -3143,7 +3231,10 @@ async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()>
             event = events.recv() => match event {
                 Ok(event) => write_frame(&mut write, &event).await?,
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    write_frame(&mut write, &ServerFrame::event(shared.state_event().await)).await?;
+                    // Repeating the versioned hello makes lag recovery explicit:
+                    // compatible clients refresh every authoritative snapshot,
+                    // rather than treating a state frame as a complete resync.
+                    write_connection_sync(&mut write, &shared).await?;
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
             },
@@ -3266,6 +3357,19 @@ async fn request_exact_message(
     client.send_pdo_placeholder_resend_request(&info).await
 }
 
+async fn finish_media_recovery_attempt(shared: &Shared, chat_jid: &str, succeeded: bool) -> bool {
+    // The set is a successful-attempt marker as well as an in-flight guard.
+    // Only a total transient failure should re-arm the next UI refresh.
+    if succeeded {
+        return false;
+    }
+    shared
+        .media_recovery_requested
+        .write()
+        .await
+        .remove(chat_jid)
+}
+
 async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<ServerEvent> {
     match command {
         Command::GetState => Ok(shared.state_event().await),
@@ -3312,12 +3416,15 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                             .insert(chat_jid.clone())
                         && let Ok(jid) = chat_jid.parse::<Jid>()
                     {
+                        let recovery_chat_jid = chat_jid.clone();
+                        let recovery_shared = Arc::clone(shared);
                         tokio::spawn(async move {
-                            if let Err(error) = request_exact_message(&client, &cursor).await {
+                            let exact_result = request_exact_message(&client, &cursor).await;
+                            if let Err(error) = &exact_result {
                                 warn!(%error, %jid, message_id = %cursor.message_id,
                                     "could not request exact media recovery");
                             }
-                            if let Err(error) = client
+                            let history_result = client
                                 .fetch_message_history(
                                     &jid,
                                     &cursor.message_id,
@@ -3325,10 +3432,16 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                                     cursor.timestamp_ms,
                                     50,
                                 )
-                                .await
-                            {
+                                .await;
+                            if let Err(error) = &history_result {
                                 warn!(%error, %jid, "could not request media history recovery");
                             }
+                            finish_media_recovery_attempt(
+                                &recovery_shared,
+                                &recovery_chat_jid,
+                                exact_result.is_ok() || history_result.is_ok(),
+                            )
+                            .await;
                         });
                     }
                     shared.database.messages(&chat_jid, limit)?
@@ -3396,6 +3509,10 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             chat_jid,
             recording_id,
         } => {
+            // IPC queues are per connection. Serialize the small voice outbox
+            // globally so the shell and CLI cannot prepare/send one recording
+            // concurrently with each other.
+            let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
             let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
             let outbox_dir = shared.voice_outbox_dir.clone();
             let prepare_recording_id = recording_id.clone();
@@ -3572,11 +3689,15 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             }
         }
         Command::DiscardVoiceRecording { recording_id } => {
+            let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
             voice_outbox::discard(&shared.voice_outbox_dir, &recording_id)?;
             broadcast_voice_outbox(shared);
             Ok(ServerEvent::Ack)
         }
-        Command::ListVoiceOutbox => voice_outbox_event(shared),
+        Command::ListVoiceOutbox => {
+            let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
+            voice_outbox_event(shared)
+        }
         Command::CreatePoll {
             chat_jid,
             question,
@@ -4309,6 +4430,7 @@ mod tests {
             group_name_sync: Mutex::new(()),
             media_recovery_requested: RwLock::new(HashSet::new()),
             media_downloads: Mutex::new(HashSet::new()),
+            voice_outbox_gate: Mutex::new(()),
         }
     }
 
@@ -4481,6 +4603,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listener_rejects_live_daemons_and_non_socket_paths_but_replaces_stale_sockets() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        std::fs::write(&socket, b"do not replace").unwrap();
+        assert!(bind_private_listener(&socket).await.is_err());
+        assert_eq!(std::fs::read(&socket).unwrap(), b"do not replace");
+        std::fs::remove_file(&socket).unwrap();
+
+        let live = UnixListener::bind(&socket).unwrap();
+        let error = bind_private_listener(&socket).await.unwrap_err();
+        assert!(error.to_string().contains("already running"));
+        drop(live);
+
+        let rebound = bind_private_listener(&socket).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn failed_media_recovery_is_rearmed_but_a_successful_attempt_stays_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        shared
+            .media_recovery_requested
+            .write()
+            .await
+            .insert("chat@s.whatsapp.net".into());
+        assert!(finish_media_recovery_attempt(&shared, "chat@s.whatsapp.net", false).await);
+        assert!(shared.media_recovery_requested.read().await.is_empty());
+
+        shared
+            .media_recovery_requested
+            .write()
+            .await
+            .insert("chat@s.whatsapp.net".into());
+        assert!(!finish_media_recovery_attempt(&shared, "chat@s.whatsapp.net", true).await);
+        assert!(
+            shared
+                .media_recovery_requested
+                .read()
+                .await
+                .contains("chat@s.whatsapp.net")
+        );
+    }
+
+    #[tokio::test]
     async fn ipc_broadcasts_continue_while_a_command_is_waiting() {
         let directory = tempfile::tempdir().unwrap();
         let shared = Arc::new(test_shared(&directory));
@@ -4519,6 +4690,56 @@ mod tests {
 
         drop(client_stream);
         assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn lagged_ipc_clients_receive_a_versioned_resync_handshake() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        let server_shared = Arc::clone(&shared);
+        let server =
+            tokio::spawn(async move { serve_connection(server_stream, server_shared).await });
+
+        let mut buffer = Vec::new();
+        for _ in 0..2 {
+            buffer.clear();
+            read_test_frame(&mut client_stream, &mut buffer).await;
+        }
+
+        let oversized = "x".repeat(96 * 1024);
+        for _ in 0..24 {
+            shared
+                .events
+                .send(ServerFrame::event(ServerEvent::Error {
+                    message: oversized.clone(),
+                }))
+                .unwrap();
+        }
+
+        let hello = loop {
+            buffer.clear();
+            let frame = read_test_frame(&mut client_stream, &mut buffer).await;
+            if matches!(frame.event, ServerEvent::Hello { .. }) {
+                break frame;
+            }
+        };
+        assert_eq!(
+            hello.event,
+            ServerEvent::Hello {
+                protocol_version: PROTOCOL_VERSION
+            }
+        );
+        buffer.clear();
+        assert!(matches!(
+            read_test_frame(&mut client_stream, &mut buffer).await.event,
+            ServerEvent::State { .. }
+        ));
+
+        drop(client_stream);
+        // Pending oversized broadcasts can observe the intentional client
+        // close as a broken pipe; the connection task itself must not panic.
+        let _ = server.await.unwrap();
     }
 
     #[tokio::test]
