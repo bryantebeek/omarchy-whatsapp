@@ -26,15 +26,169 @@ mind.
 - A hardened user systemd service, launcher entry, scalable icon, installer,
   uninstaller, and Arch `PKGBUILD`.
 
-The app renders contact, group, and group-participant avatars; encrypted image,
-video, and voice messages; documents; static/live-location cards; and
+The app renders contact, group, and group-participant avatars; online and
+last-seen presence; direct and group typing/recording indicators; encrypted
+image, video, and voice messages; documents; static/live-location cards; and
 synchronized emoji reactions. Poll cards show live vote totals and let you vote
 or revise your selection; new single- or multiple-answer polls can be created
 from the composer. Voice notes download on demand and play inline. Reaction
 chips aggregate matching emoji and support adding, changing, and removing your
 reaction. Location cards open in the system browser using OpenStreetMap,
 avoiding an embedded browser engine. Stickers, full calling, search, and group
-administration remain lightweight placeholders or out of scope.
+administration are not yet implemented. The roadmap below separates
+package-backed work from app-specific scope.
+
+## Roadmap
+
+This roadmap tracks user-facing capabilities exposed by the pinned
+`whatsapp-rust` release that are not yet available end-to-end through the
+daemon, IPC protocol, and Quickshell interface. A synchronized setting or a
+text placeholder does not count as complete until the user can inspect and
+operate it in this app.
+
+The order is directional rather than a release promise. Each item also needs
+the corresponding Rust, IPC, QML, workflow, coverage, mutation, packaging, and
+live-deployment work required by this repository's quality gates.
+
+### Rich messaging
+
+- [ ] Upload and send images, videos, GIFs, documents, regular audio, and voice
+  notes.
+- [ ] Reply to and quote messages, including group-participant context.
+- [ ] Compose user and group mentions.
+- [ ] Forward existing text and media messages with the correct forwarded
+  metadata.
+- [ ] Edit sent messages.
+- [ ] Delete a message for everyone, including group-admin revocation where
+  permitted.
+- [ ] Delete a message only for this account and optionally remove its cached
+  media.
+- [ ] Keep or unkeep messages in disappearing chats.
+- [ ] Pin and unpin individual messages, with supported pin durations.
+- [ ] Send played receipts after voice and video messages are actually played.
+- [ ] Render and download static, animated, and Lottie stickers instead of a
+  placeholder.
+- [ ] Fetch first-party sticker packs and create, upload, and send custom
+  sticker packs.
+- [ ] Create structured events with descriptions, times, locations, call
+  links, and guest policy; render events and send RSVP responses.
+- [ ] Render and send encrypted comments on Community Announcement posts.
+- [ ] Add structured handling for contact cards and group invites instead of
+  reducing them to text placeholders.
+- [ ] Add outbound contact-card, static-location, and live-location messages
+  through the package's generic message API.
+
+### Chats, history, and organization
+
+- [ ] Archive and unarchive chats.
+- [ ] Mute, timed-mute, and unmute chats.
+- [ ] Star and unstar messages, and expose a starred-message view.
+- [ ] Mark chats unread as well as read.
+- [ ] Delete chats and clear chat history, with explicit starred-message and
+  cached-media choices.
+- [ ] Mute and unmute individual contacts' status updates.
+- [ ] Save or rename contacts and optionally synchronize them to the primary
+  phone address book.
+- [ ] Create, rename, recolor, and delete labels.
+- [ ] Associate and disassociate labels with chats, then expose label filtering
+  in the interface.
+- [ ] Configure the account-default disappearing-message duration.
+- [ ] Configure disappearing messages for direct chats and groups.
+- [ ] Apply message-expiry behavior in local history rather than only storing
+  synchronized disappearing-mode metadata.
+
+### Contacts, profiles, safety, and privacy
+
+- [ ] Check whether a phone number is registered on WhatsApp before opening a
+  new conversation.
+- [ ] Show full contact information, about text, full-size profile pictures,
+  verified names, and business profiles.
+- [ ] Change this account's push name, about/status text, and profile picture,
+  including picture removal.
+- [ ] Block and unblock contacts, list blocked contacts, and show blocked state.
+- [ ] Report direct or group messages as spam with the available report flows.
+- [ ] Fetch and edit last-seen, online, profile-photo, about/status, group-add,
+  read-receipt, call-add, message, and defense-mode privacy settings.
+- [ ] Manage per-contact privacy exclusion lists for supported categories.
+
+### Groups
+
+- [ ] Create and leave groups.
+- [ ] Edit group subjects, descriptions, and profile pictures.
+- [ ] Add and remove participants, including removal from linked community
+  groups.
+- [ ] Promote and demote group administrators.
+- [ ] Create, inspect, revoke, and join through group invite links and V4
+  invites.
+- [ ] View, approve, reject, cancel, and revoke membership requests.
+- [ ] Configure locked and announcement modes.
+- [ ] Configure who may add members, share invite links, and share history with
+  new members.
+- [ ] Configure membership approval, group-history sharing, frequently
+  forwarded-message restrictions, admin reporting, and sharing limits.
+- [ ] Display the full group metadata already available from the package,
+  including creation, ownership, permissions, suspension, and community state.
+- [ ] Set or clear per-group member labels.
+- [ ] Use batch group-info and profile-picture queries where they improve large
+  account synchronization.
+
+### Communities
+
+- [ ] Create and deactivate communities.
+- [ ] Create community subgroups.
+- [ ] Link and unlink existing subgroups.
+- [ ] List communities and their subgroups, participant counts, and linked
+  participants.
+- [ ] Join subgroups and remove participants across community structures.
+
+### Newsletters and status
+
+- [ ] List subscribed newsletters and show newsletter metadata and history.
+- [ ] Create, join, leave, and update newsletters, including invite lookup.
+- [ ] Send newsletter messages and support newsletter reactions, edits, and
+  revocation.
+- [ ] Configure follower/admin newsletter mute and live-update subscriptions.
+- [ ] Show received WhatsApp status/story posts instead of filtering the status
+  broadcast from the messenger UI.
+- [ ] Post and revoke text, image, and video statuses.
+- [ ] Configure status recipients with contacts, allow-list, and deny-list
+  privacy modes.
+
+### Presence and chat state
+
+- [x] Publish available and unavailable presence.
+- [x] Subscribe and unsubscribe from contact presence, then display online and
+  last-seen state.
+- [x] Receive and display direct and group typing and recording indicators.
+- [x] Send composing and paused chat-state updates from the text composer.
+- [ ] Send recording chat-state while capturing a voice note once outbound
+  voice-note recording is implemented.
+
+### Linking and calls
+
+- [ ] Add phone-number pair-code linking, including custom codes, refresh,
+  cancellation, and error recovery.
+- [ ] Add WebAuthn/passkey linking and confirmation flows.
+- [ ] Let the user reject an incoming call and explicitly terminate signaling;
+  these controls are available without compiling the media runtime.
+- [ ] Enable an appropriate optional `whatsapp-rust` VoIP profile and implement
+  1:1 audio/video calling.
+- [ ] Add native group calls and calls bound to existing WhatsApp groups.
+- [ ] Create, preview, join, and manage audio/video call links and waiting
+  rooms.
+- [ ] Add in-call participant invitation/ringing, mute, hand raise, reactions,
+  video upgrades, screen sharing, and hangup controls.
+
+### Scope notes
+
+- Message-content search remains a separate product feature: the pinned
+  package does not expose a comparable high-level server-side search API.
+- Custom storage, transports, runtimes, native library plugins, telemetry,
+  Signal internals, retry machinery, raw nodes, and arbitrary protobuf fields
+  are integration primitives rather than WhatsApp UI roadmap items.
+- Full VoIP is not part of the current dependency feature set and will increase
+  binary size and require audio/video device integration. Call rejection and
+  termination do not require that optional media feature.
 
 ## Install on Omarchy
 
