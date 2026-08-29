@@ -29,8 +29,10 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
+  readonly property int protocolVersion: 23
 
   property bool connected: false
+  property bool protocolCompatible: false
   property string connectionState: "starting"
   property string connectionDetail: ""
   property double pairingExpiresAt: 0
@@ -792,7 +794,7 @@ Item {
 
   function send(command, fields) {
     var socket = socketLoader.item
-    if (!socket || !socket.connected) return 0
+    if (!socket || !socket.connected || !protocolCompatible) return 0
     var payload = { id: nextRequestId++, command: String(command || "") }
     fields = fields || {}
     for (var key in fields) payload[key] = fields[key]
@@ -1105,11 +1107,40 @@ Item {
     }
   }
 
+  function handleHello(frame) {
+    var received = Number(frame ? frame.protocol_version : 0)
+    if (!isFinite(received) || Math.floor(received) !== received
+        || received !== protocolVersion) {
+      protocolCompatible = false
+      connectionState = "error"
+      var versionLabel = isFinite(received) && received > 0
+        ? String(received) : "unknown"
+      connectionDetail = "WhatsApp component version mismatch (shell protocol "
+        + protocolVersion + ", daemon protocol " + versionLabel
+        + "). Reinstall or update the plugin."
+      lastError = connectionDetail
+      clearPresenceState()
+      return false
+    }
+    protocolCompatible = true
+    connectionDetail = ""
+    lastError = ""
+    refresh()
+    updateActiveChat()
+    sendPresence(true)
+    return true
+  }
+
   function handleLine(line) {
     var frame
     try { frame = JSON.parse(String(line || "")) }
     catch (error) { return }
     if (!frame || !frame.event) return
+    if (frame.event === "hello") {
+      handleHello(frame)
+      return
+    }
+    if (!protocolCompatible) return
     var frameId = frame.id === undefined || frame.id === null
       ? "" : String(frame.id)
     var requestedMessagesJid = frameId
@@ -1120,9 +1151,7 @@ Item {
     finishVoiceMessageRequest(frame)
     var queuedMessagesJid = finishMessagesRequest(frame)
     lastError = ""
-    if (frame.event === "hello") {
-      refresh()
-    } else if (frame.event === "state") {
+    if (frame.event === "state") {
       handleState(frame)
     } else if (frame.event === "chats") {
       chats = copyArray(frame.chats)
@@ -1235,6 +1264,7 @@ Item {
       onConnectionStateChanged: {
         root.connected = connected
         if (connected) {
+          root.protocolCompatible = false
           root.groupParticipantRequestJids = ({})
           root.messagesRequestIds = ({})
           root.messagesRequestJids = ({})
@@ -1244,16 +1274,15 @@ Item {
           root.reconnectAttempt = 0
           root.lastError = ""
           root.sentPresenceState = -1
-          root.refresh()
-          root.updateActiveChat()
-          root.sendPresence(true)
         } else {
+          root.protocolCompatible = false
           root.clearPresenceState()
           root.sentPresenceState = -1
         }
       }
       onError: function(_error) {
         root.connected = false
+        root.protocolCompatible = false
         root.connectionState = "starting"
         root.clearPresenceState()
         root.sentPresenceState = -1

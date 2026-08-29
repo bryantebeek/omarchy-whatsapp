@@ -34,6 +34,10 @@ TestCase {
     })
     verify(service !== null)
     tryCompare(service, "connected", true)
+    service.handleLine(JSON.stringify({
+      event: "hello", protocol_version: service.protocolVersion
+    }))
+    compare(service.protocolCompatible, true)
     TestIo.socketWrites = []
     TestIo.processStarts = []
     messagesWillChangeCount = 0
@@ -83,6 +87,12 @@ TestCase {
     socket.connected = false
     compare(service.send("offline"), 0)
     socket.connected = true
+    compare(service.protocolCompatible, false)
+    compare(service.send("before-handshake"), 0)
+    service.handleLine(JSON.stringify({
+      event: "hello", protocol_version: service.protocolVersion
+    }))
+    TestIo.socketWrites = []
 
     service.refreshMetadata()
     var frames = sentFrames()
@@ -90,6 +100,38 @@ TestCase {
     compare(frames[frames.length - 3].command, "list_chats")
     compare(frames[frames.length - 2].command, "list_avatars")
     compare(frames[frames.length - 1].command, "list_voice_outbox")
+  }
+
+  function test_protocol_handshake_rejects_version_skew_and_drives_resync() {
+    TestIo.socketWrites = []
+    service.handleLine(JSON.stringify({
+      event: "hello", protocol_version: service.protocolVersion + 1
+    }))
+    compare(service.protocolCompatible, false)
+    compare(service.connectionState, "error")
+    verify(service.connectionDetail.indexOf("component version mismatch") >= 0)
+    verify(service.connectionDetail.indexOf(String(service.protocolVersion + 1)) >= 0)
+    compare(service.send("blocked"), 0)
+    service.handleLine(JSON.stringify({
+      event: "state", status: { state: "connected" }, unread_total: 99
+    }))
+    compare(service.connectionState, "error")
+    compare(service.unreadTotal, 0)
+
+    service.handleLine(JSON.stringify({ event: "hello" }))
+    compare(service.protocolCompatible, false)
+    verify(service.connectionDetail.indexOf("unknown") >= 0)
+
+    service.handleLine(JSON.stringify({
+      event: "hello", protocol_version: service.protocolVersion
+    }))
+    compare(service.protocolCompatible, true)
+    compare(service.lastError, "")
+    var frames = sentFrames()
+    verify(frames.some(function(frame) { return frame.command === "get_state" }))
+    verify(frames.some(function(frame) { return frame.command === "list_chats" }))
+    verify(frames.some(function(frame) { return frame.command === "list_avatars" }))
+    verify(frames.some(function(frame) { return frame.command === "list_voice_outbox" }))
   }
 
   function test_copy_normalize_and_hex_helpers() {
@@ -750,7 +792,9 @@ TestCase {
     service.handleLine(JSON.stringify({ event: "avatars", jids: ["a", "b"], changed_jids: ["b"], revision: 7 }))
     compare(service.avatarAvailable.a, true)
     compare(service.avatarRevisions.b, 7)
-    service.handleLine(JSON.stringify({ event: "hello" }))
+    service.handleLine(JSON.stringify({
+      event: "hello", protocol_version: service.protocolVersion
+    }))
     verify(sentFrames().length > 0)
   }
 
@@ -763,5 +807,10 @@ TestCase {
     tryVerify(function() { return TestIo.sockets.length > 1 })
     tryCompare(service, "connected", true)
     compare(service.reconnectAttempt, 0)
+    compare(service.protocolCompatible, false)
+    service.handleLine(JSON.stringify({
+      event: "hello", protocol_version: service.protocolVersion
+    }))
+    compare(service.protocolCompatible, true)
   }
 }

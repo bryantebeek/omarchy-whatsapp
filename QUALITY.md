@@ -19,6 +19,10 @@ Merging should require the `Quality`, `Coverage`, `Smoke`, `Dependency review`,
 `Supply chain`, and `CodeQL` checks through the branch protection rules in the
 GitHub repository settings.
 
+The version gate checks both release metadata and the daemon/QML IPC protocol
+constant. Changing the wire contract without updating the shell handshake fails
+locally and in CI before a partially compatible build can be packaged.
+
 ## One-time GitHub settings
 
 Keep the repository's `main` ruleset configured to:
