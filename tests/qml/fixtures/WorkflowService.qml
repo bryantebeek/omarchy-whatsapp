@@ -19,6 +19,11 @@ QtObject {
   property int messageSentSerial: 0
   property int incomingMessageSerial: 0
   property int pollCreateRequestId: 0
+  property int voiceMessageRequestId: 0
+  property bool voiceRecordingTestMode: true
+  property int voiceRecordingTestDurationMs: 2400
+  property int voiceRecordingSerial: 0
+  property var voiceOutboxEntries: []
   property var pollVotes: []
   property var createdPolls: []
   property string selectedChatJid: ""
@@ -28,6 +33,8 @@ QtObject {
   property var mediaDownloadRequests: ({})
   property var calls: []
   property var sentMessages: []
+  property var sentVoiceMessages: []
+  property var discardedVoiceRecordings: []
   property var pinnedChats: []
   property var downloadedMessages: []
   property var chatStateUpdates: []
@@ -63,6 +70,57 @@ QtObject {
   function noteComposerActivity(text) {
     chatStateUpdates = chatStateUpdates.concat([String(text || "") ? "typing" : "paused"])
     return String(text || "") !== ""
+  }
+
+  function newVoiceRecording() {
+    voiceRecordingSerial++
+    var recordingId = "42-" + voiceRecordingSerial
+    return {
+      recording_id: recordingId,
+      chat_jid: selectedChatJid,
+      path: "/synthetic/outbox/voice-" + recordingId + ".ogg"
+    }
+  }
+
+  function beginVoiceRecording() {
+    chatStateUpdates = chatStateUpdates.concat(["recording"])
+    return selectedChatJid !== "" && voiceMessageRequestId === 0
+  }
+
+  function finishVoiceRecording() {
+    chatStateUpdates = chatStateUpdates.concat(["paused"])
+    return true
+  }
+
+  function sendVoiceMessage(recordingId, chatJid, durationMs) {
+    if (!chatJid || !recordingId || Number(durationMs || 0) < 250)
+      return false
+    sentVoiceMessages = sentVoiceMessages.concat([{
+      chat_jid: String(chatJid),
+      recording_id: String(recordingId),
+      duration_ms: Number(durationMs)
+    }])
+    messageSentSerial++
+    return true
+  }
+
+  function retryVoiceMessage(entry) {
+    if (!sendVoiceMessage(entry.recording_id, entry.chat_jid, entry.duration_ms))
+      return false
+    voiceOutboxEntries = voiceOutboxEntries.filter(function(value) {
+      return String(value.recording_id || "") !== String(entry.recording_id || "")
+    })
+    return true
+  }
+
+  function discardVoiceRecording(recordingId) {
+    discardedVoiceRecordings = discardedVoiceRecordings.concat([
+      String(recordingId || "")
+    ])
+    voiceOutboxEntries = voiceOutboxEntries.filter(function(entry) {
+      return String(entry.recording_id || "") !== String(recordingId || "")
+    })
+    return true
   }
 
   function chatStateLabel(jid) {

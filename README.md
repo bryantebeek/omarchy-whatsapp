@@ -34,12 +34,12 @@ conversation loads. It also synchronizes emoji reactions. Lottie
 stickers show their embedded static preview without passing sender-controlled
 animation JSON to Qt's in-process Lottie renderer. Poll cards show live vote
 totals and let you vote or revise your selection; new single- or multiple-answer
-polls can be created from the composer. Voice notes download on demand and play inline. Reaction
-chips aggregate matching emoji and support adding, changing, and removing your
-reaction. Location cards open in the system browser using OpenStreetMap,
-avoiding an embedded browser engine. Full calling, search, and group
-administration are not yet implemented. The roadmap below separates
-package-backed work from app-specific scope.
+polls can be created from the composer. Voice notes can be recorded, uploaded,
+sent, downloaded on demand, and played inline. Reaction chips aggregate matching
+emoji and support adding, changing, and removing your reaction. Location cards
+open in the system browser using OpenStreetMap, avoiding an embedded browser
+engine. Full calling, search, and group administration are not yet implemented.
+The roadmap below separates package-backed work from app-specific scope.
 
 ## Roadmap
 
@@ -55,8 +55,9 @@ live-deployment work required by this repository's quality gates.
 
 ### Rich messaging
 
-- [ ] Upload and send images, videos, GIFs, documents, regular audio, and voice
-  notes.
+- [ ] Upload and send images, videos, GIFs, documents, and regular audio.
+- [x] Record, upload, and send Ogg Opus voice notes, including recording-state
+  updates, idempotent retry, crash recovery, and private local-cache retention.
 - [ ] Reply to and quote messages, including group-participant context.
 - [ ] Compose user and group mentions.
 - [ ] Forward existing text and media messages with the correct forwarded
@@ -167,8 +168,7 @@ live-deployment work required by this repository's quality gates.
   last-seen state.
 - [x] Receive and display direct and group typing and recording indicators.
 - [x] Send composing and paused chat-state updates from the text composer.
-- [ ] Send recording chat-state while capturing a voice note once outbound
-  voice-note recording is implemented.
+- [x] Send recording chat-state while capturing a voice note.
 
 ### Linking and calls
 
@@ -291,7 +291,12 @@ only the explicit `--purge-data` option removes it.
   messages per chat. Poll creation secrets and each participant's latest vote
   stay in this private database and are not exposed through shell IPC. Raster
   images are limited to 25 MiB each and the private media cache is pruned to
-  256 MiB; profile previews are capped at 1 MiB each and 64 MiB total.
+  256 MiB; profile previews are capped at 1 MiB each and 64 MiB total. Voice
+  recordings are created in an owner-only outbox and structurally validated as
+  Ogg Opus. Failed sends can be retried with the same delivery ID; the outbox is
+  capped at eight entries and 64 MiB with seven-day retention, while abandoned
+  recordings expire after 24 hours. Successful audio is copied into the private
+  media cache before its outbox entry is removed.
 - Notification content is passed as argv, never through a shell. Clicking a
   notification asks Omarchy Shell to open the app at the relevant conversation.
 - Offline history sync is indexed but does not create desktop notifications.

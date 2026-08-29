@@ -945,6 +945,13 @@ impl Database {
         Ok(messages)
     }
 
+    pub fn message_by_id(&self, chat_jid: &str, message_id: &str) -> Result<Option<Message>> {
+        Ok(self
+            .messages(chat_jid, 1_000)?
+            .into_iter()
+            .find(|message| message.id == message_id))
+    }
+
     pub fn apply_reaction(
         &self,
         chat_jid: &str,
@@ -2505,6 +2512,19 @@ mod tests {
         assert_eq!(
             stored.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             ["a", "b"]
+        );
+        assert_eq!(
+            database
+                .message_by_id("1@s.whatsapp.net", "b")
+                .unwrap()
+                .map(|value| value.id),
+            Some("b".into())
+        );
+        assert!(
+            database
+                .message_by_id("1@s.whatsapp.net", "missing")
+                .unwrap()
+                .is_none()
         );
         database.mark_read("1@s.whatsapp.net").unwrap();
         assert_eq!(database.unread_total().unwrap(), 0);

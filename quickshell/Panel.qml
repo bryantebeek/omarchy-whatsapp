@@ -36,12 +36,30 @@ Item {
   property var activeInlineVideoCard: null
   property bool activeInlineVideoGif: false
   property var activeVoiceMessageCard: null
+  property bool voiceRecordingActive: false
+  property string voiceRecordingId: ""
+  property string voiceRecordingPath: ""
+  property string voiceRecordingChatJid: ""
+  property string voiceRecordingStopAction: ""
   property real currentTimestamp: Date.now() / 1000
   property var licenseEntries: []
   property string licenseLoadError: ""
   property alias appMenu: headerMenu
   property alias appMenuFirstAction: headerLicenseAction
   readonly property bool unreadOnly: service && service.unreadOnly === true
+  readonly property bool voiceRecordingTestMode: service
+    && service.voiceRecordingTestMode === true
+  readonly property int voiceRecordingDurationMs: voiceRecordingTestMode
+    ? Number(service.voiceRecordingTestDurationMs || 0)
+    : Number(voiceRecorder.duration || 0)
+  readonly property var voiceOutboxEntry: {
+    var entries = service && Array.isArray(service.voiceOutboxEntries)
+      ? service.voiceOutboxEntries : []
+    var selected = service ? String(service.selectedChatJid || "") : ""
+    for (var i = entries.length - 1; i >= 0; i--)
+      if (String(entries[i].chat_jid || "") === selected) return entries[i]
+    return null
+  }
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "io.github.bryantebeek.whatsapp"
@@ -315,6 +333,7 @@ Item {
     imagePreviewPopup.close()
     stopInlineVideo()
     stopVoiceMessage()
+    stopVoiceRecording(false)
     scrollToBottomAnimation.stop()
     opened = false
     controlHeld = false
@@ -436,6 +455,66 @@ Item {
     if (!service || !service.sendMessage(composer.text)) return
     composer.text = ""
     scheduleConversationScroll("bottom", "")
+  }
+
+  function startVoiceRecording() {
+    if (voiceRecordingActive || !service
+        || voiceOutboxEntry
+        || typeof service.newVoiceRecording !== "function"
+        || typeof service.beginVoiceRecording !== "function") return false
+    var recording = service.newVoiceRecording()
+    if (!recording || !recording.recording_id || !recording.path
+        || !service.beginVoiceRecording()) return false
+    voiceRecordingId = String(recording.recording_id)
+    voiceRecordingPath = String(recording.path)
+    voiceRecordingChatJid = String(recording.chat_jid || "")
+    voiceRecordingStopAction = ""
+    voiceRecordingActive = true
+    if (!voiceRecordingTestMode) {
+      voiceRecorder.outputLocation = "file://" + voiceRecordingPath
+      voiceRecorder.record()
+    }
+    return true
+  }
+
+  function completeVoiceRecordingStop() {
+    if (!voiceRecordingActive || !voiceRecordingStopAction) return false
+    var action = voiceRecordingStopAction
+    var recordingId = voiceRecordingId
+    var chatJid = voiceRecordingChatJid
+    var duration = Math.floor(voiceRecordingDurationMs)
+    voiceRecordingActive = false
+    voiceRecordingId = ""
+    voiceRecordingPath = ""
+    voiceRecordingChatJid = ""
+    voiceRecordingStopAction = ""
+    if (action === "send" && service
+        && typeof service.sendVoiceMessage === "function") {
+      var accepted = service.sendVoiceMessage(recordingId, chatJid, duration)
+      if (accepted) scheduleConversationScroll("bottom", "")
+      return accepted
+    }
+    if (service && typeof service.discardVoiceRecording === "function")
+      service.discardVoiceRecording(recordingId)
+    return action !== "send"
+  }
+
+  function stopVoiceRecording(sendRecording) {
+    if (!voiceRecordingActive) return false
+    voiceRecordingStopAction = sendRecording === true ? "send" : "discard"
+    if (service && typeof service.finishVoiceRecording === "function")
+      service.finishVoiceRecording()
+    if (voiceRecordingTestMode
+        || voiceRecorder.recorderState === MediaRecorder.StoppedState)
+      return completeVoiceRecordingStop()
+    voiceRecorder.stop()
+    return true
+  }
+
+  function voiceRecordingFailed(message) {
+    if (service)
+      service.lastError = String(message || "Could not record voice message")
+    return stopVoiceRecording(false)
   }
 
   function openPollCreator() {
@@ -953,6 +1032,40 @@ Item {
     }
   }
 
+  AudioInput {
+    id: voiceRecordingInput
+  }
+
+  MediaRecorder {
+    id: voiceRecorder
+    mediaFormat.fileFormat: MediaFormat.Ogg
+    mediaFormat.audioCodec: MediaFormat.AudioCodec.Opus
+    quality: MediaRecorder.NormalQuality
+    encodingMode: MediaRecorder.ConstantBitRateEncoding
+    audioBitRate: 32000
+    audioChannelCount: 1
+    audioSampleRate: 48000
+
+    onRecorderStateChanged: {
+      if (recorderState === MediaRecorder.StoppedState
+          && root.voiceRecordingActive && root.voiceRecordingStopAction)
+        root.completeVoiceRecordingStop()
+    }
+    onDurationChanged: {
+      if (duration >= 15 * 60 * 1000 && root.voiceRecordingActive)
+        root.stopVoiceRecording(true)
+    }
+    onErrorOccurred: function(error, errorString) {
+      if (error !== MediaRecorder.NoError)
+        root.voiceRecordingFailed(errorString)
+    }
+  }
+
+  CaptureSession {
+    audioInput: voiceRecordingInput
+    recorder: voiceRecorder
+  }
+
   NumberAnimation {
     id: scrollToBottomAnimation
 
@@ -965,6 +1078,7 @@ Item {
   Connections {
     target: root.service
     function onSelectedChatJidChanged() {
+      root.stopVoiceRecording(false)
       imagePreviewPopup.close()
       root.clearMediaDownloadAnchor()
       root.stopInlineVideo()
@@ -976,6 +1090,10 @@ Item {
       root.restoreConversationAfterMessages = false
       root.preservedConversationMessageId = ""
       Qt.callLater(root.revealSelectedChat)
+    }
+    function onConnectionStateChanged() {
+      if (!root.service || root.service.connectionState !== "connected")
+        root.stopVoiceRecording(false)
     }
     function onMessagesWillChange(preservePosition) {
       root.stopInlineVideo()
@@ -3853,11 +3971,13 @@ Item {
                       anchors.rightMargin: Style.space(14)
                       anchors.verticalCenter: parent.verticalCenter
                       spacing: Style.space(8)
+                      visible: !root.voiceRecordingActive && !root.voiceOutboxEntry
                       CrispTextField {
                         id: composer
                         objectName: "composer"
-                        width: parent.width - pollButton.width - sendButton.width
-                          - parent.spacing * 2
+                        width: parent.width - pollButton.width
+                          - voiceRecordButton.width - sendButton.width
+                          - parent.spacing * 3
                         enabled: root.service && root.service.selectedChatJid !== ""
                         placeholderText: enabled ? "Message" : "Select a conversation"
                         onTextChanged: if (root.service
@@ -3876,6 +3996,18 @@ Item {
                         onClicked: root.openPollCreator()
                       }
                       CrispButton {
+                        id: voiceRecordButton
+                        objectName: "voiceRecordButton"
+                        iconText: "󰍬"
+                        bordered: true
+                        enabled: composer.enabled && root.service
+                          && !root.voiceOutboxEntry
+                          && Number(root.service.voiceMessageRequestId || 0) === 0
+                        foreground: root.foreground
+                        tooltipText: "Record voice message"
+                        onClicked: root.startVoiceRecording()
+                      }
+                      CrispButton {
                         id: sendButton
                         objectName: "sendButton"
                         iconText: "󰒊"
@@ -3884,6 +4016,121 @@ Item {
                         foreground: root.foreground
                         tooltipText: "Send message"
                         onClicked: root.submitMessage()
+                      }
+                    }
+                    Row {
+                      id: voiceOutboxControls
+                      objectName: "voiceOutboxControls"
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.leftMargin: Style.space(14)
+                      anchors.rightMargin: Style.space(14)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(8)
+                      visible: !root.voiceRecordingActive
+                        && !!root.voiceOutboxEntry
+
+                      Text {
+                        id: voiceOutboxStatus
+                        objectName: "voiceOutboxStatus"
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: {
+                          if (!root.voiceOutboxEntry) return ""
+                          var duration = Model.mediaDuration(Math.floor(
+                            Number(root.voiceOutboxEntry.duration_ms || 0) / 1000))
+                          return root.voiceOutboxEntry.status === "sending"
+                            ? "Sending voice message…  " + duration
+                            : "Voice message failed  " + duration
+                        }
+                        color: root.voiceOutboxEntry
+                          && root.voiceOutboxEntry.status === "failed"
+                          ? Color.urgent : root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+                      Item {
+                        width: Math.max(0, parent.width - voiceOutboxStatus.width
+                          - voiceRetryButton.width - voiceOutboxDiscardButton.width
+                          - parent.spacing * 3)
+                        height: 1
+                      }
+                      CrispButton {
+                        id: voiceOutboxDiscardButton
+                        objectName: "voiceOutboxDiscardButton"
+                        iconText: "󰅖"
+                        bordered: true
+                        visible: !!root.voiceOutboxEntry
+                          && root.voiceOutboxEntry.status === "failed"
+                        enabled: !!root.voiceOutboxEntry
+                          && root.voiceOutboxEntry.status === "failed"
+                          && root.service !== null
+                        foreground: root.foreground
+                        tooltipText: "Discard failed voice message"
+                        onClicked: root.service.discardVoiceRecording(
+                          root.voiceOutboxEntry.recording_id)
+                      }
+                      CrispButton {
+                        id: voiceRetryButton
+                        objectName: "voiceRetryButton"
+                        iconText: "󰑐"
+                        bordered: true
+                        visible: !!root.voiceOutboxEntry
+                          && root.voiceOutboxEntry.status === "failed"
+                        enabled: !!root.voiceOutboxEntry
+                          && root.voiceOutboxEntry.status === "failed"
+                          && root.service !== null
+                          && root.service.connectionState === "connected"
+                          && Number(root.service.voiceMessageRequestId || 0) === 0
+                        foreground: root.foreground
+                        tooltipText: root.voiceOutboxEntry
+                          ? String(root.voiceOutboxEntry.error || "Retry voice message") : ""
+                        onClicked: root.service.retryVoiceMessage(root.voiceOutboxEntry)
+                      }
+                    }
+                    Row {
+                      id: voiceRecordingControls
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.leftMargin: Style.space(14)
+                      anchors.rightMargin: Style.space(14)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(8)
+                      visible: root.voiceRecordingActive
+
+                      Text {
+                        id: voiceRecordingStatus
+                        objectName: "voiceRecordingStatus"
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "●  " + Model.mediaDuration(
+                          Math.floor(root.voiceRecordingDurationMs / 1000))
+                        color: Color.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+                      Item {
+                        width: Math.max(0, parent.width
+                          - voiceRecordingStatus.width - voiceCancelButton.width
+                          - voiceSendButton.width - parent.spacing * 3)
+                        height: 1
+                      }
+                      CrispButton {
+                        id: voiceCancelButton
+                        objectName: "voiceCancelButton"
+                        iconText: "󰅖"
+                        bordered: true
+                        foreground: root.foreground
+                        tooltipText: "Discard voice message"
+                        onClicked: root.stopVoiceRecording(false)
+                      }
+                      CrispButton {
+                        id: voiceSendButton
+                        objectName: "voiceSendButton"
+                        iconText: "󰒊"
+                        bordered: true
+                        enabled: root.voiceRecordingDurationMs >= 250
+                        foreground: root.foreground
+                        tooltipText: "Send voice message"
+                        onClicked: root.stopVoiceRecording(true)
                       }
                     }
                   }

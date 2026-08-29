@@ -548,6 +548,20 @@ fn audio_bytes_are_safe(bytes: &[u8]) -> bool {
         || matches!(bytes, [0xff, second, ..] if second & 0xe0 == 0xe0)
 }
 
+pub fn copy_private_file(source: &Path, destination: &Path) -> Result<()> {
+    let temporary = destination.with_extension(format!("tmp-{}", std::process::id()));
+    let result = (|| -> Result<()> {
+        std::fs::copy(source, &temporary)?;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&temporary, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
 pub fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     let result = (|| -> Result<()> {
@@ -987,6 +1001,21 @@ mod tests {
         assert!(!video_bytes_are_safe(b"<html>not a video"));
         assert!(audio_bytes_are_safe(b"OggS\0\x02voice"));
         assert!(!audio_bytes_are_safe(b"<html>not audio"));
+    }
+
+    #[test]
+    fn private_file_copy_preserves_source_and_restricts_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.ogg");
+        let destination = directory.path().join("destination.ogg");
+        std::fs::write(&source, b"voice").unwrap();
+        copy_private_file(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(source).unwrap(), b"voice");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"voice");
+        assert_eq!(
+            std::fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

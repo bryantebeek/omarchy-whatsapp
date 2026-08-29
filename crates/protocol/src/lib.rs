@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 23;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -115,6 +115,24 @@ pub struct PollOption {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceOutboxStatus {
+    Sending,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceOutboxEntry {
+    pub recording_id: String,
+    pub chat_jid: String,
+    pub duration_ms: u64,
+    pub status: VoiceOutboxStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageMedia {
     Image {
@@ -214,6 +232,14 @@ pub enum Command {
         chat_jid: String,
         text: String,
     },
+    SendVoiceMessage {
+        chat_jid: String,
+        recording_id: String,
+    },
+    DiscardVoiceRecording {
+        recording_id: String,
+    },
+    ListVoiceOutbox,
     CreatePoll {
         chat_jid: String,
         question: String,
@@ -355,6 +381,9 @@ pub enum ServerEvent {
         #[serde(default)]
         changed_jids: Vec<String>,
     },
+    VoiceOutbox {
+        entries: Vec<VoiceOutboxEntry>,
+    },
     Ack,
     Pong,
     Error {
@@ -441,6 +470,37 @@ mod tests {
         );
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn voice_message_commands_round_trip_are_stable() {
+        for command in [
+            Command::SendVoiceMessage {
+                chat_jid: "31612345678@s.whatsapp.net".into(),
+                recording_id: "42-7".into(),
+            },
+            Command::DiscardVoiceRecording {
+                recording_id: "42-7".into(),
+            },
+            Command::ListVoiceOutbox,
+        ] {
+            let frame = ClientFrame::new(Some(8), command);
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+        }
+
+        let event = ServerFrame::event(ServerEvent::VoiceOutbox {
+            entries: vec![VoiceOutboxEntry {
+                recording_id: "42-7".into(),
+                chat_jid: "31612345678@s.whatsapp.net".into(),
+                duration_ms: 2_400,
+                status: VoiceOutboxStatus::Failed,
+                error: Some("offline".into()),
+                created_at: 42,
+            }],
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), event);
     }
 
     #[test]

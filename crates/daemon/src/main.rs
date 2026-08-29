@@ -5,6 +5,7 @@ mod database;
 mod event_coverage;
 mod live_location;
 mod notification;
+mod voice_outbox;
 
 use anyhow::{Context, Result, anyhow, bail};
 use buffa::Message as _;
@@ -32,9 +33,11 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, error, info, warn};
 use whatsapp_rust::prelude::*;
 use whatsapp_rust::types::jid::JidExt as SignalJidExt;
+use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::request::InfoQuery;
 use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::wacore_binary::{JidExt, NodeContent, SERVER_JID, builder::NodeBuilder};
+use whatsapp_rust::{SendOptions, UploadOptions, media};
 
 const CHAT_LIST_LIMIT: u32 = 500;
 const AVATAR_SYNC_LIMIT: u32 = 1_000;
@@ -66,6 +69,7 @@ struct Shared {
     event_sync_marker: PathBuf,
     avatar_dir: PathBuf,
     media_dir: PathBuf,
+    voice_outbox_dir: PathBuf,
     avatar_revision: AtomicU64,
     app_state_failed: AtomicBool,
     logout_requested: AtomicBool,
@@ -106,6 +110,7 @@ async fn clear_local_account_data(paths: &AppPaths, shared: &Shared) -> Result<(
     shared.database.clear_account_data()?;
     reset_private_directory(&shared.avatar_dir)?;
     reset_private_directory(&shared.media_dir)?;
+    reset_private_directory(&shared.voice_outbox_dir)?;
     remove_sqlite_store(&paths.protocol_db)?;
     for marker in [
         &shared.contact_sync_marker,
@@ -1544,6 +1549,21 @@ fn broadcast_messages(shared: &Shared, chat_jid: &str) {
     }
 }
 
+fn voice_outbox_event(shared: &Shared) -> Result<ServerEvent> {
+    Ok(ServerEvent::VoiceOutbox {
+        entries: voice_outbox::entries(&shared.voice_outbox_dir)?,
+    })
+}
+
+fn broadcast_voice_outbox(shared: &Shared) {
+    match voice_outbox_event(shared) {
+        Ok(event) => {
+            let _ = shared.events.send(ServerFrame::event(event));
+        }
+        Err(error) => warn!(%error, "could not publish voice outbox state"),
+    }
+}
+
 fn broadcast_snapshot(shared: &Shared) {
     broadcast_chats(shared);
     broadcast_unread(shared);
@@ -2713,8 +2733,20 @@ async fn main() -> Result<()> {
     std::fs::set_permissions(&paths.state_dir, std::fs::Permissions::from_mode(0o700))?;
     let avatar_dir = paths.state_dir.join("avatars");
     let media_dir = paths.state_dir.join("media");
+    let voice_outbox_dir = paths.state_dir.join("outbox");
     assets::private_dir(&avatar_dir)?;
     assets::private_dir(&media_dir)?;
+    assets::private_dir(&voice_outbox_dir)?;
+    match voice_outbox::recover_interrupted(&voice_outbox_dir, Utc::now().timestamp()) {
+        Ok(entries) if !entries.is_empty() => {
+            info!(
+                count = entries.len(),
+                "recovered retryable voice messages from the outbox"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => warn!(%error, "could not recover the voice message outbox"),
+    }
 
     let (app_events, library_events, excluded_events) = event_coverage::counts();
     info!(
@@ -2744,6 +2776,7 @@ async fn main() -> Result<()> {
         event_sync_marker: paths.state_dir.join("event-state-v5"),
         avatar_dir,
         media_dir,
+        voice_outbox_dir,
         avatar_revision: AtomicU64::new(0),
         app_state_failed: AtomicBool::new(false),
         logout_requested: AtomicBool::new(false),
@@ -3359,6 +3392,191 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             }));
             Ok(ServerEvent::Sent { message })
         }
+        Command::SendVoiceMessage {
+            chat_jid,
+            recording_id,
+        } => {
+            let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
+            let outbox_dir = shared.voice_outbox_dir.clone();
+            let prepare_recording_id = recording_id.clone();
+            let prepare_chat_jid = requested.to_non_ad_string();
+            let mut prepared = tokio::task::spawn_blocking(move || {
+                voice_outbox::prepare(
+                    &outbox_dir,
+                    &prepare_recording_id,
+                    &prepare_chat_jid,
+                    Utc::now().timestamp(),
+                )
+            })
+            .await
+            .context("voice outbox preparation task failed")??;
+            broadcast_voice_outbox(shared);
+            let result: Result<Message> = async {
+                let client = shared
+                    .client
+                    .read()
+                    .await
+                    .clone()
+                    .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+                let requested: Jid = prepared
+                    .job
+                    .chat_jid
+                    .parse()
+                    .context("invalid persisted voice message chat JID")?;
+                let canonical = canonical_contact_jid(shared, &client, &requested).await;
+                let jid: Jid = canonical.parse().context("invalid canonical chat JID")?;
+                let delivery_id = prepared
+                    .job
+                    .message_id
+                    .clone()
+                    .unwrap_or_else(|| client.generate_message_id());
+                voice_outbox::assign_delivery(
+                    &shared.voice_outbox_dir,
+                    &mut prepared.job,
+                    &jid.to_non_ad_string(),
+                    &delivery_id,
+                    Utc::now().timestamp(),
+                )?;
+                broadcast_voice_outbox(shared);
+                if let Some(message) = shared
+                    .database
+                    .message_by_id(&jid.to_non_ad_string(), &delivery_id)?
+                {
+                    return Ok(message);
+                }
+                let upload = client
+                    .upload(
+                        std::mem::take(&mut prepared.bytes),
+                        MediaType::Audio,
+                        UploadOptions::new(),
+                    )
+                    .await
+                    .context("uploading voice message")?;
+                let duration_seconds =
+                    u32::try_from(prepared.job.duration_ms.div_ceil(1_000)).unwrap_or(u32::MAX);
+                let outbound = media::audio_message(
+                    upload,
+                    media::AudioOptions {
+                        mimetype: Some("audio/ogg; codecs=opus".into()),
+                        duration_seconds: Some(duration_seconds),
+                        ptt: Some(true),
+                        ..Default::default()
+                    },
+                );
+                let sent = client
+                    .send_message_with_options(
+                        &jid,
+                        outbound,
+                        SendOptions::default().with_message_id(&delivery_id),
+                    )
+                    .await?;
+                if sent.message_id != delivery_id {
+                    bail!("WhatsApp returned a different voice message ID");
+                }
+                let cached_path = assets::message_audio_path(
+                    &shared.media_dir,
+                    &jid.to_non_ad_string(),
+                    &delivery_id,
+                    Some("audio/ogg; codecs=opus"),
+                );
+                let recording_path =
+                    voice_outbox::recording_path(&shared.voice_outbox_dir, &recording_id)?;
+                let copy_source = recording_path.clone();
+                let copy_destination = cached_path.clone();
+                let downloaded = match tokio::task::spawn_blocking(move || {
+                    assets::copy_private_file(&copy_source, &copy_destination)
+                })
+                .await
+                .context("voice cache copy task failed")?
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(%error, "could not retain sent voice message in the private cache");
+                        false
+                    }
+                };
+                assets::prune_media_cache(
+                    &shared.media_dir,
+                    if downloaded {
+                        &cached_path
+                    } else {
+                        &recording_path
+                    },
+                );
+                let message = Message {
+                    id: delivery_id,
+                    chat_jid: jid.to_non_ad_string(),
+                    sender_jid: "me".into(),
+                    sender_name: "You".into(),
+                    text: "[Voice message]".into(),
+                    timestamp: Utc::now().timestamp(),
+                    from_me: true,
+                    receipt: 1,
+                    delivered_at: None,
+                    read_at: None,
+                    delivered_to: Vec::new(),
+                    read_by: Vec::new(),
+                    media: Some(MessageMedia::Audio {
+                        path: cached_path.to_string_lossy().into_owned(),
+                        downloaded,
+                        mime_type: "audio/ogg; codecs=opus".into(),
+                        duration_seconds,
+                        voice_message: true,
+                    }),
+                    reactions: Vec::new(),
+                };
+                let chat_name = shared
+                    .database
+                    .chat_name(&message.chat_jid)?
+                    .or_else(|| {
+                        shared
+                            .database
+                            .contact_name(&message.chat_jid)
+                            .ok()
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| message.chat_jid.clone());
+                shared
+                    .database
+                    .insert_message(&message, &chat_name, jid.is_group(), false)?;
+                let _ = shared.events.send(ServerFrame::event(ServerEvent::Sent {
+                    message: message.clone(),
+                }));
+                Ok(message)
+            }
+            .await;
+            match result {
+                Ok(message) => {
+                    if let Err(error) = voice_outbox::finish_sent(
+                        &shared.voice_outbox_dir,
+                        &mut prepared.job,
+                        Utc::now().timestamp(),
+                    ) {
+                        warn!(%error, "could not finalize a sent voice outbox entry");
+                    }
+                    broadcast_voice_outbox(shared);
+                    Ok(ServerEvent::Sent { message })
+                }
+                Err(error) => {
+                    if let Err(persist_error) = voice_outbox::mark_failed(
+                        &shared.voice_outbox_dir,
+                        &mut prepared.job,
+                        &error.to_string(),
+                        Utc::now().timestamp(),
+                    ) {
+                        warn!(%persist_error, "could not retain a failed voice outbox entry");
+                    }
+                    broadcast_voice_outbox(shared);
+                    Err(error)
+                }
+            }
+        }
+        Command::DiscardVoiceRecording { recording_id } => {
+            voice_outbox::discard(&shared.voice_outbox_dir, &recording_id)?;
+            broadcast_voice_outbox(shared);
+            Ok(ServerEvent::Ack)
+        }
+        Command::ListVoiceOutbox => voice_outbox_event(shared),
         Command::CreatePoll {
             chat_jid,
             question,
@@ -4083,6 +4301,7 @@ mod tests {
             event_sync_marker: directory.path().join("event-state-v5"),
             avatar_dir: directory.path().join("avatars"),
             media_dir: directory.path().join("media"),
+            voice_outbox_dir: directory.path().join("outbox"),
             avatar_revision: AtomicU64::new(0),
             app_state_failed: AtomicBool::new(false),
             logout_requested: AtomicBool::new(false),

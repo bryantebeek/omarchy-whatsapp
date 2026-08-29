@@ -118,6 +118,66 @@ TestCase {
     wait(10)
   }
 
+  function test_record_and_send_voice_message() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var recordButton = control("voiceRecordButton")
+    compare(recordButton.enabled, true)
+    compare(recordButton.tooltipText, "Record voice message")
+    recordButton.click()
+    compare(panel.voiceRecordingActive, true)
+    compare(service.chatStateUpdates[service.chatStateUpdates.length - 1],
+      "recording")
+    compare(control("voiceRecordingStatus").text, "●  0:02")
+    var voiceSendButton = control("voiceSendButton")
+    compare(voiceSendButton.enabled, true)
+    voiceSendButton.click()
+    compare(panel.voiceRecordingActive, false)
+    compare(service.sentVoiceMessages.length, 1)
+    compare(service.sentVoiceMessages[0].chat_jid, "alice@s.whatsapp.net")
+    compare(service.sentVoiceMessages[0].recording_id, "42-1")
+    compare(service.sentVoiceMessages[0].duration_ms, 2400)
+    compare(service.discardedVoiceRecordings.length, 0)
+    compare(service.chatStateUpdates[service.chatStateUpdates.length - 1],
+      "paused")
+
+    recordButton.click()
+    compare(panel.voiceRecordingActive, true)
+    control("voiceCancelButton").click()
+    compare(panel.voiceRecordingActive, false)
+    compare(service.sentVoiceMessages.length, 1)
+    compare(service.discardedVoiceRecordings.length, 1)
+
+    service.voiceOutboxEntries = [{
+      recording_id: "retry-1",
+      chat_jid: "alice@s.whatsapp.net",
+      duration_ms: 2400,
+      status: "failed",
+      error: "Network unavailable"
+    }]
+    compare(control("voiceOutboxStatus").text, "Voice message failed  0:02")
+    compare(panel.voiceRecordingActive, false)
+    compare(panel.voiceOutboxEntry.status, "failed")
+    var retryButton = control("voiceRetryButton")
+    compare(service.connectionState, "connected")
+    compare(service.voiceMessageRequestId, 0)
+    tryCompare(retryButton, "enabled", true)
+    compare(retryButton.tooltipText, "Network unavailable")
+    retryButton.click()
+    compare(service.sentVoiceMessages.length, 2)
+    compare(service.sentVoiceMessages[1].recording_id, "retry-1")
+    compare(service.voiceOutboxEntries.length, 0)
+
+    service.voiceOutboxEntries = [{
+      recording_id: "discard-2",
+      chat_jid: "alice@s.whatsapp.net",
+      duration_ms: 1000,
+      status: "failed"
+    }]
+    control("voiceOutboxDiscardButton").click()
+    compare(service.voiceOutboxEntries.length, 0)
+    compare(service.discardedVoiceRecordings.length, 2)
+  }
+
   function test_presence_and_typing() {
     panel.open('{"chatJid":"alice@s.whatsapp.net"}')
     var subtitle = control("conversationSubtitle")

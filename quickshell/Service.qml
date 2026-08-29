@@ -63,6 +63,12 @@ Item {
   property double presenceClock: Date.now() / 1000
   property string localChatStateJid: ""
   property string localChatState: ""
+  property int voiceRecordingSerial: 0
+  property int voiceMessageRequestId: 0
+  property string voiceMessageRequestRecordingId: ""
+  property string voiceMessageRequestChatJid: ""
+  property int voiceMessageRequestDurationMs: 0
+  property var voiceOutboxEntries: []
   property int sentPresenceState: -1
   property var pollVoteRequests: ({})
   property int pollCreateRequestId: 0
@@ -98,8 +104,24 @@ Item {
     chatStates = ({})
     localChatStateJid = ""
     localChatState = ""
+    if (voiceMessageRequestId > 0)
+      setLocalVoiceOutboxEntry({
+        recording_id: voiceMessageRequestRecordingId,
+        chat_jid: voiceMessageRequestChatJid,
+        duration_ms: voiceMessageRequestDurationMs,
+        status: "failed",
+        error: "Connection lost; retry is safe",
+        local_only: true,
+        created_at: Date.now() / 1000
+      })
+    voiceMessageRequestId = 0
+    voiceMessageRequestRecordingId = ""
+    voiceMessageRequestChatJid = ""
+    voiceMessageRequestDurationMs = 0
     if (typeof localTypingPauseTimer !== "undefined")
       localTypingPauseTimer.stop()
+    if (typeof localRecordingRefreshTimer !== "undefined")
+      localRecordingRefreshTimer.stop()
   }
 
   function applyPresence(frame) {
@@ -224,6 +246,7 @@ Item {
     localChatStateJid = ""
     localChatState = ""
     localTypingPauseTimer.stop()
+    localRecordingRefreshTimer.stop()
     send("set_chat_state", { chat_jid: jid, state: "paused" })
     return true
   }
@@ -245,6 +268,182 @@ Item {
       localChatState = "typing"
     }
     localTypingPauseTimer.restart()
+    return true
+  }
+
+  function recordingIdIsValid(recordingId) {
+    var value = String(recordingId || "")
+    return value.length > 0 && value.length <= 80
+      && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(value)
+  }
+
+  function voiceOutboxForChat(chatJid) {
+    var value = String(chatJid || "")
+    for (var i = voiceOutboxEntries.length - 1; i >= 0; i--)
+      if (String(voiceOutboxEntries[i].chat_jid || "") === value)
+        return voiceOutboxEntries[i]
+    return null
+  }
+
+  function setLocalVoiceOutboxEntry(entry) {
+    if (!entry || !recordingIdIsValid(entry.recording_id)) return false
+    var values = voiceOutboxEntries.slice()
+    var replacement = Object.assign({}, entry)
+    for (var i = 0; i < values.length; i++) {
+      if (String(values[i].recording_id || "") !== replacement.recording_id)
+        continue
+      values[i] = replacement
+      voiceOutboxEntries = values
+      return true
+    }
+    values.push(replacement)
+    voiceOutboxEntries = values
+    return true
+  }
+
+  function removeLocalVoiceOutboxEntry(recordingId) {
+    var value = String(recordingId || "")
+    var filtered = voiceOutboxEntries.filter(function(entry) {
+      return String(entry.recording_id || "") !== value
+    })
+    var changed = filtered.length !== voiceOutboxEntries.length
+    if (changed) voiceOutboxEntries = filtered
+    return changed
+  }
+
+  function applyVoiceOutbox(frame) {
+    var input = copyArray(frame ? frame.entries : [])
+    var entries = []
+    for (var i = 0; i < input.length; i++) {
+      var entry = input[i] || {}
+      var recordingId = String(entry.recording_id || "")
+      var status = String(entry.status || "")
+      var duration = Math.floor(Number(entry.duration_ms || 0))
+      if (!recordingIdIsValid(recordingId)
+          || (status !== "sending" && status !== "failed")
+          || !isFinite(duration) || duration < 250) continue
+      entries.push({
+        recording_id: recordingId,
+        chat_jid: String(entry.chat_jid || ""),
+        duration_ms: duration,
+        status: status,
+        error: String(entry.error || ""),
+        local_only: false,
+        created_at: Number(entry.created_at || 0)
+      })
+    }
+    for (var localIndex = 0; localIndex < voiceOutboxEntries.length; localIndex++) {
+      var local = voiceOutboxEntries[localIndex] || {}
+      if (local.local_only !== true) continue
+      var found = entries.some(function(entry) {
+        return entry.recording_id === String(local.recording_id || "")
+      })
+      if (!found) entries.push(Object.assign({}, local))
+    }
+    voiceOutboxEntries = entries
+    return entries.length
+  }
+
+  function newVoiceRecording() {
+    if (!selectedChatJid || connectionState !== "connected") return null
+    voiceRecordingSerial++
+    var recordingId = String(Date.now()) + "-" + String(voiceRecordingSerial)
+    return {
+      recording_id: recordingId,
+      chat_jid: selectedChatJid,
+      path: statePath + "/outbox/voice-" + recordingId + ".ogg"
+    }
+  }
+
+  function beginVoiceRecording() {
+    if (!selectedChatJid || connectionState !== "connected" || !panelVisible
+        || !panelFocused || voiceMessageRequestId > 0) return false
+    pauseComposing()
+    if (!send("set_chat_state", {
+      chat_jid: selectedChatJid,
+      state: "recording"
+    })) return false
+    localChatStateJid = selectedChatJid
+    localChatState = "recording"
+    localRecordingRefreshTimer.start()
+    return true
+  }
+
+  function finishVoiceRecording() {
+    return pauseComposing()
+  }
+
+  function sendVoiceMessage(recordingId, chatJid, durationMs) {
+    var value = String(recordingId || "")
+    var chat = String(chatJid || "")
+    var duration = Math.floor(Number(durationMs || 0))
+    if (!recordingIdIsValid(value) || !chat || voiceMessageRequestId > 0
+        || !isFinite(duration)
+        || duration < 250 || duration > 15 * 60 * 1000) return false
+    voiceMessageRequestId = send("send_voice_message", {
+      chat_jid: chat,
+      recording_id: value
+    })
+    if (!voiceMessageRequestId) {
+      setLocalVoiceOutboxEntry({
+        recording_id: value,
+        chat_jid: chat,
+        duration_ms: duration,
+        status: "failed",
+        error: "Daemon is unavailable; retry is safe",
+        local_only: true,
+        created_at: Date.now() / 1000
+      })
+      return false
+    }
+    voiceMessageRequestRecordingId = value
+    voiceMessageRequestChatJid = chat
+    voiceMessageRequestDurationMs = duration
+    setLocalVoiceOutboxEntry({
+      recording_id: value,
+      chat_jid: chat,
+      duration_ms: duration,
+      status: "sending",
+      error: "",
+      local_only: false,
+      created_at: Date.now() / 1000
+    })
+    return true
+  }
+
+  function retryVoiceMessage(entry) {
+    if (!entry) return false
+    return sendVoiceMessage(entry.recording_id, entry.chat_jid, entry.duration_ms)
+  }
+
+  function discardVoiceRecording(recordingId) {
+    var value = String(recordingId || "")
+    if (!recordingIdIsValid(value)) return false
+    if (!send("discard_voice_recording", { recording_id: value })) return false
+    removeLocalVoiceOutboxEntry(value)
+    return true
+  }
+
+  function finishVoiceMessageRequest(frame) {
+    if (!frame || Number(frame.id || 0) !== voiceMessageRequestId) return false
+    var recordingId = voiceMessageRequestRecordingId
+    if (frame.event === "error") {
+      setLocalVoiceOutboxEntry({
+        recording_id: recordingId,
+        chat_jid: voiceMessageRequestChatJid,
+        duration_ms: voiceMessageRequestDurationMs,
+        status: "failed",
+        error: String(frame.message || "Could not send voice message"),
+        local_only: true,
+        created_at: Date.now() / 1000
+      })
+    } else if (frame.event === "sent") {
+      removeLocalVoiceOutboxEntry(recordingId)
+    }
+    voiceMessageRequestId = 0
+    voiceMessageRequestRecordingId = ""
+    voiceMessageRequestChatJid = ""
+    voiceMessageRequestDurationMs = 0
     return true
   }
 
@@ -739,6 +938,7 @@ Item {
     send("get_state")
     send("list_chats", { limit: 500 })
     send("list_avatars")
+    send("list_voice_outbox")
   }
 
   function refresh() {
@@ -917,6 +1117,7 @@ Item {
     var requestedGroupParticipantsJid = finishGroupParticipantsRequest(frame)
     finishPollRequest(frame)
     finishMediaDownloadRequest(frame)
+    finishVoiceMessageRequest(frame)
     var queuedMessagesJid = finishMessagesRequest(frame)
     lastError = ""
     if (frame.event === "hello") {
@@ -945,6 +1146,8 @@ Item {
       applyPresence(frame)
     } else if (frame.event === "chat_state") {
       applyChatState(frame)
+    } else if (frame.event === "voice_outbox") {
+      applyVoiceOutbox(frame)
     } else if (frame.event === "messages") {
       if (String(frame.chat_jid || "") === selectedChatJid) {
         var preserveMessagePosition = messagesChatJid === selectedChatJid
@@ -1082,6 +1285,22 @@ Item {
     interval: 5000
     repeat: false
     onTriggered: root.pauseComposing()
+  }
+
+  Timer {
+    id: localRecordingRefreshTimer
+    interval: 8000
+    repeat: true
+    onTriggered: {
+      if (root.localChatState !== "recording" || !root.localChatStateJid) {
+        stop()
+        return
+      }
+      root.send("set_chat_state", {
+        chat_jid: root.localChatStateJid,
+        state: "recording"
+      })
+    }
   }
 
   Timer {

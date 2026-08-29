@@ -54,6 +54,7 @@ def main() -> int:
     required_workflows = {
         "open_search_select_and_close",
         "new_conversation_and_send_message",
+        "record_and_send_voice_message",
         "presence_and_typing",
         "menus_open_without_auto_focus",
         "pin_and_unpin_conversation",

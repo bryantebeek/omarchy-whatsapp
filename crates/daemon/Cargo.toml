@@ -22,6 +22,7 @@ hmac.workspace = true
 omarchy-whatsapp-protocol = { version = "0.3.0", path = "../protocol" }
 qrcode.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true

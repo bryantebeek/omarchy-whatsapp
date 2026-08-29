@@ -86,9 +86,10 @@ TestCase {
 
     service.refreshMetadata()
     var frames = sentFrames()
-    compare(frames[frames.length - 3].command, "get_state")
-    compare(frames[frames.length - 2].command, "list_chats")
-    compare(frames[frames.length - 1].command, "list_avatars")
+    compare(frames[frames.length - 4].command, "get_state")
+    compare(frames[frames.length - 3].command, "list_chats")
+    compare(frames[frames.length - 2].command, "list_avatars")
+    compare(frames[frames.length - 1].command, "list_voice_outbox")
   }
 
   function test_copy_normalize_and_hex_helpers() {
@@ -482,6 +483,101 @@ TestCase {
       return frame.command === "set_chat_state" && frame.state === "paused"
     }))
     compare(service.noteComposerActivity("not focused"), false)
+  }
+
+  function test_voice_recording_and_send_lifecycle() {
+    service.connectionState = "connected"
+    service.selectedChatJid = "alice@s.whatsapp.net"
+    service.setPanelState(true, true)
+    TestIo.socketWrites = []
+    var recording = service.newVoiceRecording()
+    verify(service.recordingIdIsValid(recording.recording_id))
+    verify(recording.path.indexOf(service.statePath + "/outbox/voice-") === 0)
+    verify(recording.path.endsWith(recording.recording_id + ".ogg"))
+    compare(recording.chat_jid, "alice@s.whatsapp.net")
+    compare(service.beginVoiceRecording(), true)
+    compare(service.localChatState, "recording")
+    compare(lastFrame().command, "set_chat_state")
+    compare(lastFrame().state, "recording")
+    compare(service.finishVoiceRecording(), true)
+    compare(lastFrame().state, "paused")
+
+    compare(service.sendVoiceMessage("../private", recording.chat_jid, 1000), false)
+    compare(service.sendVoiceMessage(recording.recording_id, recording.chat_jid, 100), false)
+    compare(service.sendVoiceMessage(recording.recording_id, recording.chat_jid, 2400), true)
+    var sendVoice = lastFrame()
+    compare(sendVoice.command, "send_voice_message")
+    compare(sendVoice.chat_jid, "alice@s.whatsapp.net")
+    compare(sendVoice.recording_id, recording.recording_id)
+    compare(sendVoice.path, undefined)
+    compare(sendVoice.duration_ms, undefined)
+    compare(service.voiceOutboxEntries.length, 1)
+    compare(service.voiceOutboxEntries[0].status, "sending")
+    compare(service.sendVoiceMessage(recording.recording_id,
+      recording.chat_jid, 2400), false)
+    compare(service.finishVoiceMessageRequest({ id: sendVoice.id + 1 }), false)
+    service.handleLine(JSON.stringify({
+      id: sendVoice.id,
+      event: "error",
+      message: "offline"
+    }))
+    compare(service.voiceMessageRequestId, 0)
+    compare(service.voiceOutboxEntries[0].status, "failed")
+    compare(service.voiceOutboxEntries[0].error, "offline")
+
+    compare(service.retryVoiceMessage(service.voiceOutboxEntries[0]), true)
+    compare(service.voiceMessageRequestRecordingId, recording.recording_id)
+    service.handleState({ status: { state: "connecting" } })
+    compare(service.voiceMessageRequestId, 0)
+    compare(service.voiceMessageRequestRecordingId, "")
+    compare(service.voiceOutboxEntries[0].status, "failed")
+    verify(service.voiceOutboxEntries[0].error.indexOf("retry is safe") >= 0)
+
+    service.connectionState = "connected"
+    compare(service.retryVoiceMessage(service.voiceOutboxEntries[0]), true)
+    var retryVoice = lastFrame()
+    compare(service.finishVoiceMessageRequest({
+      id: retryVoice.id,
+      event: "sent"
+    }), true)
+    compare(service.voiceOutboxEntries.length, 0)
+
+    service.handleLine(JSON.stringify({ event: "voice_outbox", entries: [
+      { recording_id: "bad/id", status: "failed", duration_ms: 2400 },
+      {
+        recording_id: recording.recording_id,
+        chat_jid: recording.chat_jid,
+        duration_ms: 2451,
+        status: "failed",
+        error: "retry",
+        created_at: 42
+      }
+    ] }))
+    compare(service.voiceOutboxEntries.length, 1)
+    compare(service.voiceOutboxEntries[0].duration_ms, 2451)
+    compare(service.voiceOutboxForChat(recording.chat_jid).recording_id,
+      recording.recording_id)
+    service.setLocalVoiceOutboxEntry({
+      recording_id: "local-2",
+      chat_jid: recording.chat_jid,
+      duration_ms: 1000,
+      status: "failed",
+      local_only: true
+    })
+    compare(service.applyVoiceOutbox({ entries: [] }), 1)
+    compare(service.voiceOutboxEntries[0].recording_id, "local-2")
+    service.removeLocalVoiceOutboxEntry("local-2")
+    service.applyVoiceOutbox({ entries: [{
+      recording_id: recording.recording_id,
+      chat_jid: recording.chat_jid,
+      duration_ms: 2451,
+      status: "failed"
+    }]})
+    compare(service.discardVoiceRecording("bad/id"), false)
+    compare(service.discardVoiceRecording(recording.recording_id), true)
+    compare(lastFrame().command, "discard_voice_recording")
+    compare(lastFrame().recording_id, recording.recording_id)
+    compare(service.voiceOutboxEntries.length, 0)
   }
 
   function test_set_chat_pinned_command() {

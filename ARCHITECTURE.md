@@ -11,6 +11,7 @@ WhatsApp linked-device servers
       ├── history.db   bounded message/event index
       ├── avatars/     bounded profile previews
       ├── media/       bounded image/location cache
+      ├── outbox/      temporary voice-note recordings
       ├── org.freedesktop.Notifications
       └── $XDG_RUNTIME_DIR/omarchy-whatsapp/
              ├── daemon.sock   owner-only NDJSON
@@ -120,6 +121,21 @@ burst and paused after inactivity, sending, selection changes, or focus loss.
 Incoming online, last-seen, typing, and recording events cross IPC but are never
 written to `history.db`; the shell expires typing indicators defensively if a
 pause broadcast is lost.
+
+Voice-note capture runs in Qt Multimedia only while the user is recording. The
+shell writes Ogg Opus under an opaque recording ID in the owner-only outbox and
+publishes recording chat state every eight seconds. The daemon parses the full
+Ogg page structure, derives duration from Opus granule positions, and persists a
+small private send record before upload. Every retry reuses one WhatsApp message
+ID, making a retry safe across disconnects or a daemon crash. A successful send
+is copied into the private message-media cache before its outbox files are
+removed; a failed send remains available for explicit retry or discard.
+
+Outbox retention is deliberately bounded rather than becoming a general job
+system: at most eight failed voice notes and 64 MiB are retained for seven days.
+Recordings that never reached the daemon are removed after 24 hours. Interrupted
+`sending` records recover as `failed`, and a locally indexed message with the
+same delivery ID completes recovery without another network send.
 
 Cross-device regular app-state is replayed once when upgrading to the event-aware
 database. Read/unread, pin, mute, archive, star, deletion/clearing, labels,
