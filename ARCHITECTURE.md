@@ -159,6 +159,10 @@ temporary file and atomically renamed after verification. Images are limited to
 1 MiB each and 64 MiB total. The shell automatically requests undownloaded WebP
 stickers as an active conversation loads. Location thumbnails use the same
 private cache.
+Every cache/outbox replacement uses a uniquely created owner-only temporary file,
+syncs its contents before atomic rename, and syncs the parent directory. Startup
+removes abandoned transfer files before cache accounting, so crashes cannot leak
+uncounted partial downloads or make concurrent writers share a temporary path.
 
 ## Deliberate exclusions
 

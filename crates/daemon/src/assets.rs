@@ -1,11 +1,15 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use tracing::warn;
 use whatsapp_rust::prelude::{Client, Jid, wa};
@@ -18,10 +22,102 @@ pub const MAX_DOCUMENT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_AVATAR_BYTES: usize = 1024 * 1024;
 const MAX_AVATAR_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MEDIA_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct PrivateTemporaryFile {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl PrivateTemporaryFile {
+    fn create(destination: &Path, kind: &str) -> Result<(Self, File)> {
+        let parent = destination
+            .parent()
+            .context("private destination has no parent directory")?;
+        let file_name = destination
+            .file_name()
+            .context("private destination has no file name")?;
+        for _ in 0..32 {
+            let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let mut temporary_name = OsString::from(file_name);
+            temporary_name.push(format!(".{kind}-{}-{sequence}", std::process::id()));
+            let path = parent.join(temporary_name);
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            path,
+                            committed: false,
+                        },
+                        file,
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("could not allocate a unique private temporary file")
+    }
+
+    fn commit(mut self, file: File, destination: &Path) -> Result<()> {
+        file.sync_all()?;
+        drop(file);
+        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&self.path, destination)?;
+        self.committed = true;
+        sync_parent_directory(destination)?;
+        Ok(())
+    }
+
+    fn commit_existing(self, destination: &Path) -> Result<()> {
+        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        self.commit(file, destination)
+    }
+}
+
+impl Drop for PrivateTemporaryFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("private destination has no parent directory")?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn is_temporary_name(name: &str) -> bool {
+    name.contains(".part-") || name.contains(".tmp-")
+}
+
+fn remove_abandoned_temporary_files(directory: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && is_temporary_name(&entry.file_name().to_string_lossy()) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
 
 pub fn private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    // Only startup/reset calls this helper. No transfer can still own these
+    // names, so cleaning all recognized temporary files is safe and prevents
+    // crash leftovers from escaping cache accounting forever.
+    remove_abandoned_temporary_files(path)?;
     Ok(())
 }
 
@@ -222,8 +318,8 @@ pub fn ensure_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Res
         return Ok(false);
     }
 
-    let temporary = thumbnail_path.with_extension(format!("part-{}.jpg", std::process::id()));
-    let _ = std::fs::remove_file(&temporary);
+    let (temporary, reserved_file) = PrivateTemporaryFile::create(thumbnail_path, "part")?;
+    drop(reserved_file);
     let mut child = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -243,8 +339,12 @@ pub fn ensure_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Res
             "scale=w='min(1280,iw)':h=-2",
             "-q:v",
             "4",
+            "-c:v",
+            "mjpeg",
+            "-f",
+            "image2",
         ])
-        .arg(&temporary)
+        .arg(&temporary.path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -259,21 +359,15 @@ pub fn ensure_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Res
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&temporary);
             bail!("timed out creating a video preview");
         }
         std::thread::sleep(Duration::from_millis(25));
     };
-    if !status.success() || !jpeg_file_is_valid(&temporary) {
-        let _ = std::fs::remove_file(&temporary);
+    if !status.success() || !jpeg_file_is_valid(&temporary.path) {
         bail!("ffmpeg did not create a valid video preview");
     }
 
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-    if thumbnail_path.exists() {
-        std::fs::remove_file(thumbnail_path)?;
-    }
-    std::fs::rename(&temporary, thumbnail_path)?;
+    temporary.commit_existing(thumbnail_path)?;
     if let Some(directory) = thumbnail_path.parent() {
         prune_media_cache(directory, thumbnail_path);
     }
@@ -549,37 +643,16 @@ fn audio_bytes_are_safe(bytes: &[u8]) -> bool {
 }
 
 pub fn copy_private_file(source: &Path, destination: &Path) -> Result<()> {
-    let temporary = destination.with_extension(format!("tmp-{}", std::process::id()));
-    let result = (|| -> Result<()> {
-        std::fs::copy(source, &temporary)?;
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        std::fs::rename(&temporary, destination)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
+    let (temporary, mut output) = PrivateTemporaryFile::create(destination, "tmp")?;
+    let mut input = File::open(source)?;
+    std::io::copy(&mut input, &mut output)?;
+    temporary.commit(output, destination)
 }
 
 pub fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        std::io::Write::write_all(&mut file, bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    let (temporary, mut file) = PrivateTemporaryFile::create(path, "tmp")?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    temporary.commit(file, path)
 }
 
 fn prune_directory(directory: &Path, max_bytes: u64, preserve: &Path) {
@@ -591,7 +664,7 @@ fn prune_directory(directory: &Path, max_bytes: u64, preserve: &Path) {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.contains(".part-") || name.contains(".tmp-") {
+            if is_temporary_name(&name) {
                 return None;
             }
             let metadata = entry.metadata().ok()?;
@@ -682,40 +755,27 @@ pub async fn download_message_image(
     if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == declared) {
         return Ok(false);
     }
-    let temporary = path.with_extension(format!("part-{}", std::process::id()));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
+    let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
     let result = client.download_to_writer(&image, file).await;
     match result {
         Ok(mut file) => {
             let length = file.metadata()?.len();
             if length == 0 || length > MAX_IMAGE_BYTES {
-                let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded image has invalid size {length}");
             }
             file.seek(SeekFrom::Start(0))?;
             let mut header = [0u8; 16];
             let count = file.read(&mut header)?;
             if !image_bytes_are_safe(&header[..count]) {
-                let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded media is not a supported raster image");
             }
-            drop(file);
-            std::fs::rename(&temporary, &path)?;
+            temporary.commit(file, &path)?;
             if let Some(directory) = path.parent() {
                 prune_directory(directory, MAX_MEDIA_CACHE_BYTES, &path);
             }
             Ok(true)
         }
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(anyhow!(error)).context("downloading WhatsApp image")
-        }
+        Err(error) => Err(anyhow!(error)).context("downloading WhatsApp image"),
     }
 }
 
@@ -734,40 +794,27 @@ pub async fn download_message_sticker(
     if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == declared) {
         return Ok(false);
     }
-    let temporary = path.with_extension(format!("part-{}", std::process::id()));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
+    let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
     let result = client.download_to_writer(&sticker, file).await;
     match result {
         Ok(mut file) => {
             let length = file.metadata()?.len();
             if length != declared || length > MAX_STICKER_BYTES {
-                let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded sticker has invalid size {length}");
             }
             file.seek(SeekFrom::Start(0))?;
             let mut header = [0u8; 16];
             let count = file.read(&mut header)?;
             if !sticker_bytes_are_safe(&header[..count]) {
-                let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded sticker is not WebP media");
             }
-            drop(file);
-            std::fs::rename(&temporary, &path)?;
+            temporary.commit(file, &path)?;
             if let Some(directory) = path.parent() {
                 prune_directory(directory, MAX_MEDIA_CACHE_BYTES, &path);
             }
             Ok(true)
         }
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(anyhow!(error)).context("downloading WhatsApp sticker")
-        }
+        Err(error) => Err(anyhow!(error)).context("downloading WhatsApp sticker"),
     }
 }
 
@@ -783,40 +830,27 @@ pub async fn download_message_video(
     if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == declared) {
         return Ok(false);
     }
-    let temporary = path.with_extension(format!("part-{}", std::process::id()));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
+    let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
     let result = client.download_to_writer(&video, file).await;
     match result {
         Ok(mut file) => {
             let length = file.metadata()?.len();
             if length != declared || length > MAX_VIDEO_BYTES {
-                let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded video has invalid size {length}");
             }
             file.seek(SeekFrom::Start(0))?;
             let mut header = [0u8; 16];
             let count = file.read(&mut header)?;
             if !video_bytes_are_safe(&header[..count]) {
-                let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded media is not a supported video");
             }
-            drop(file);
-            std::fs::rename(&temporary, &path)?;
+            temporary.commit(file, &path)?;
             if let Some(directory) = path.parent() {
                 prune_directory(directory, MAX_MEDIA_CACHE_BYTES, &path);
             }
             Ok(true)
         }
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(anyhow!(error)).context("downloading WhatsApp video")
-        }
+        Err(error) => Err(anyhow!(error)).context("downloading WhatsApp video"),
     }
 }
 
@@ -832,40 +866,27 @@ pub async fn download_message_audio(
     if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == declared) {
         return Ok(false);
     }
-    let temporary = path.with_extension(format!("part-{}", std::process::id()));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
+    let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
     let result = client.download_to_writer(&audio, file).await;
     match result {
         Ok(mut file) => {
             let length = file.metadata()?.len();
             if length != declared || length > MAX_AUDIO_BYTES {
-                let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded audio has invalid size {length}");
             }
             file.seek(SeekFrom::Start(0))?;
             let mut header = [0u8; 16];
             let count = file.read(&mut header)?;
             if !audio_bytes_are_safe(&header[..count]) {
-                let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded media is not supported audio");
             }
-            drop(file);
-            std::fs::rename(&temporary, &path)?;
+            temporary.commit(file, &path)?;
             if let Some(directory) = path.parent() {
                 prune_directory(directory, MAX_MEDIA_CACHE_BYTES, &path);
             }
             Ok(true)
         }
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(anyhow!(error)).context("downloading WhatsApp audio")
-        }
+        Err(error) => Err(anyhow!(error)).context("downloading WhatsApp audio"),
     }
 }
 
@@ -881,34 +902,21 @@ pub async fn download_message_document(
     if declared == 0 || declared > MAX_DOCUMENT_BYTES {
         bail!("document declares an invalid size of {declared} bytes");
     }
-    let temporary = path.with_extension(format!("part-{}", std::process::id()));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)?;
+    let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
     let result = client.download_to_writer(&document, file).await;
     match result {
         Ok(file) => {
             let length = file.metadata()?.len();
             if length == 0 || length > MAX_DOCUMENT_BYTES {
-                drop(file);
-                let _ = std::fs::remove_file(&temporary);
                 bail!("downloaded document has invalid size {length}");
             }
-            drop(file);
-            std::fs::rename(&temporary, &path)?;
+            temporary.commit(file, &path)?;
             if let Some(directory) = path.parent() {
                 prune_directory(directory, MAX_MEDIA_CACHE_BYTES, &path);
             }
             Ok(true)
         }
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(anyhow!(error)).context("downloading WhatsApp document")
-        }
+        Err(error) => Err(anyhow!(error)).context("downloading WhatsApp document"),
     }
 }
 
@@ -1015,6 +1023,54 @@ mod tests {
         assert_eq!(
             std::fs::metadata(destination).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn private_directory_removes_only_abandoned_transfer_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let complete = media.join("complete.img");
+        let temporary = media.join("image.img.part-123-4");
+        let metadata = media.join("job.json.tmp-123-5");
+        std::fs::write(&complete, b"complete").unwrap();
+        std::fs::write(&temporary, b"partial").unwrap();
+        std::fs::write(&metadata, b"partial").unwrap();
+
+        private_dir(&media).unwrap();
+
+        assert_eq!(std::fs::read(complete).unwrap(), b"complete");
+        assert!(!temporary.exists());
+        assert!(!metadata.exists());
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_do_not_share_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = Arc::new(directory.path().join("state.json"));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|index| {
+                let destination = Arc::clone(&destination);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let contents = format!("value-{index}");
+                    barrier.wait();
+                    write_private_bytes(&destination, contents.as_bytes()).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let contents = std::fs::read_to_string(&*destination).unwrap();
+        assert!((0..8).any(|index| contents == format!("value-{index}")));
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .all(|entry| !is_temporary_name(&entry.unwrap().file_name().to_string_lossy()))
         );
     }
 
