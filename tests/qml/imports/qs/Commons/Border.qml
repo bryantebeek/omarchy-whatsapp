@@ -11,7 +11,10 @@ QtObject {
     return { color: color, widths: { top: value, right: value, bottom: value, left: value } }
   }
   function controlSpec() { return none() }
-  function localOrSurfaceSpec(spec) { return spec || none() }
+  function localOrSurfaceSpec(section, token, localColor, defaultColor,
+      fallbackWidth) {
+    return flat(localColor || defaultColor, fallbackWidth)
+  }
   function color(spec) { return spec && spec.color ? spec.color : "transparent" }
   function top(spec) { return spec && spec.widths ? Number(spec.widths.top || 0) : 0 }
   function right(spec) { return spec && spec.widths ? Number(spec.widths.right || 0) : 0 }

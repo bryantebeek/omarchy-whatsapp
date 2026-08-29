@@ -3500,6 +3500,8 @@ Item {
                               root.messageReceiptTooltip(modelData)
                             readonly property bool receiptTooltipVisible:
                               messageReceiptTooltipPopup.visible
+                            readonly property var receiptTooltipControl:
+                              messageReceiptTooltipPopup
                             readonly property bool receiptHovered:
                               messageReceiptHoverArea.containsMouse
                             anchors.centerIn: parent
@@ -3527,10 +3529,48 @@ Item {
                             id: messageReceiptTooltipPopup
                             objectName: "messageReceiptTooltip-"
                               + String(modelData.id || "")
+                            readonly property color tooltipBackground:
+                              Color.tooltip.background
+                            readonly property color tooltipForeground:
+                              Color.tooltip.text
+                            readonly property color tooltipBorder:
+                              Color.tooltip.border
+                            readonly property var tooltipBorderSpec:
+                              Border.localOrSurfaceSpec("tooltip", "border",
+                                tooltipBorder, Color.tooltip.border,
+                                Math.max(1, Style.normalBorderWidth))
                             visible: messageReceiptHoverArea.containsMouse
                             text: messageReceiptStatus.receiptTooltipText
-                            delay: 250
+                            delay: 400
                             timeout: -1
+                            padding: 0
+
+                            background: BorderSurface {
+                              color: messageReceiptTooltipPopup.tooltipBackground
+                              borderSpec:
+                                messageReceiptTooltipPopup.tooltipBorderSpec
+                              radius: 0
+                            }
+
+                            contentItem: Text {
+                              text: messageReceiptTooltipPopup.text
+                              color:
+                                messageReceiptTooltipPopup.tooltipForeground
+                              font.family: root.fontFamily
+                              font.pixelSize: Style.font.bodySmall
+                              leftPadding: Border.left(
+                                messageReceiptTooltipPopup.tooltipBorderSpec)
+                                + Style.spacing.controlPaddingX
+                              rightPadding: Border.right(
+                                messageReceiptTooltipPopup.tooltipBorderSpec)
+                                + Style.spacing.controlPaddingX
+                              topPadding: Border.top(
+                                messageReceiptTooltipPopup.tooltipBorderSpec)
+                                + Style.spacing.controlPaddingY
+                              bottomPadding: Border.bottom(
+                                messageReceiptTooltipPopup.tooltipBorderSpec)
+                                + Style.spacing.controlPaddingY
+                            }
                           }
                         }
 

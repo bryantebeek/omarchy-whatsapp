@@ -1,6 +1,7 @@
 import QtQuick
 import QtTest
 import Quickshell
+import qs.Commons
 
 import "../../quickshell" as Whatsapp
 import "fixtures"
@@ -228,6 +229,22 @@ TestCase {
     var receiptHoverArea = control("messageReceiptHoverArea-m2")
     compare(receiptHoverArea.hoverEnabled, true)
     compare(receiptHoverArea.acceptedButtons, Qt.NoButton)
+    var receiptTooltip = receiptStatus.receiptTooltipControl
+    verify(receiptTooltip !== null)
+    compare(receiptTooltip.delay, 400)
+    compare(receiptTooltip.timeout, -1)
+    compare(receiptTooltip.padding, 0)
+    compare(receiptTooltip.background.color, Color.tooltip.background)
+    compare(receiptTooltip.background.radius, 0)
+    compare(receiptTooltip.contentItem.color, Color.tooltip.text)
+    compare(receiptTooltip.contentItem.font.family, panel.fontFamily)
+    compare(receiptTooltip.contentItem.font.pixelSize, Style.font.bodySmall)
+    compare(receiptTooltip.contentItem.leftPadding,
+      Border.left(receiptTooltip.tooltipBorderSpec)
+      + Style.spacing.controlPaddingX)
+    compare(receiptTooltip.contentItem.topPadding,
+      Border.top(receiptTooltip.tooltipBorderSpec)
+      + Style.spacing.controlPaddingY)
     compare(control("messageTimestamp-m2").font.pixelSize, 10)
     compare(panel.messageIndex("m1"), 0)
     compare(panel.messageIndex("m2"), 1)
@@ -277,6 +294,7 @@ TestCase {
         + "space after the conversation model is replaced and rendered again."
     })
     service.replaceMessages(updated, true)
+    compare(panel.preservedConversationMessageOffset, anchorOffset)
     tryCompare(list, "count", 40)
     compare(JSON.parse(list.model.get(4).messageJson).receipt, 3)
     tryVerify(function() {

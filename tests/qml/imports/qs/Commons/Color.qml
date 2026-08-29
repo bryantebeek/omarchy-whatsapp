@@ -13,4 +13,9 @@ QtObject {
     property color text: "#eeeeee"
     property color border: "#555555"
   }
+  readonly property QtObject tooltip: QtObject {
+    property color background: "#222222"
+    property color text: "#eeeeee"
+    property color border: "#555555"
+  }
 }

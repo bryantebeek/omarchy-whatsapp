@@ -8,6 +8,7 @@ QtObject {
   readonly property QtObject font: QtObject {
     property string family: "Sans"
     property int caption: 12
+    property int bodySmall: 12
     property int body: 14
     property int subtitle: 16
     property int title: 18
@@ -16,7 +17,11 @@ QtObject {
     property int icon: 18
     property int iconLarge: 24
   }
-  readonly property QtObject spacing: QtObject { property real controlGap: 6 }
+  readonly property QtObject spacing: QtObject {
+    property real controlGap: 6
+    property real controlPaddingX: 6
+    property real controlPaddingY: 4
+  }
   readonly property QtObject bar: QtObject { property real statusSlot: 26 }
 
   function space(value) { return Number(value) }
