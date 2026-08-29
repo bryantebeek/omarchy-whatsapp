@@ -339,6 +339,50 @@ TestCase {
     tryCompare(control("messageList"), "count", 3)
   }
 
+  function test_conversation_date_dividers() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var firstDay = new Date(2024, 1, 29, 9, 15, 0)
+    var secondDay = new Date(2024, 2, 1, 10, 30, 0)
+    service.loadMessages([
+      {
+        id: "date-1", chat_jid: "alice@s.whatsapp.net",
+        sender_jid: "alice@s.whatsapp.net", sender_name: "Alice",
+        text: "First day", timestamp: firstDay.getTime() / 1000
+      },
+      {
+        id: "date-2", chat_jid: "alice@s.whatsapp.net",
+        sender_jid: "alice@s.whatsapp.net", sender_name: "Alice",
+        text: "Same day", timestamp: (firstDay.getTime() + 3600000) / 1000
+      },
+      {
+        id: "date-3", chat_jid: "alice@s.whatsapp.net",
+        sender_jid: "alice@s.whatsapp.net", sender_name: "Alice",
+        text: "Next day", timestamp: secondDay.getTime() / 1000
+      }
+    ], "")
+
+    var list = control("messageList")
+    tryCompare(list, "count", 3)
+    var firstDivider = control("dateDivider-date-1")
+    var sameDayDivider = control("dateDivider-date-2")
+    var nextDivider = control("dateDivider-date-3")
+    compare(firstDivider.parent.showDateDivider, true)
+    compare(sameDayDivider.parent.showDateDivider, false)
+    compare(nextDivider.parent.showDateDivider, true)
+    verify(firstDivider.height > 0)
+    compare(sameDayDivider.height, 0)
+    verify(nextDivider.height > 0)
+    verify(firstDivider.lineWidth > 0)
+    verify(control("dateDividerLeftLine-date-1").width > 0)
+    verify(control("dateDividerRightLine-date-1").width > 0)
+    compare(control("dateDividerLabel-date-1").text,
+      firstDay.toLocaleDateString(Qt.locale(), "dddd, d MMMM yyyy"))
+    compare(control("dateDividerLabel-date-3").text,
+      secondDay.toLocaleDateString(Qt.locale(), "dddd, d MMMM yyyy"))
+    compare(control("messageBubble-date-1").y, firstDivider.height)
+    compare(control("messageBubble-date-2").y, 0)
+  }
+
   function test_event_updates_preserve_conversation_viewport() {
     panel.open('{"chatJid":"alice@s.whatsapp.net"}')
     service.loadMessages(syntheticMessages(40), "")

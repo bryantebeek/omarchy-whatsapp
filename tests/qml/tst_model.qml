@@ -133,6 +133,36 @@ TestCase {
     compare(Model.messageTime(timestamp), Qt.formatTime(new Date(timestamp * 1000), "HH:mm"))
   }
 
+  function test_messageDateKey_uses_local_timezone() {
+    compare(Model.messageDateKey(null), "")
+    compare(Model.messageDateKey("invalid"), "")
+    compare(Model.messageDateKey(-1), "")
+
+    var beforeMidnight = new Date(2024, 1, 29, 23, 59, 0)
+    var afterMidnight = new Date(2024, 2, 1, 0, 1, 0)
+    compare(Model.messageDateKey(beforeMidnight.getTime() / 1000), "2024-1-29")
+    compare(Model.messageDateKey(afterMidnight.getTime() / 1000), "2024-2-1")
+    verify(Model.messageDateKey(beforeMidnight.getTime() / 1000)
+      !== Model.messageDateKey(afterMidnight.getTime() / 1000))
+
+    var sameLocalDay = new Date(2024, 1, 29, 1, 30, 0)
+    compare(Model.messageDateKey(sameLocalDay.getTime() / 1000),
+      Model.messageDateKey(beforeMidnight.getTime() / 1000))
+  }
+
+  function test_messageDateLabel_locales() {
+    compare(Model.messageDateLabel(null), "")
+    compare(Model.messageDateLabel("invalid"), "")
+    var date = new Date(2024, 1, 29, 13, 7, 0)
+    var timestamp = date.getTime() / 1000
+    var english = Qt.locale("en_US")
+    var dutch = Qt.locale("nl_NL")
+    compare(Model.messageDateLabel(timestamp, english),
+      date.toLocaleDateString(english, "dddd, d MMMM yyyy"))
+    compare(Model.messageDateLabel(timestamp, dutch),
+      date.toLocaleDateString(dutch, "dddd, d MMMM yyyy"))
+  }
+
   function test_lastSeenLabel() {
     compare(Model.lastSeenLabel(null, 1, "HH:mm"), "")
     compare(Model.lastSeenLabel("invalid", 1, "HH:mm"), "")

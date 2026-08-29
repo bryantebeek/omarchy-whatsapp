@@ -2424,9 +2424,17 @@ Item {
                         Model.linkifiedMessage(modelData.text, root.accent)
                       readonly property bool showSenderAvatar: !modelData.from_me
                         && showSenderLabel
+                      readonly property var previousMessage: root.service
+                        && index > 0 && index <= root.service.messages.length
+                        ? root.service.messages[index - 1] : null
                       readonly property var nextMessage: root.service
                         && index + 1 < root.service.messages.length
                         ? root.service.messages[index + 1] : null
+                      readonly property string messageDateKey:
+                        Model.messageDateKey(modelData.timestamp)
+                      readonly property bool showDateDivider: messageDateKey !== ""
+                        && (!previousMessage || messageDateKey
+                          !== Model.messageDateKey(previousMessage.timestamp))
                       readonly property bool showMessageTime: !nextMessage
                         || !sameSender(nextMessage)
                         || !sameMinute(nextMessage)
@@ -2498,7 +2506,8 @@ Item {
                       }
 
                       width: messageList.width
-                      height: Math.max(bubble.height, senderAvatar.height)
+                      height: dateDivider.height
+                        + Math.max(bubble.height, senderAvatar.height)
                         + (reactionsBar.visible
                           ? reactionsBar.height - Style.space(6) : 0)
                         + (messageFooter.visible
@@ -2513,6 +2522,63 @@ Item {
                       ListView.onReused: {
                         root.stopVoiceMessage(voiceMessageCard)
                         reactionPicker.close()
+                      }
+
+                      Item {
+                        id: dateDivider
+                        objectName: "dateDivider-" + String(modelData.id || "")
+                        readonly property real lineWidth: Math.max(0,
+                          width - dateDividerLabelBackground.width
+                            - Style.space(48)) / 2
+                        visible: messageDelegate.showDateDivider
+                        width: parent.width
+                        height: messageDelegate.showDateDivider
+                          ? Style.space(34) : 0
+
+                        Rectangle {
+                          objectName: "dateDividerLeftLine-"
+                            + String(modelData.id || "")
+                          anchors.left: parent.left
+                          anchors.leftMargin: Style.space(16)
+                          anchors.verticalCenter: parent.verticalCenter
+                          width: dateDivider.lineWidth
+                          height: Math.max(1, Style.normalBorderWidth)
+                          color: Qt.rgba(root.foreground.r, root.foreground.g,
+                            root.foreground.b, root.foreground.a * 0.28)
+                        }
+
+                        Rectangle {
+                          objectName: "dateDividerRightLine-"
+                            + String(modelData.id || "")
+                          anchors.right: parent.right
+                          anchors.rightMargin: Style.space(16)
+                          anchors.verticalCenter: parent.verticalCenter
+                          width: dateDivider.lineWidth
+                          height: Math.max(1, Style.normalBorderWidth)
+                          color: Qt.rgba(root.foreground.r, root.foreground.g,
+                            root.foreground.b, root.foreground.a * 0.28)
+                        }
+
+                        Rectangle {
+                          id: dateDividerLabelBackground
+                          anchors.centerIn: parent
+                          width: dateDividerLabel.implicitWidth + Style.space(12)
+                          height: dateDividerLabel.implicitHeight + Style.space(4)
+                          color: root.background
+
+                          Text {
+                            id: dateDividerLabel
+                            objectName: "dateDividerLabel-"
+                              + String(modelData.id || "")
+                            anchors.centerIn: parent
+                            text: Model.messageDateLabel(modelData.timestamp,
+                              Qt.locale())
+                            color: root.timestamp
+                            font.family: root.fontFamily
+                            font.pixelSize: root.messageMetaFontSize
+                            font.bold: true
+                          }
+                        }
                       }
 
                       CrispBorderSurface {
@@ -2591,6 +2657,7 @@ Item {
 
                       CrispBorderSurface {
                         id: bubble
+                        objectName: "messageBubble-" + String(modelData.id || "")
                         readonly property bool stickerOnlyMedia:
                           messageDelegate.isSticker
                         readonly property bool borderOnlyMedia:
@@ -2659,6 +2726,7 @@ Item {
                           + (borderOnlyMedia
                             ? borderTop + borderBottom
                             : (stickerOnlyMedia ? 0 : Style.space(16)))
+                        y: dateDivider.height
                         x: modelData.from_me
                           ? messageDelegate.width - width - Style.space(18)
                           : (messageDelegate.showSenderAvatar

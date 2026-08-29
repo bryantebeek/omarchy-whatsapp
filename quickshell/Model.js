@@ -98,6 +98,22 @@ function messageTime(seconds, format) {
   return Qt.formatTime(new Date(value * 1000), format || "HH:mm")
 }
 
+function messageDateKey(seconds) {
+  var value = Number(seconds || 0)
+  if (!isFinite(value) || value <= 0) return ""
+  var date = new Date(value * 1000)
+  if (isNaN(date.getTime())) return ""
+  return date.getFullYear() + "-" + date.getMonth() + "-" + date.getDate()
+}
+
+function messageDateLabel(seconds, locale) {
+  var value = Number(seconds || 0)
+  if (!isFinite(value) || value <= 0) return ""
+  var date = new Date(value * 1000)
+  if (isNaN(date.getTime())) return ""
+  return date.toLocaleDateString(locale || Qt.locale(), "dddd, d MMMM yyyy")
+}
+
 function lastSeenLabel(seconds, nowSeconds, format, locale) {
   var value = Number(seconds || 0)
   var current = Number(nowSeconds || 0)

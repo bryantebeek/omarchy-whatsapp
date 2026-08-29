@@ -59,6 +59,7 @@ def main() -> int:
         "menus_open_without_auto_focus",
         "pin_and_unpin_conversation",
         "load_history_and_receive_updates",
+        "conversation_date_dividers",
         "event_updates_preserve_conversation_viewport",
         "open_media_and_recover_connection",
         "render_and_download_stickers",
