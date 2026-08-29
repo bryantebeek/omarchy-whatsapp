@@ -108,10 +108,18 @@ full VoIP surface.
 
 All 61 events exposed by the pinned `whatsapp-rust` release have an explicit
 policy. Product-relevant events are consumed by the daemon; internal routing
-and device-cache events remain library-owned; typing/presence, newsletters,
-pair-code/passkey linking, and profile-about events are explicitly excluded.
+and device-cache events remain library-owned; newsletters, pair-code/passkey
+linking, and profile-about events are explicitly excluded.
 An ordered compile-time test fails when upstream appends a new event kind until
 it is classified.
+
+Presence and chat state are intentionally ephemeral. While the panel is focused,
+the daemon advertises this linked device as available and subscribes to presence
+for the active direct conversation. The composer sends composing once per typing
+burst and paused after inactivity, sending, selection changes, or focus loss.
+Incoming online, last-seen, typing, and recording events cross IPC but are never
+written to `history.db`; the shell expires typing indicators defensively if a
+pause broadcast is lost.
 
 Cross-device regular app-state is replayed once when upgrading to the event-aware
 database. Read/unread, pin, mute, archive, star, deletion/clearing, labels,
@@ -135,7 +143,7 @@ temporary file and atomically renamed after verification. Images are limited to
 
 ## Deliberate exclusions
 
-Stickers, newsletters, presence/typing, embedded maps,
-and a full VoIP stack are not downloaded or hosted by the UI. Their messages
-remain visible as compact placeholders. This keeps the always-on process small
-and avoids pulling Chromium/WebEngine into Omarchy Shell.
+Stickers, newsletters, embedded maps, and a full VoIP stack are not downloaded
+or hosted by the UI. Their messages remain visible as compact placeholders.
+This keeps the always-on process small and avoids pulling Chromium/WebEngine
+into Omarchy Shell.

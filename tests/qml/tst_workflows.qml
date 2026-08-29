@@ -48,6 +48,24 @@ TestCase {
     return false
   }
 
+  function syntheticMessages(count) {
+    var messages = []
+    for (var i = 0; i < count; i++) {
+      messages.push({
+        id: "scroll-" + i,
+        chat_jid: "alice@s.whatsapp.net",
+        sender_jid: i % 2 ? "me" : "alice@s.whatsapp.net",
+        sender_name: i % 2 ? "" : "Alice",
+        from_me: i % 2 === 1,
+        text: "Synthetic message " + i + " with enough text for a stable row",
+        timestamp: 1000 + i * 61,
+        receipt: 1,
+        read_by: []
+      })
+    }
+    return messages
+  }
+
   function test_open_search_select_and_close() {
     panel.open('{"chatJid":"team@g.us"}')
     compare(panel.opened, true)
@@ -83,12 +101,69 @@ TestCase {
     compare(newChat.text, "")
 
     var composer = control("composer")
+    var sendButton = control("sendButton")
+    compare(sendButton.text, "")
+    compare(sendButton.tooltipText, "Send message")
+    compare(sendButton.enabled, true)
+    sendButton.click()
+    compare(service.sentMessages.length, 0)
     composer.text = "Hello from the test"
-    control("sendButton").click()
+    compare(service.chatStateUpdates[service.chatStateUpdates.length - 1], "typing")
+    sendButton.click()
     compare(service.sentMessages.length, 1)
     compare(service.sentMessages[0], "Hello from the test")
     compare(composer.text, "")
+    compare(service.chatStateUpdates[service.chatStateUpdates.length - 1], "paused")
     wait(10)
+  }
+
+  function test_presence_and_typing() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var subtitle = control("conversationSubtitle")
+    var alicePreview = null
+    var teamPreview = null
+    tryVerify(function() {
+      alicePreview = findChild(panel, "chatPreview-alice@s.whatsapp.net")
+      teamPreview = findChild(panel, "chatPreview-team@g.us")
+      return alicePreview !== null && teamPreview !== null
+    })
+    compare(alicePreview.text, "Lunch?")
+    compare(teamPreview.text, "Release ready")
+    service.presenceLabelResult = "online"
+    tryCompare(subtitle, "text", "online")
+    service.chatStateLabels = ({ "alice@s.whatsapp.net": "typing…" })
+    tryCompare(subtitle, "text", "typing…")
+    tryCompare(alicePreview, "text", "Typing…")
+    compare(alicePreview.color, panel.accent)
+    compare(teamPreview.text, "Release ready")
+    compare(String(teamPreview.color), String(panel.sidebarSecondary))
+    service.chatStateLabels = ({})
+    service.presenceLabelResult = "last seen today at 13:07"
+    tryCompare(subtitle, "text", "last seen today at 13:07")
+    tryCompare(alicePreview, "text", "Lunch?")
+    compare(String(alicePreview.color), String(panel.sidebarSecondary))
+
+    panel.chooseChat("team@g.us")
+    service.chatStateLabels = ({ "team@g.us": "Alice and Bob are typing…" })
+    tryCompare(subtitle, "text", "Alice and Bob are typing…")
+    tryCompare(teamPreview, "text", "Alice and Bob are typing…")
+    compare(teamPreview.color, panel.accent)
+  }
+
+  function test_menus_open_without_auto_focus() {
+    panel.open("{}")
+    control("headerMoreButton").click()
+    tryCompare(panel.appMenu, "opened", true)
+    wait(10)
+    compare(panel.appMenuFirstAction.activeFocus, false)
+    panel.appMenu.close()
+
+    var aliceRow = control("chatRow-alice@s.whatsapp.net")
+    aliceRow.openContextMenuAt(aliceRow.width / 2, aliceRow.height / 2)
+    tryCompare(aliceRow.contextMenu, "opened", true)
+    wait(10)
+    compare(aliceRow.pinAction.activeFocus, false)
+    aliceRow.contextMenu.close()
   }
 
   function test_pin_and_unpin_conversation() {
@@ -120,13 +195,39 @@ TestCase {
     panel.open('{"chatJid":"alice@s.whatsapp.net"}')
     service.loadMessages([
       { id: "m1", chat_jid: "alice@s.whatsapp.net", sender_jid: "alice@s.whatsapp.net", sender_name: "Alice", text: "First", timestamp: 100 },
-      { id: "m2", chat_jid: "alice@s.whatsapp.net", sender_jid: "me", from_me: true, text: "Second", timestamp: 101, receipt: 3 }
+      {
+        id: "m2",
+        chat_jid: "alice@s.whatsapp.net",
+        sender_jid: "me",
+        from_me: true,
+        text: "Second",
+        timestamp: 101,
+        receipt: 3,
+        delivered_at: 102,
+        read_at: 103,
+        read_by: [{
+          jid: "alice@s.whatsapp.net", name: "Alice", read_at: 103
+        }]
+      }
     ], "m1")
     tryCompare(control("messageList"), "count", 2)
     var receiptStatus = control("messageReceiptStatus-m2")
     compare(receiptStatus.text, "✓✓")
     compare(receiptStatus.color, panel.accent)
-    compare(receiptStatus.font.pixelSize, 12)
+    compare(receiptStatus.font.pixelSize, 13)
+    compare(receiptStatus.parent.parent.spacing, 4)
+    compare(receiptStatus.receiptTooltipText,
+      "Read\nDelivered at " + panel.messageReceiptTimestamp(102)
+      + "\nRead at " + panel.messageReceiptTimestamp(103)
+      + "\nRead by Alice · " + panel.messageReceiptTimestamp(103))
+    var receiptHoverTarget = control("messageReceiptHoverTarget-m2")
+    verify(receiptHoverTarget.width > 0,
+      "Receipt hover target must have a positive width")
+    verify(receiptHoverTarget.height > 0,
+      "Receipt hover target must have a positive height")
+    var receiptHoverArea = control("messageReceiptHoverArea-m2")
+    compare(receiptHoverArea.hoverEnabled, true)
+    compare(receiptHoverArea.acceptedButtons, Qt.NoButton)
     compare(control("messageTimestamp-m2").font.pixelSize, 10)
     compare(panel.messageIndex("m1"), 0)
     compare(panel.messageIndex("m2"), 1)
@@ -138,6 +239,90 @@ TestCase {
       sender_name: "Alice", text: "Third", timestamp: 102
     }]), "")
     tryCompare(control("messageList"), "count", 3)
+  }
+
+  function test_event_updates_preserve_conversation_viewport() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    service.loadMessages(syntheticMessages(40), "")
+    var list = control("messageList")
+    tryCompare(list, "count", 40)
+    tryCompare(panel, "conversationReady", true)
+    verify(list.model !== service.messages,
+      "The ListView must use a stable render model instead of the service array")
+
+    var aliceRow = control("chatRow-alice@s.whatsapp.net")
+    var updatedChats = service.chats.slice()
+    updatedChats[0] = Object.assign({}, updatedChats[0], {
+      last_message: "Newest sidebar preview"
+    })
+    service.chats = updatedChats
+    tryCompare(control("chatPreview-alice@s.whatsapp.net"), "text",
+      "Newest sidebar preview")
+    compare(control("chatRow-alice@s.whatsapp.net"), aliceRow,
+      "Updating a chat preview must not recreate its sidebar row")
+
+    list.positionViewAtIndex(18, ListView.Beginning)
+    list.forceLayout()
+    wait(20)
+    var anchor = control("messageDelegate-scroll-18")
+    var anchorOffset = anchor.y - list.contentY
+    verify(list.contentY > 0)
+
+    var updated = service.messages.slice()
+    updated[4] = Object.assign({}, updated[4], {
+      receipt: 3,
+      text: "This event changed content above the viewport into a much taller "
+        + "message. The visible anchor should remain at exactly the same pixel "
+        + "offset even though the delegates above it now need more vertical "
+        + "space after the conversation model is replaced and rendered again."
+    })
+    service.replaceMessages(updated, true)
+    tryCompare(list, "count", 40)
+    compare(JSON.parse(list.model.get(4).messageJson).receipt, 3)
+    tryVerify(function() {
+      var restored = findChild(panel, "messageDelegate-scroll-18")
+      return restored !== null
+        && Math.abs((restored.y - list.contentY) - anchorOffset) < 1
+    })
+    compare(control("messageDelegate-scroll-18"), anchor,
+      "An unchanged visible bubble must not be recreated for metadata updates")
+
+    service.incomingMessageSerial++
+    service.loadMessages(service.messages.concat([{
+      id: "scroll-40",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "alice@s.whatsapp.net",
+      sender_name: "Alice",
+      text: "A new message received while reading history",
+      timestamp: 4000
+    }]), "")
+    tryCompare(list, "count", 41)
+    compare(list.model.get(40).messageKey, "id:scroll-40")
+    tryVerify(function() {
+      var restored = findChild(panel, "messageDelegate-scroll-18")
+      return restored !== null
+        && Math.abs((restored.y - list.contentY) - anchorOffset) < 1
+    })
+    compare(control("messageDelegate-scroll-18"), anchor,
+      "Appending a message must not recreate visible history bubbles")
+
+    panel.scheduleConversationScroll("bottom", "")
+    panel.animateConversationViewportToBottom()
+    tryVerify(function() { return panel.conversationViewportNearBottom() })
+    var previousLatest = control("messageDelegate-scroll-40")
+    service.incomingMessageSerial++
+    service.loadMessages(service.messages.concat([{
+      id: "scroll-41",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "alice@s.whatsapp.net",
+      sender_name: "Alice",
+      text: "A new message received at the bottom",
+      timestamp: 4061
+    }]), "")
+    tryCompare(list, "count", 42)
+    tryVerify(function() { return panel.conversationViewportNearBottom() })
+    compare(control("messageDelegate-scroll-40"), previousLatest,
+      "Appending at the bottom must retain the previous latest bubble")
   }
 
   function test_create_render_and_vote_in_poll() {

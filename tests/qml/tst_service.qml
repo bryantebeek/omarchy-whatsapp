@@ -10,6 +10,16 @@ TestCase {
   name: "ServiceState"
 
   property var service: null
+  property int messagesWillChangeCount: 0
+  property bool lastPreservePosition: false
+
+  Connections {
+    target: testCase.service
+    function onMessagesWillChange(preservePosition) {
+      testCase.messagesWillChangeCount++
+      testCase.lastPreservePosition = preservePosition
+    }
+  }
 
   Component {
     id: serviceComponent
@@ -26,6 +36,8 @@ TestCase {
     tryCompare(service, "connected", true)
     TestIo.socketWrites = []
     TestIo.processStarts = []
+    messagesWillChangeCount = 0
+    lastPreservePosition = false
   }
 
   function cleanup() {
@@ -81,7 +93,18 @@ TestCase {
 
   function test_copy_normalize_and_hex_helpers() {
     var original = [
-      { id: "one", receipt: 9, reactions: { 0: "👍", length: 1 } }, null
+      {
+        id: "one",
+        receipt: 9,
+        delivered_at: "123.9",
+        read_at: "invalid",
+        read_by: [
+          { jid: "alice@s.whatsapp.net", name: "Alice", read_at: "456.8" },
+          { jid: "alice@s.whatsapp.net", name: "Duplicate" },
+          { name: "Missing address" }
+        ],
+        reactions: { 0: "👍", length: 1 }
+      }, null
     ]
     var copy = service.copyArray(original)
     verify(copy !== original)
@@ -90,23 +113,95 @@ TestCase {
     compare(normalized[0].reactions.length, 1)
     compare(normalized[0].reactions[0], "👍")
     compare(normalized[0].receipt, 4)
+    compare(normalized[0].delivered_at, 123)
+    compare(normalized[0].read_at, 0)
+    compare(normalized[0].read_by.length, 1)
+    compare(normalized[0].read_by[0].name, "Alice")
+    compare(normalized[0].read_by[0].read_at, 456)
     compare(normalized[1].reactions.length, 0)
     compare(normalized[1].receipt, 0)
+    compare(normalized[1].delivered_at, 0)
+    compare(normalized[1].read_at, 0)
+    compare(normalized[1].read_by.length, 0)
     compare(service.hexKey("Aé"), "41c3a9")
   }
 
   function test_receipt_updates_are_monotonic_and_outgoing_only() {
     service.messages = [
-      { id: "outgoing", from_me: true, receipt: 1 },
-      { id: "incoming", from_me: false, receipt: 0 }
+      {
+        id: "outgoing", from_me: true, receipt: 1,
+        delivered_at: 0, read_at: 0, read_by: []
+      },
+      {
+        id: "direct-read", from_me: true, receipt: 1,
+        delivered_at: 0, read_at: 0, read_by: []
+      },
+      { id: "incoming", from_me: false, receipt: 0, read_by: [] }
     ]
     compare(service.applyReceipts(null), false)
-    compare(service.applyReceipts({ message_ids: ["outgoing"], receipt: 3 }), true)
+    compare(service.applyReceipts({
+      message_ids: ["outgoing"], receipt: 2, timestamp: 20
+    }), true)
+    compare(messagesWillChangeCount, 1)
+    compare(lastPreservePosition, true)
+    compare(service.messages[0].delivered_at, 20)
+    compare(service.applyReceipts({
+      message_ids: ["outgoing"], receipt: 2, timestamp: 30
+    }), false)
+    compare(messagesWillChangeCount, 1)
+    compare(service.applyReceipts({
+      message_ids: ["outgoing"], receipt: 2, timestamp: 10
+    }), true)
+    compare(service.messages[0].delivered_at, 10)
+    compare(service.applyReceipts({
+      message_ids: ["outgoing"],
+      receipt: 3,
+      timestamp: 40,
+      reader: {
+        jid: "alice@s.whatsapp.net", name: "Alice", read_at: 39
+      }
+    }), true)
     compare(service.messages[0].receipt, 3)
+    compare(service.messages[0].read_at, 40)
+    compare(service.messages[0].read_by.length, 1)
+    compare(service.messages[0].read_by[0].name, "Alice")
+    compare(service.messages[0].read_by[0].read_at, 39)
     compare(service.applyReceipts({ message_ids: ["outgoing"], receipt: 2 }), false)
     compare(service.messages[0].receipt, 3)
+    compare(service.applyReceipts({
+      message_ids: ["outgoing"],
+      receipt: 3,
+      timestamp: 45,
+      reader: { jid: "bob@s.whatsapp.net", name: "Bob" }
+    }), true)
+    compare(service.messages[0].read_by.length, 2)
+    compare(service.messages[0].read_by[1].read_at, 45)
+    compare(service.applyReceipts({
+      message_ids: ["outgoing"],
+      receipt: 3,
+      timestamp: 50,
+      reader: { jid: "bob@s.whatsapp.net", name: "Bob" }
+    }), false)
+    compare(service.applyReceipts({
+      message_ids: ["outgoing"], receipt: 3, timestamp: 30,
+      reader: { jid: "alice@s.whatsapp.net", name: "Alice", read_at: 29 }
+    }), true)
+    compare(service.messages[0].read_at, 30)
+    compare(service.messages[0].read_by[0].read_at, 29)
+    compare(service.applyReceipts({
+      message_ids: ["direct-read"], receipt: 3, timestamp: 60,
+      reader: { jid: "alice@s.whatsapp.net", name: "Alice", read_at: "invalid" }
+    }), true)
+    compare(service.messages[1].delivered_at, 0)
+    compare(service.messages[1].read_at, 60)
+    compare(service.messages[1].read_by[0].read_at, 0)
     compare(service.applyReceipts({ message_ids: ["incoming"], receipt: 4 }), false)
-    compare(service.messages[1].receipt, 0)
+    compare(service.messages[2].receipt, 0)
+
+    service.replaceMessages([{ id: "replacement" }], false)
+    compare(messagesWillChangeCount, 7)
+    compare(lastPreservePosition, false)
+    compare(service.messages[0].id, "replacement")
   }
 
   function test_ui_preferences() {
@@ -248,6 +343,89 @@ TestCase {
     compare(reaction.target_from_me, false)
   }
 
+  function test_presence_and_remote_chat_state_lifecycle() {
+    service.presenceClock = new Date(2024, 7, 28, 15, 30, 0).getTime() / 1000
+    service.handleLine(JSON.stringify({
+      event: "presence", jid: "alice@s.whatsapp.net", available: true
+    }))
+    compare(service.presenceLabel("alice@s.whatsapp.net",
+      service.presenceClock, "HH:mm", Qt.locale("en_US")), "online")
+    service.handleLine(JSON.stringify({
+      event: "presence", jid: "alice@s.whatsapp.net", available: false,
+      last_seen: new Date(2024, 7, 28, 13, 7, 0).getTime() / 1000
+    }))
+    compare(service.presenceLabel("alice@s.whatsapp.net",
+      service.presenceClock, "HH:mm", Qt.locale("en_US")),
+      "last seen today at 13:07")
+    compare(service.applyPresence(null), false)
+
+    service.handleLine(JSON.stringify({
+      event: "chat_state", chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "alice@s.whatsapp.net", sender_name: "Alice", state: "typing"
+    }))
+    compare(service.chatStateLabel("alice@s.whatsapp.net", false), "typing…")
+    service.handleLine(JSON.stringify({
+      event: "chat_state", chat_jid: "team@g.us",
+      sender_jid: "bob@s.whatsapp.net", sender_name: "Bob", state: "typing"
+    }))
+    service.handleLine(JSON.stringify({
+      event: "chat_state", chat_jid: "team@g.us",
+      sender_jid: "alice@s.whatsapp.net", sender_name: "Alice", state: "recording"
+    }))
+    compare(service.chatStateLabel("team@g.us", true),
+      "Alice is recording audio…; Bob is typing…")
+    compare(service.applyChatState({ chat_jid: "team@g.us", sender_jid: "bob", state: "bad" }), false)
+    compare(service.applyChatState({
+      chat_jid: "team@g.us", sender_jid: "bob@s.whatsapp.net", state: "paused"
+    }), true)
+    compare(service.chatStateLabel("team@g.us", true), "Alice is recording audio…")
+    compare(service.expireChatStates(service.presenceClock + 11), true)
+    compare(service.chatStateLabel("team@g.us", true), "")
+
+    service.handleLine(JSON.stringify({
+      event: "state", status: { state: "disconnected" }, unread_total: 0
+    }))
+    compare(Object.keys(service.contactPresence).length, 0)
+    compare(Object.keys(service.chatStates).length, 0)
+  }
+
+  function test_local_typing_and_presence_commands() {
+    service.connectionState = "connected"
+    service.selectedChatJid = "alice@s.whatsapp.net"
+    service.setPanelState(true, true)
+    var frames = sentFrames()
+    verify(frames.some(function(frame) {
+      return frame.command === "set_presence" && frame.available === true
+    }))
+    verify(frames.some(function(frame) {
+      return frame.command === "set_active_chat"
+        && frame.chat_jid === "alice@s.whatsapp.net"
+    }))
+
+    TestIo.socketWrites = []
+    compare(service.noteComposerActivity("h"), true)
+    compare(service.noteComposerActivity("hi"), true)
+    frames = sentFrames().filter(function(frame) {
+      return frame.command === "set_chat_state"
+    })
+    compare(frames.length, 1)
+    compare(frames[0].state, "typing")
+    compare(service.pauseComposing(), true)
+    compare(lastFrame().state, "paused")
+    compare(service.pauseComposing(), false)
+
+    service.noteComposerActivity("again")
+    service.setPanelState(true, false)
+    frames = sentFrames()
+    verify(frames.some(function(frame) {
+      return frame.command === "set_presence" && frame.available === false
+    }))
+    verify(frames.some(function(frame) {
+      return frame.command === "set_chat_state" && frame.state === "paused"
+    }))
+    compare(service.noteComposerActivity("not focused"), false)
+  }
+
   function test_set_chat_pinned_command() {
     compare(service.setChatPinned("", true), false)
     compare(TestIo.socketWrites.length, 0)
@@ -306,9 +484,15 @@ TestCase {
     compare(summonArgs[1].chatJid, "chat")
     service.selectedChatJid = "chat"
     service.setPanelState(true, true)
-    compare(lastFrame().chat_jid, "chat")
+    var frames = sentFrames()
+    verify(frames.some(function(frame) {
+      return frame.command === "set_active_chat" && frame.chat_jid === "chat"
+    }))
     service.setPanelState(false, true)
-    compare(lastFrame().chat_jid, null)
+    frames = sentFrames()
+    verify(frames.some(function(frame) {
+      return frame.command === "set_active_chat" && frame.chat_jid === null
+    }))
     compare(service.unlinkDevice(), false)
     service.connectionState = "connected"
     compare(service.unlinkDevice(), true)
@@ -349,6 +533,16 @@ TestCase {
     compare(service.messagesFirstUnreadId, "m1")
     compare(service.messagesResponseSerial, 1)
     compare(service.mediaRevision, 1)
+
+    requestId = service.requestMessages("one")
+    service.handleLine(JSON.stringify({
+      id: requestId,
+      event: "messages",
+      chat_jid: "one",
+      messages: [{ id: "m1", sender_jid: "sender" }]
+    }))
+    compare(lastPreservePosition, true)
+    compare(service.messagesResponseSerial, 2)
   }
 
   function test_event_groups_media_messages_and_errors() {

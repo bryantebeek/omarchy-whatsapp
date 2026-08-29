@@ -39,6 +39,13 @@ TestCase {
     var panel = createTemporaryObject(panelComponent, testCase, { service: service })
     verify(panel !== null)
     compare(panel.groupConversationSubtitle(), "You, Alice, Bob, Carol + 1 other")
+    compare(panel.conversationActivitySubtitle(),
+      "You, Alice, Bob, Carol + 1 other")
+    service.chatStateLabelResult = "Alice is typing…"
+    compare(panel.conversationActivitySubtitle(), "Alice is typing…")
+    compare(panel.sidebarChatActivity(service.selectedChat), "Alice is typing…")
+    service.chatStateLabelResult = ""
+    compare(panel.sidebarChatActivity(service.selectedChat), "")
     service.groupParticipantsError = "failed"
     compare(panel.groupConversationSubtitle(), "Participants unavailable")
     compare(panel.licenseKindLabel("project"), "Application")
@@ -59,6 +66,40 @@ TestCase {
     compare(panel.messageReceiptIcon(3), "✓✓")
     compare(panel.messageReceiptIcon(4), "󰍬")
     compare(panel.messageReceiptLabel(3), "Read")
+    compare(panel.messageReceiptTimestamp(0), "")
+    compare(panel.messageReceiptTooltip({ receipt: 3, read_by: [] }), "Read")
+    var delivered = panel.messageReceiptTimestamp(100)
+    var read = panel.messageReceiptTimestamp(120)
+    compare(panel.messageReceiptTooltip({
+      receipt: 3,
+      delivered_at: 100,
+      read_at: 120,
+      read_by: [
+        { jid: "alice@s.whatsapp.net", name: "Alice", read_at: 120 }
+      ]
+    }), "Read\nDelivered at " + delivered + "\nRead at " + read
+      + "\nRead by Alice · " + read)
+    compare(panel.messageReceiptTooltip({ receipt: 3, read_by: [
+      { jid: "alice@s.whatsapp.net", name: "Alice" }
+    ] }), "Read\nRead by Alice")
+    compare(panel.messageReceiptTooltip({ receipt: 3, read_by: [
+      { jid: "bob@s.whatsapp.net", name: "Bob" },
+      { jid: "alice@s.whatsapp.net", name: "Alice" },
+      { jid: "alice@s.whatsapp.net", name: "Duplicate" }
+    ] }), "Read\nRead by:\nAlice\nBob")
+
+    service.chats = [{
+      jid: "alice@s.whatsapp.net", name: "Alice", phone_number: "316123",
+      is_group: false
+    }]
+    service.selectedChatJid = "alice@s.whatsapp.net"
+    service.presenceLabelResult = "online"
+    compare(panel.conversationActivitySubtitle(), "online")
+    service.chatStateLabelResult = "typing…"
+    compare(panel.sidebarChatActivity(service.selectedChat), "Typing…")
+    service.chatStateLabelResult = ""
+    service.presenceLabelResult = ""
+    compare(panel.conversationActivitySubtitle(), "+316123")
   }
 
   function test_bar_widget_loads_and_formats_state() {

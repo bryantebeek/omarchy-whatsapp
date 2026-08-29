@@ -98,6 +98,29 @@ function messageTime(seconds, format) {
   return Qt.formatTime(new Date(value * 1000), format || "HH:mm")
 }
 
+function lastSeenLabel(seconds, nowSeconds, format, locale) {
+  var value = Number(seconds || 0)
+  var current = Number(nowSeconds || 0)
+  if (!isFinite(value) || value <= 0 || !isFinite(current) || current <= 0)
+    return ""
+  var date = new Date(value * 1000)
+  var now = new Date(current * 1000)
+  if (isNaN(date.getTime()) || isNaN(now.getTime())) return ""
+  var time = Qt.formatTime(date, format || "HH:mm")
+  if (date.getFullYear() === now.getFullYear()
+      && date.getMonth() === now.getMonth()
+      && date.getDate() === now.getDate())
+    return "last seen today at " + time
+  var yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+  if (date.getFullYear() === yesterday.getFullYear()
+      && date.getMonth() === yesterday.getMonth()
+      && date.getDate() === yesterday.getDate())
+    return "last seen yesterday at " + time
+  var activeLocale = locale || Qt.locale()
+  return "last seen " + date.toLocaleDateString(activeLocale, "d MMM")
+    + " at " + time
+}
+
 function mediaDuration(seconds) {
   var parsed = Number(seconds || 0)
   var value = isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0

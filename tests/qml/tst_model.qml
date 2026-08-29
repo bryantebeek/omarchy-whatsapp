@@ -133,6 +133,25 @@ TestCase {
     compare(Model.messageTime(timestamp), Qt.formatTime(new Date(timestamp * 1000), "HH:mm"))
   }
 
+  function test_lastSeenLabel() {
+    compare(Model.lastSeenLabel(null, 1, "HH:mm"), "")
+    compare(Model.lastSeenLabel("invalid", 1, "HH:mm"), "")
+    compare(Model.lastSeenLabel(1, "invalid", "HH:mm"), "")
+
+    var now = new Date(2024, 7, 28, 15, 30, 0)
+    var today = new Date(2024, 7, 28, 13, 7, 0)
+    var yesterday = new Date(2024, 7, 27, 23, 5, 0)
+    var older = new Date(2024, 6, 3, 9, 4, 0)
+    var locale = Qt.locale("en_US")
+    compare(Model.lastSeenLabel(today.getTime() / 1000,
+      now.getTime() / 1000, "HH:mm", locale), "last seen today at 13:07")
+    compare(Model.lastSeenLabel(yesterday.getTime() / 1000,
+      now.getTime() / 1000, "HH:mm", locale), "last seen yesterday at 23:05")
+    compare(Model.lastSeenLabel(older.getTime() / 1000,
+      now.getTime() / 1000, "h:mm AP", locale),
+      "last seen " + older.toLocaleDateString(locale, "d MMM") + " at 9:04 AM")
+  }
+
   function test_mediaDuration_data() {
     return [
       { tag: "invalid", input: "invalid", expected: "0:00" },

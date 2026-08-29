@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use omarchy_whatsapp_protocol::{Chat, Message, MessageMedia, Reaction};
+use omarchy_whatsapp_protocol::{Chat, Message, MessageMedia, MessageReader, Reaction};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::fs;
@@ -85,6 +85,8 @@ impl Database {
                 read        INTEGER NOT NULL DEFAULT 0,
                 starred     INTEGER NOT NULL DEFAULT 0,
                 receipt     INTEGER NOT NULL DEFAULT 0,
+                delivered_at   INTEGER,
+                receipt_read_at INTEGER,
                 media_json      TEXT,
                 media_download  BLOB,
                 PRIMARY KEY (chat_jid, id),
@@ -94,6 +96,15 @@ impl Database {
                 ON messages(chat_jid, timestamp DESC);
             CREATE INDEX IF NOT EXISTS messages_by_sender
                 ON messages(sender_jid);
+            CREATE TABLE IF NOT EXISTS message_reads (
+                chat_jid   TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                reader_jid TEXT NOT NULL,
+                read_at    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_jid, message_id, reader_jid)
+            );
+            CREATE INDEX IF NOT EXISTS message_reads_by_reader
+                ON message_reads(reader_jid);
             CREATE TABLE IF NOT EXISTS contacts (
                 jid    TEXT PRIMARY KEY,
                 name   TEXT NOT NULL,
@@ -186,6 +197,11 @@ impl Database {
         );
         let _ = connection.execute(
             "ALTER TABLE messages ADD COLUMN receipt INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = connection.execute("ALTER TABLE messages ADD COLUMN delivered_at INTEGER", []);
+        let _ = connection.execute(
+            "ALTER TABLE messages ADD COLUMN receipt_read_at INTEGER",
             [],
         );
         let _ = connection.execute("ALTER TABLE messages ADD COLUMN media_json TEXT", []);
@@ -288,6 +304,7 @@ impl Database {
         transaction.execute_batch(
             "
             DELETE FROM reactions;
+            DELETE FROM message_reads;
             DELETE FROM poll_votes;
             DELETE FROM poll_secrets;
             DELETE FROM message_tombstones;
@@ -447,10 +464,10 @@ impl Database {
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO messages
              (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, read,
-              receipt, media_json)
+              receipt, delivered_at, receipt_read_at, media_json)
              VALUES (?1, ?2, ?3,
                 COALESCE((SELECT name FROM contacts WHERE jid = ?3 AND source = 1), ?4),
-                ?5, ?6, ?7, ?8, ?9, ?10)",
+                ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 message.chat_jid,
                 message.id,
@@ -461,6 +478,8 @@ impl Database {
                 message.from_me,
                 !message_is_unread,
                 message.receipt,
+                message.delivered_at,
+                message.read_at,
                 media_json,
             ],
         )? > 0;
@@ -489,6 +508,11 @@ impl Database {
         )?;
         transaction.execute(
             "DELETE FROM poll_secrets WHERE chat_jid = ?1 AND message_id NOT IN
+             (SELECT id FROM messages WHERE chat_jid = ?1)",
+            [&message.chat_jid],
+        )?;
+        transaction.execute(
+            "DELETE FROM message_reads WHERE chat_jid = ?1 AND message_id NOT IN
              (SELECT id FROM messages WHERE chat_jid = ?1)",
             [&message.chat_jid],
         )?;
@@ -734,10 +758,10 @@ impl Database {
             .expect("history database mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me,
-                    receipt, media_json
+                    receipt, delivered_at, receipt_read_at, media_json
              FROM (
                 SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me,
-                       receipt, media_json
+                       receipt, delivered_at, receipt_read_at, media_json
                 FROM messages WHERE chat_jid = ?1
                 ORDER BY timestamp DESC LIMIT ?2
              ) ORDER BY timestamp ASC",
@@ -745,7 +769,7 @@ impl Database {
         let rows =
             statement.query_map(params![chat_jid, i64::from(limit.clamp(1, 1000))], |row| {
                 let mut media = row
-                    .get::<_, Option<String>>(8)?
+                    .get::<_, Option<String>>(10)?
                     .and_then(|json| serde_json::from_str(&json).ok());
                 match &mut media {
                     Some(MessageMedia::Image {
@@ -788,6 +812,9 @@ impl Database {
                     timestamp: row.get(5)?,
                     from_me: row.get(6)?,
                     receipt: u8::try_from(row.get::<_, i64>(7)?.clamp(0, 4)).unwrap_or_default(),
+                    delivered_at: row.get(8)?,
+                    read_at: row.get(9)?,
+                    read_by: Vec::new(),
                     media,
                     reactions: Vec::new(),
                 })
@@ -819,8 +846,41 @@ impl Database {
                 .or_default()
                 .push(reaction);
         }
+        let mut readers_by_message: HashMap<String, Vec<MessageReader>> = HashMap::new();
+        let mut reader_statement = connection.prepare(
+            "SELECT message_reads.message_id, message_reads.reader_jid,
+                    COALESCE(NULLIF(contacts.name, ''), NULLIF(chats.name, ''), ''),
+                    message_reads.read_at
+             FROM message_reads
+             LEFT JOIN contacts ON contacts.jid = message_reads.reader_jid
+             LEFT JOIN chats ON chats.jid = message_reads.reader_jid
+             WHERE message_reads.chat_jid = ?1
+             ORDER BY LOWER(COALESCE(NULLIF(contacts.name, ''), NULLIF(chats.name, ''), '')),
+                      message_reads.reader_jid",
+        )?;
+        let reader_rows = reader_statement.query_map([chat_jid], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                MessageReader {
+                    jid: row.get(1)?,
+                    name: row.get(2)?,
+                    read_at: match row.get::<_, i64>(3)? {
+                        value if value > 0 => Some(value),
+                        _ => None,
+                    },
+                },
+            ))
+        })?;
+        for row in reader_rows {
+            let (message_id, reader) = row?;
+            readers_by_message
+                .entry(message_id)
+                .or_default()
+                .push(reader);
+        }
         for message in &mut messages {
             message.reactions = reactions_by_message.remove(&message.id).unwrap_or_default();
+            message.read_by = readers_by_message.remove(&message.id).unwrap_or_default();
         }
         Ok(messages)
     }
@@ -1325,7 +1385,14 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_receipts(&self, message_ids: &[String], receipt: u8) -> Result<bool> {
+    pub fn update_receipts(
+        &self,
+        chat_jid: &str,
+        message_ids: &[String],
+        receipt: u8,
+        reader_jid: Option<&str>,
+        read_at: i64,
+    ) -> Result<bool> {
         if message_ids.is_empty() {
             return Ok(false);
         }
@@ -1338,10 +1405,43 @@ impl Database {
         let mut changed = false;
         for id in message_ids {
             changed |= transaction.execute(
-                "UPDATE messages SET receipt = ?2
-                 WHERE id = ?1 AND from_me = 1 AND receipt < ?2",
-                params![id, receipt],
+                "UPDATE messages SET
+                    receipt = MAX(receipt, ?2),
+                    delivered_at = CASE
+                        WHEN ?2 = 2 AND ?4 > 0
+                             AND (delivered_at IS NULL OR ?4 < delivered_at)
+                        THEN ?4 ELSE delivered_at END,
+                    receipt_read_at = CASE
+                        WHEN ?2 >= 3 AND ?4 > 0
+                             AND (receipt_read_at IS NULL OR ?4 < receipt_read_at)
+                        THEN ?4 ELSE receipt_read_at END
+                 WHERE id = ?1 AND chat_jid = ?3 AND from_me = 1
+                   AND (receipt < ?2
+                     OR (?2 = 2 AND ?4 > 0
+                         AND (delivered_at IS NULL OR ?4 < delivered_at))
+                     OR (?2 >= 3 AND ?4 > 0
+                         AND (receipt_read_at IS NULL OR ?4 < receipt_read_at)))",
+                params![id, receipt, chat_jid, read_at],
             )? > 0;
+            if receipt >= 3
+                && let Some(reader_jid) = reader_jid.filter(|jid| !jid.is_empty())
+            {
+                changed |= transaction.execute(
+                    "INSERT INTO message_reads
+                     (chat_jid, message_id, reader_jid, read_at)
+                     SELECT ?1, ?2, ?3, ?4
+                     WHERE EXISTS (
+                        SELECT 1 FROM messages
+                        WHERE chat_jid = ?1 AND id = ?2 AND from_me = 1
+                     )
+                     ON CONFLICT(chat_jid, message_id, reader_jid) DO UPDATE SET
+                        read_at = excluded.read_at
+                     WHERE excluded.read_at > 0
+                       AND (message_reads.read_at <= 0
+                            OR excluded.read_at < message_reads.read_at)",
+                    params![chat_jid, id, reader_jid, read_at],
+                )? > 0;
+            }
         }
         transaction.commit()?;
         Ok(changed)
@@ -1470,6 +1570,7 @@ impl Database {
         let transaction = connection.unchecked_transaction()?;
         transaction.execute("DELETE FROM poll_votes WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [chat_jid])?;
+        transaction.execute("DELETE FROM message_reads WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM messages WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM reactions WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM chats WHERE jid = ?1", [chat_jid])?;
@@ -1491,6 +1592,7 @@ impl Database {
         let transaction = connection.unchecked_transaction()?;
         transaction.execute("DELETE FROM poll_votes WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [chat_jid])?;
+        transaction.execute("DELETE FROM message_reads WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM messages WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute("DELETE FROM reactions WHERE chat_jid = ?1", [chat_jid])?;
         transaction.execute(
@@ -1519,6 +1621,10 @@ impl Database {
         )?;
         transaction.execute(
             "DELETE FROM poll_secrets WHERE chat_jid = ?1 AND message_id = ?2",
+            params![chat_jid, message_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM message_reads WHERE chat_jid = ?1 AND message_id = ?2",
             params![chat_jid, message_id],
         )?;
         transaction.execute(
@@ -1939,6 +2045,11 @@ impl Database {
             params![old_jid, new_jid],
         )?;
         transaction.execute(
+            "UPDATE OR IGNORE message_reads SET reader_jid = ?2 WHERE reader_jid = ?1",
+            params![old_jid, new_jid],
+        )?;
+        transaction.execute("DELETE FROM message_reads WHERE reader_jid = ?1", [old_jid])?;
+        transaction.execute(
             "UPDATE OR IGNORE reactions SET reactor_jid = ?2 WHERE reactor_jid = ?1",
             params![old_jid, new_jid],
         )?;
@@ -1983,6 +2094,15 @@ impl Database {
             params![old_jid, new_jid],
         )?;
         transaction.execute("DELETE FROM messages WHERE chat_jid = ?1", [old_jid])?;
+        transaction.execute(
+            "INSERT INTO message_reads (chat_jid, message_id, reader_jid, read_at)
+             SELECT ?2, message_id, reader_jid, read_at
+             FROM message_reads WHERE chat_jid = ?1
+             ON CONFLICT(chat_jid, message_id, reader_jid) DO UPDATE SET
+                read_at = MAX(message_reads.read_at, excluded.read_at)",
+            params![old_jid, new_jid],
+        )?;
+        transaction.execute("DELETE FROM message_reads WHERE chat_jid = ?1", [old_jid])?;
         transaction.execute(
             "DELETE FROM messages WHERE chat_jid = ?1 AND rowid NOT IN
              (SELECT rowid FROM messages WHERE chat_jid = ?1
@@ -2264,6 +2384,9 @@ mod tests {
             timestamp,
             from_me: false,
             receipt: 0,
+            delivered_at: None,
+            read_at: None,
+            read_by: Vec::new(),
             media: None,
             reactions: Vec::new(),
         }
@@ -2338,12 +2461,52 @@ mod tests {
             database.messages("1@s.whatsapp.net", 50).unwrap()[0].receipt,
             1
         );
-        assert!(database.update_receipts(&["outgoing".into()], 2).unwrap());
-        assert!(!database.update_receipts(&["outgoing".into()], 1).unwrap());
-        assert!(database.update_receipts(&["outgoing".into()], 3).unwrap());
+        assert!(
+            database
+                .update_receipts("1@s.whatsapp.net", &["outgoing".into()], 2, None, 2)
+                .unwrap()
+        );
+        assert!(
+            !database
+                .update_receipts("1@s.whatsapp.net", &["outgoing".into()], 1, None, 3)
+                .unwrap()
+        );
+        database
+            .update_contact_name("ada@s.whatsapp.net", "Ada")
+            .unwrap();
+        assert!(
+            database
+                .update_receipts(
+                    "1@s.whatsapp.net",
+                    &["outgoing".into()],
+                    3,
+                    Some("ada@s.whatsapp.net"),
+                    4,
+                )
+                .unwrap()
+        );
+        assert!(
+            !database
+                .update_receipts(
+                    "1@s.whatsapp.net",
+                    &["outgoing".into()],
+                    3,
+                    Some("ada@s.whatsapp.net"),
+                    5,
+                )
+                .unwrap()
+        );
+        let stored = database.messages("1@s.whatsapp.net", 50).unwrap();
+        assert_eq!(stored[0].receipt, 3);
+        assert_eq!(stored[0].delivered_at, Some(2));
+        assert_eq!(stored[0].read_at, Some(4));
         assert_eq!(
-            database.messages("1@s.whatsapp.net", 50).unwrap()[0].receipt,
-            3
+            stored[0].read_by,
+            [MessageReader {
+                jid: "ada@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                read_at: Some(4),
+            }]
         );
     }
 

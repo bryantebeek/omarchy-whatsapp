@@ -67,11 +67,15 @@ pub const EVENT_COVERAGE: &[(EventKind, Coverage, &str)] = &[
         Coverage::Library,
         "internal stanza router",
     ),
-    (EventKind::ChatPresence, Coverage::Excluded, "no typing UI"),
+    (
+        EventKind::ChatPresence,
+        Coverage::App,
+        "typing and recording UI",
+    ),
     (
         EventKind::Presence,
-        Coverage::Excluded,
-        "no online/last-seen UI",
+        Coverage::App,
+        "online and last-seen UI",
     ),
     (
         EventKind::PictureUpdate,
@@ -131,7 +135,7 @@ pub const EVENT_COVERAGE: &[(EventKind, Coverage, &str)] = &[
     (
         EventKind::SelfPushNameUpdated,
         Coverage::App,
-        "account diagnostic",
+        "account diagnostic and deferred presence recovery",
     ),
     (EventKind::PinUpdate, Coverage::App, "chat ordering"),
     (

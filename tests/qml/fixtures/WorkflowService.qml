@@ -30,6 +30,10 @@ QtObject {
   property var sentMessages: []
   property var pinnedChats: []
   property var downloadedMessages: []
+  property var chatStateUpdates: []
+  property string chatStateLabelResult: ""
+  property var chatStateLabels: ({})
+  property string presenceLabelResult: ""
   readonly property var selectedChat: {
     for (var i = 0; i < chats.length; i++)
       if (String(chats[i].jid || "") === selectedChatJid) return chats[i]
@@ -55,6 +59,16 @@ QtObject {
   function setPanelState(visible, focused) {
     record("setPanelState", { visible: visible, focused: focused })
   }
+
+  function noteComposerActivity(text) {
+    chatStateUpdates = chatStateUpdates.concat([String(text || "") ? "typing" : "paused"])
+    return String(text || "") !== ""
+  }
+
+  function chatStateLabel(jid) {
+    return String(chatStateLabels[String(jid || "")] || chatStateLabelResult)
+  }
+  function presenceLabel() { return presenceLabelResult }
 
   function setUnreadOnly(value) { unreadOnly = value === true }
 
@@ -105,12 +119,18 @@ QtObject {
   }
 
   function loadMessages(items, firstUnreadId) {
-    messagesWillChange(false)
+    messagesWillChange(messagesChatJid === selectedChatJid
+      && messages.length > 0)
     messages = items.slice()
     messagesChatJid = selectedChatJid
     messagesFirstUnreadId = String(firstUnreadId || "")
     messagesResponseHasFollowup = false
     messagesResponseSerial++
+  }
+
+  function replaceMessages(items, preservePosition) {
+    messagesWillChange(preservePosition === true)
+    messages = items.slice()
   }
 
   function downloadMedia(message) {

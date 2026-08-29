@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as QQC
 import QtQuick.Effects
 import QtMultimedia
+import QtQml.Models
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -25,6 +26,8 @@ Item {
   property bool scrollToBottomAfterMessages: false
   property bool restoreConversationAfterMessages: false
   property real preservedConversationContentY: 0
+  property string preservedConversationMessageId: ""
+  property real preservedConversationMessageOffset: 0
   property string mediaDownloadAnchorChatJid: ""
   property string mediaDownloadAnchorMessageId: ""
   property real mediaDownloadAnchorOffset: 0
@@ -36,6 +39,8 @@ Item {
   property real currentTimestamp: Date.now() / 1000
   property var licenseEntries: []
   property string licenseLoadError: ""
+  property alias appMenu: headerMenu
+  property alias appMenuFirstAction: headerLicenseAction
   readonly property bool unreadOnly: service && service.unreadOnly === true
 
   readonly property string pluginId: manifest && manifest.id
@@ -77,6 +82,8 @@ Item {
     }
     return output
   }
+
+  onFilteredChatsChanged: root.syncChatRenderModel()
 
   function snapToDevicePixel(value) {
     var scale = Math.max(1, Number(devicePixelRatio) || 1)
@@ -246,6 +253,26 @@ Item {
     var remaining = participants.length - shown
     return labels.join(", ") + (remaining > 0
       ? " + " + remaining + (remaining === 1 ? " other" : " others") : "")
+  }
+
+  function conversationActivitySubtitle() {
+    if (!service || !service.selectedChat) return ""
+    var chat = service.selectedChat
+    var activity = typeof service.chatStateLabel === "function"
+      ? service.chatStateLabel(chat.jid, chat.is_group === true) : ""
+    if (activity) return activity
+    if (chat.is_group === true) return groupConversationSubtitle()
+    var presence = typeof service.presenceLabel === "function"
+      ? service.presenceLabel(chat.jid, currentTimestamp,
+        messageTimeFormat, Qt.locale()) : ""
+    return presence || Model.contactPhoneNumber(chat.phone_number, chat.jid)
+  }
+
+  function sidebarChatActivity(chat) {
+    if (!service || !chat || typeof service.chatStateLabel !== "function") return ""
+    var activity = service.chatStateLabel(chat.jid, chat.is_group === true)
+    if (!activity || chat.is_group === true) return String(activity || "")
+    return activity.charAt(0).toUpperCase() + activity.slice(1)
   }
 
   function licenseKindLabel(kind) {
@@ -476,6 +503,92 @@ Item {
     return -1
   }
 
+  function serializedMessage(message) {
+    try { return JSON.stringify(message || {}) }
+    catch (error) { return "{}" }
+  }
+
+  function messageRenderKey(message, index) {
+    var id = String(message ? message.id || "" : "")
+    return id ? "id:" + id : "index:" + index
+  }
+
+  function renderedMessageIndex(key, startIndex) {
+    for (var i = Math.max(0, Number(startIndex || 0));
+        i < conversationMessageModel.count; i++)
+      if (conversationMessageModel.get(i).messageKey === key) return i
+    return -1
+  }
+
+  function syncConversationMessageModel() {
+    var desired = service && Array.isArray(service.messages)
+      ? service.messages : []
+    for (var index = 0; index < desired.length; index++) {
+      var message = desired[index] || {}
+      var key = messageRenderKey(message, index)
+      var serialized = serializedMessage(message)
+      var row = index < conversationMessageModel.count
+        ? conversationMessageModel.get(index) : null
+      if (!row || row.messageKey !== key) {
+        var existingIndex = renderedMessageIndex(key, index + 1)
+        if (existingIndex >= 0)
+          conversationMessageModel.move(existingIndex, index, 1)
+        else
+          conversationMessageModel.insert(index, {
+            messageKey: key,
+            messageJson: serialized
+          })
+        row = conversationMessageModel.get(index)
+      }
+      if (row.messageJson !== serialized)
+        conversationMessageModel.setProperty(index, "messageJson", serialized)
+    }
+    if (conversationMessageModel.count > desired.length)
+      conversationMessageModel.remove(desired.length,
+        conversationMessageModel.count - desired.length)
+    if (messageList) messageList.forceLayout()
+  }
+
+  function chatRenderKey(chat, index) {
+    var jid = String(chat ? chat.jid || "" : "")
+    return jid ? "jid:" + jid : "index:" + index
+  }
+
+  function renderedChatIndex(key, startIndex) {
+    for (var i = Math.max(0, Number(startIndex || 0));
+        i < chatRenderModel.count; i++)
+      if (chatRenderModel.get(i).chatKey === key) return i
+    return -1
+  }
+
+  function syncChatRenderModel() {
+    var desired = filteredChats
+    for (var index = 0; index < desired.length; index++) {
+      var chat = desired[index] || {}
+      var key = chatRenderKey(chat, index)
+      var serialized = serializedMessage(chat)
+      var row = index < chatRenderModel.count
+        ? chatRenderModel.get(index) : null
+      if (!row || row.chatKey !== key) {
+        var existingIndex = renderedChatIndex(key, index + 1)
+        if (existingIndex >= 0)
+          chatRenderModel.move(existingIndex, index, 1)
+        else
+          chatRenderModel.insert(index, {
+            chatKey: key,
+            chatJson: serialized
+          })
+        row = chatRenderModel.get(index)
+      }
+      if (row.chatJson !== serialized)
+        chatRenderModel.setProperty(index, "chatJson", serialized)
+    }
+    if (chatRenderModel.count > desired.length)
+      chatRenderModel.remove(desired.length,
+        chatRenderModel.count - desired.length)
+    if (chatList) chatList.forceLayout()
+  }
+
   function clearMediaDownloadAnchor() {
     mediaDownloadAnchorClearTimer.stop()
     mediaDownloadAnchorSerial++
@@ -604,14 +717,56 @@ Item {
     })
   }
 
+  function preserveConversationPosition() {
+    if (!messageList || !messageList.count) return false
+    messageList.forceLayout()
+    preservedConversationContentY = messageList.contentY
+    var index = messageList.indexAt(1, messageList.contentY + 1)
+    if (index < 0) index = messageList.indexAt(1,
+      messageList.contentY + Math.max(1, messageList.spacing + 1))
+    if (index < 0 || !service || index >= service.messages.length) {
+      preservedConversationMessageId = ""
+      preservedConversationMessageOffset = 0
+    } else {
+      var item = messageList.itemAtIndex(index)
+      preservedConversationMessageId = String(
+        (service.messages[index] || {}).id || "")
+      preservedConversationMessageOffset = item
+        ? item.y - messageList.contentY : 0
+    }
+    restoreConversationAfterMessages = true
+    return true
+  }
+
+  function restoreConversationPosition(serial, remainingPasses) {
+    if (serial !== conversationScrollSerial
+        || !restoreConversationAfterMessages || !messageList) return
+    messageList.forceLayout()
+    var index = messageIndex(preservedConversationMessageId)
+    var item = index >= 0 ? messageList.itemAtIndex(index) : null
+    if (index >= 0 && !item) {
+      messageList.positionViewAtIndex(index, ListView.Beginning)
+      messageList.forceLayout()
+      item = messageList.itemAtIndex(index)
+    }
+    if (item)
+      messageList.contentY = item.y - preservedConversationMessageOffset
+    else
+      messageList.contentY = preservedConversationContentY
+    if (remainingPasses > 0) {
+      Qt.callLater(function() {
+        root.restoreConversationPosition(serial, remainingPasses - 1)
+      })
+    } else {
+      restoreConversationAfterMessages = false
+      preservedConversationMessageId = ""
+    }
+  }
+
   function scheduleConversationPositionRestore() {
     var serial = ++conversationScrollSerial
     Qt.callLater(function() {
-      if (serial !== root.conversationScrollSerial
-          || !root.restoreConversationAfterMessages || !messageList) return
-      messageList.forceLayout()
-      messageList.contentY = root.preservedConversationContentY
-      root.restoreConversationAfterMessages = false
+      root.restoreConversationPosition(serial, 2)
     })
   }
 
@@ -654,12 +809,70 @@ Item {
     return labels[value]
   }
 
+  function messageReceiptTimestamp(timestamp) {
+    var value = Math.floor(Number(timestamp || 0))
+    return value > 0 ? Model.messageTime(value, root.messageTimeFormat) : ""
+  }
+
+  function messageReceiptTooltip(message) {
+    var lines = [root.messageReceiptLabel(message ? message.receipt : 0)]
+    var deliveredAt = root.messageReceiptTimestamp(
+      message ? message.delivered_at : 0)
+    var readAt = root.messageReceiptTimestamp(message ? message.read_at : 0)
+    if (deliveredAt) lines.push("Delivered at " + deliveredAt)
+    if (readAt) lines.push("Read at " + readAt)
+    var readers = message ? message.read_by : null
+    if (!readers || typeof readers.length !== "number") return lines.join("\n")
+    var entries = []
+    var seen = ({})
+    for (var i = 0; i < readers.length; i++) {
+      var reader = readers[i] || {}
+      var jid = String(reader.jid || "")
+      if (!jid || seen[jid] === true) continue
+      seen[jid] = true
+      entries.push({
+        name: Model.friendlyName(reader.name, jid),
+        read_at: root.messageReceiptTimestamp(reader.read_at)
+      })
+    }
+    entries.sort(function (left, right) {
+      return left.name.localeCompare(right.name)
+    })
+    if (!entries.length) return lines.join("\n")
+    if (entries.length === 1) {
+      lines.push("Read by " + entries[0].name
+        + (entries[0].read_at ? " · " + entries[0].read_at : ""))
+      return lines.join("\n")
+    }
+    lines.push("Read by:")
+    for (var entryIndex = 0; entryIndex < entries.length; entryIndex++)
+      lines.push(entries[entryIndex].name
+        + (entries[entryIndex].read_at
+          ? " · " + entries[entryIndex].read_at : ""))
+    return lines.join("\n")
+  }
+
   Timer {
     interval: 30000
     repeat: true
     running: root.opened
     triggeredOnStart: true
     onTriggered: root.currentTimestamp = Date.now() / 1000
+  }
+
+  ListModel {
+    id: conversationMessageModel
+    objectName: "conversationMessageModel"
+  }
+
+  ListModel {
+    id: chatRenderModel
+    objectName: "chatRenderModel"
+  }
+
+  Component.onCompleted: {
+    root.syncConversationMessageModel()
+    root.syncChatRenderModel()
   }
 
   Timer {
@@ -721,6 +934,7 @@ Item {
       root.conversationReady = false
       root.scrollToBottomAfterMessages = false
       root.restoreConversationAfterMessages = false
+      root.preservedConversationMessageId = ""
       Qt.callLater(root.revealSelectedChat)
     }
     function onMessagesWillChange(preservePosition) {
@@ -729,8 +943,13 @@ Item {
       if (root.mediaDownloadAnchorMessageId) return
       if (!preservePosition || !messageList || !root.conversationReady
           || root.restoreConversationAfterMessages) return
-      root.preservedConversationContentY = messageList.contentY
-      root.restoreConversationAfterMessages = true
+      root.preserveConversationPosition()
+    }
+    function onMessagesChanged() {
+      root.syncConversationMessageModel()
+      if (root.restoreConversationAfterMessages
+          && !root.mediaDownloadAnchorMessageId)
+        root.scheduleConversationPositionRestore()
     }
     function onMessageSentSerialChanged() {
       root.scrollToBottomAfterMessages = true
@@ -1316,6 +1535,7 @@ Item {
             CrispButton {
               id: headerMoreButton
 
+              objectName: "headerMoreButton"
               iconText: "󰇙"
               foreground: root.foreground
               tooltipText: "More"
@@ -1326,6 +1546,7 @@ Item {
               QQC.Popup {
                 id: headerMenu
 
+                objectName: "headerMenu"
                 readonly property var popupBorderSpec:
                   Border.localOrSurfaceSpec("popups", "border",
                     Color.popups.border, Color.popups.border,
@@ -1348,10 +1569,6 @@ Item {
                 closePolicy: QQC.Popup.CloseOnEscape
                   | QQC.Popup.CloseOnPressOutsideParent
 
-                onOpened: Qt.callLater(function() {
-                  headerLicenseAction.forceActiveFocus()
-                })
-
                 background: CrispBorderSurface {
                   color: Color.popups.background
                   sourceBorderSpec: headerMenu.popupBorderSpec
@@ -1366,6 +1583,7 @@ Item {
                   CrispMenuButton {
                     id: headerLicenseAction
 
+                    objectName: "headerLicenseAction"
                     width: parent.width
                     menuIconText: ""
                     menuText: "Licenses"
@@ -1522,7 +1740,7 @@ Item {
                     width: parent.width
                     height: parent.height - sidebarTools.height
                     clip: true
-                    model: root.filteredChats
+                    model: chatRenderModel
                     boundsBehavior: Flickable.StopAtBounds
                     reuseItems: true
                     QQC.ScrollBar.vertical: QQC.ScrollBar {}
@@ -1534,8 +1752,12 @@ Item {
                     delegate: Item {
                       id: chatDelegate
 
-                      required property var modelData
+                      required property string chatJson
                       required property int index
+                      readonly property var modelData: {
+                        try { return JSON.parse(chatJson || "{}") || {} }
+                        catch (error) { return ({}) }
+                      }
                       objectName: "chatRow-" + String(modelData.jid || "")
                       property alias contextMenu: chatContextMenu
                       property alias pinAction: chatPinAction
@@ -1543,6 +1765,8 @@ Item {
                       height: Style.space(60)
                       readonly property bool selected: root.service
                         && String(modelData.jid || "") === root.service.selectedChatJid
+                      readonly property string activityText:
+                        root.sidebarChatActivity(modelData)
 
                       function openContextMenuAt(pointerX, pointerY) {
                         chatContextMenu.x = Math.max(0,
@@ -1692,18 +1916,22 @@ Item {
                               chatStatusIcons.implicitHeight)
                             Text {
                               id: chatPreview
+                              objectName: "chatPreview-" + String(modelData.jid || "")
                               anchors.left: parent.left
                               anchors.right: chatStatusIcons.left
                               anchors.rightMargin: chatStatusIcons.visible
                                 ? Style.space(5) : 0
                               text: {
+                                if (chatDelegate.activityText)
+                                  return chatDelegate.activityText
                                 var message = String(modelData.last_message || "")
                                 if (!message) return "No messages yet"
                                 var sender = String(modelData.last_sender_name || "")
                                 return modelData.is_group === true && sender
                                   ? sender + ": " + message : message
                               }
-                              color: root.sidebarSecondary
+                              color: chatDelegate.activityText
+                                ? root.accent : root.sidebarSecondary
                               font.family: root.fontFamily
                               font.pixelSize: Style.font.caption
                               maximumLineCount: 1
@@ -1795,10 +2023,6 @@ Item {
                         focus: true
                         closePolicy: QQC.Popup.CloseOnEscape
                           | QQC.Popup.CloseOnPressOutsideParent
-
-                        onOpened: Qt.callLater(function() {
-                          chatPinAction.forceActiveFocus()
-                        })
 
                         background: CrispBorderSurface {
                           color: Color.popups.background
@@ -1938,14 +2162,10 @@ Item {
                         }
                         Text {
                           id: conversationSubtitle
+                          objectName: "conversationSubtitle"
                           visible: root.service && root.service.selectedChat
                             && conversationSubtitle.text !== ""
-                          text: !root.service || !root.service.selectedChat
-                            ? "" : root.service.selectedChat.is_group
-                              ? root.groupConversationSubtitle()
-                              : Model.contactPhoneNumber(
-                                root.service.selectedChat.phone_number,
-                                root.service.selectedChat.jid)
+                          text: root.conversationActivitySubtitle()
                           color: root.foreground
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.caption
@@ -1995,7 +2215,7 @@ Item {
                       || !(root.service && root.service.selectedChatJid) ? 1 : 0
                     interactive: root.conversationReady
                       || !(root.service && root.service.selectedChatJid)
-                    model: root.service ? root.service.messages : []
+                    model: conversationMessageModel
                     spacing: Style.space(4)
                     topMargin: Style.space(12)
                     bottomMargin: Style.space(12)
@@ -2006,8 +2226,12 @@ Item {
                     delegate: Item {
                       id: messageDelegate
                       objectName: "messageDelegate-" + String(modelData.id || "")
-                      required property var modelData
+                      required property string messageJson
                       required property int index
+                      readonly property var modelData: {
+                        try { return JSON.parse(messageJson || "{}") || {} }
+                        catch (error) { return ({}) }
+                      }
                       readonly property var mediaData: root.service
                         ? root.service.messageMedia(modelData)
                         : modelData.media || null
@@ -3257,21 +3481,57 @@ Item {
                         x: modelData.from_me
                           ? bubble.x + bubble.width - width - Style.space(4)
                           : bubble.x + Style.space(4)
-                        spacing: Style.space(2)
+                        spacing: 4
 
-                        Text {
-                          objectName: "messageReceiptStatus-"
+                        Item {
+                          id: messageReceiptHoverTarget
+                          objectName: "messageReceiptHoverTarget-"
                             + String(modelData.id || "")
                           visible: modelData.from_me === true
                           anchors.verticalCenter: parent.verticalCenter
-                          text: root.messageReceiptIcon(modelData.receipt)
-                          color: Number(modelData.receipt || 0) >= 3
-                            ? root.accent : root.timestamp
-                          font.family: root.fontFamily
-                          font.pixelSize: 12
-                          font.bold: Number(modelData.receipt || 0) > 0
-                          Accessible.name:
-                            root.messageReceiptLabel(modelData.receipt)
+                          width: messageReceiptStatus.implicitWidth
+                          height: messageReceiptStatus.implicitHeight
+
+                          Text {
+                            id: messageReceiptStatus
+                            objectName: "messageReceiptStatus-"
+                              + String(modelData.id || "")
+                            readonly property string receiptTooltipText:
+                              root.messageReceiptTooltip(modelData)
+                            readonly property bool receiptTooltipVisible:
+                              messageReceiptTooltipPopup.visible
+                            readonly property bool receiptHovered:
+                              messageReceiptHoverArea.containsMouse
+                            anchors.centerIn: parent
+                            text: root.messageReceiptIcon(modelData.receipt)
+                            color: Number(modelData.receipt || 0) >= 3
+                              ? root.accent : root.timestamp
+                            font.family: root.fontFamily
+                            font.pixelSize: 13
+                            font.bold: Number(modelData.receipt || 0) > 0
+                            Accessible.name:
+                              root.messageReceiptLabel(modelData.receipt)
+                          }
+
+                          MouseArea {
+                            id: messageReceiptHoverArea
+                            objectName: "messageReceiptHoverArea-"
+                              + String(modelData.id || "")
+                            anchors.fill: parent
+                            anchors.margins: -3
+                            acceptedButtons: Qt.NoButton
+                            hoverEnabled: true
+                          }
+
+                          QQC.ToolTip {
+                            id: messageReceiptTooltipPopup
+                            objectName: "messageReceiptTooltip-"
+                              + String(modelData.id || "")
+                            visible: messageReceiptHoverArea.containsMouse
+                            text: messageReceiptStatus.receiptTooltipText
+                            delay: 250
+                            timeout: -1
+                          }
                         }
 
                         Text {
@@ -3352,6 +3612,9 @@ Item {
                           - parent.spacing * 2
                         enabled: root.service && root.service.selectedChatJid !== ""
                         placeholderText: enabled ? "Message" : "Select a conversation"
+                        onTextChanged: if (root.service
+                            && typeof root.service.noteComposerActivity === "function")
+                          root.service.noteComposerActivity(text)
                         onAccepted: root.submitMessage()
                       }
                       CrispButton {
@@ -3368,11 +3631,10 @@ Item {
                         id: sendButton
                         objectName: "sendButton"
                         iconText: "󰒊"
-                        text: "Send"
                         bordered: true
-                        active: composer.text.trim() !== ""
-                        enabled: composer.enabled && composer.text.trim() !== ""
+                        enabled: composer.enabled
                         foreground: root.foreground
+                        tooltipText: "Send message"
                         onClicked: root.submitMessage()
                       }
                     }

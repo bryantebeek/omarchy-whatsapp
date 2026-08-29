@@ -126,6 +126,9 @@ mod tests {
             timestamp: 0,
             from_me: false,
             receipt: 0,
+            delivered_at: None,
+            read_at: None,
+            read_by: Vec::new(),
             media: None,
             reactions: Vec::new(),
         }

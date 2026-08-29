@@ -54,8 +54,11 @@ def main() -> int:
     required_workflows = {
         "open_search_select_and_close",
         "new_conversation_and_send_message",
+        "presence_and_typing",
+        "menus_open_without_auto_focus",
         "pin_and_unpin_conversation",
         "load_history_and_receive_updates",
+        "event_updates_preserve_conversation_viewport",
         "open_media_and_recover_connection",
     }
     tested_workflows = names(r"function\s+test_([A-Za-z0-9_]+)\s*\(", workflow_tests)

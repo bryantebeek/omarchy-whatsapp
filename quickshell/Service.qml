@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import "Model.js" as Model
 
 Item {
   id: root
@@ -57,6 +58,12 @@ Item {
   property var messagesQueuedRequests: ({})
   property int messageSentSerial: 0
   property int incomingMessageSerial: 0
+  property var contactPresence: ({})
+  property var chatStates: ({})
+  property double presenceClock: Date.now() / 1000
+  property string localChatStateJid: ""
+  property string localChatState: ""
+  property int sentPresenceState: -1
   property var pollVoteRequests: ({})
   property int pollCreateRequestId: 0
   property string selectedChatJid: ""
@@ -84,6 +91,161 @@ Item {
 
   function copyArray(value) {
     return Array.isArray(value) ? value.slice() : []
+  }
+
+  function clearPresenceState() {
+    contactPresence = ({})
+    chatStates = ({})
+    localChatStateJid = ""
+    localChatState = ""
+    if (typeof localTypingPauseTimer !== "undefined")
+      localTypingPauseTimer.stop()
+  }
+
+  function applyPresence(frame) {
+    var jid = String(frame ? frame.jid || "" : "")
+    if (!jid) return false
+    var lastSeen = Number(frame.last_seen || 0)
+    var values = Object.assign({}, contactPresence)
+    values[jid] = {
+      available: frame.available === true,
+      last_seen: isFinite(lastSeen) && lastSeen > 0 ? lastSeen : 0
+    }
+    contactPresence = values
+    return true
+  }
+
+  function chatStateKey(chatJid, senderJid) {
+    return String(chatJid || "") + "\n" + String(senderJid || "")
+  }
+
+  function applyChatState(frame) {
+    var chatJid = String(frame ? frame.chat_jid || "" : "")
+    var senderJid = String(frame ? frame.sender_jid || "" : "")
+    var state = String(frame ? frame.state || "" : "")
+    if (!chatJid || !senderJid
+        || ["typing", "recording", "paused"].indexOf(state) < 0) return false
+    var values = Object.assign({}, chatStates)
+    var key = chatStateKey(chatJid, senderJid)
+    if (state === "paused") {
+      if (values[key] === undefined) return false
+      delete values[key]
+    } else {
+      values[key] = {
+        chat_jid: chatJid,
+        sender_jid: senderJid,
+        sender_name: String(frame.sender_name || ""),
+        state: state,
+        expires_at: presenceClock + 10
+      }
+    }
+    chatStates = values
+    return true
+  }
+
+  function clearChatState(chatJid, senderJid) {
+    var key = chatStateKey(chatJid, senderJid)
+    if (chatStates[key] === undefined) return false
+    var values = Object.assign({}, chatStates)
+    delete values[key]
+    chatStates = values
+    return true
+  }
+
+  function expireChatStates(nowSeconds) {
+    var now = Number(nowSeconds || presenceClock)
+    var values = Object.assign({}, chatStates)
+    var changed = false
+    for (var key in values) {
+      if (Number((values[key] || {}).expires_at || 0) > now) continue
+      delete values[key]
+      changed = true
+    }
+    if (changed) chatStates = values
+    return changed
+  }
+
+  function chatStateLabel(chatJid, isGroup) {
+    var jid = String(chatJid || "")
+    if (!jid) return ""
+    var entries = []
+    for (var key in chatStates) {
+      var entry = chatStates[key] || {}
+      if (String(entry.chat_jid || "") === jid
+          && Number(entry.expires_at || 0) > presenceClock) entries.push(entry)
+    }
+    if (!entries.length) return ""
+    entries.sort(function(left, right) {
+      return String(left.sender_name || left.sender_jid || "")
+        .localeCompare(String(right.sender_name || right.sender_jid || ""))
+    })
+    var typingNames = []
+    var recordingNames = []
+    for (var i = 0; i < entries.length; i++) {
+      var name = Model.friendlyName(entries[i].sender_name, entries[i].sender_jid)
+      if (entries[i].state === "recording") recordingNames.push(name)
+      else typingNames.push(name)
+    }
+    if (isGroup !== true)
+      return recordingNames.length ? "recording audio…" : "typing…"
+    function groupAction(names, action) {
+      if (names.length === 1) return names[0] + " is " + action + "…"
+      if (names.length === 2)
+        return names[0] + " and " + names[1] + " are " + action + "…"
+      return names[0] + ", " + names[1] + " + " + (names.length - 2)
+        + " are " + action + "…"
+    }
+    if (recordingNames.length && typingNames.length)
+      return groupAction(recordingNames, "recording audio") + "; "
+        + groupAction(typingNames, "typing")
+    var names = recordingNames.length ? recordingNames : typingNames
+    var action = recordingNames.length ? "recording audio" : "typing"
+    return groupAction(names, action)
+  }
+
+  function presenceLabel(jid, nowSeconds, format, locale) {
+    var value = contactPresence[String(jid || "")] || {}
+    if (value.available === true) return "online"
+    return Model.lastSeenLabel(value.last_seen, nowSeconds, format, locale)
+  }
+
+  function sendPresence(force) {
+    var available = panelVisible && panelFocused
+    var encoded = available ? 1 : 0
+    if (force !== true && sentPresenceState === encoded) return false
+    if (!send("set_presence", { available: available })) return false
+    sentPresenceState = encoded
+    return true
+  }
+
+  function pauseComposing() {
+    if (!localChatStateJid || !localChatState) return false
+    var jid = localChatStateJid
+    localChatStateJid = ""
+    localChatState = ""
+    localTypingPauseTimer.stop()
+    send("set_chat_state", { chat_jid: jid, state: "paused" })
+    return true
+  }
+
+  function noteComposerActivity(text) {
+    var active = String(text || "") !== "" && panelVisible && panelFocused
+      && selectedChatJid && connectionState === "connected"
+    if (!active) {
+      pauseComposing()
+      return false
+    }
+    if (localChatStateJid !== selectedChatJid || localChatState !== "typing") {
+      pauseComposing()
+      if (!send("set_chat_state", {
+        chat_jid: selectedChatJid,
+        state: "typing"
+      })) return false
+      localChatStateJid = selectedChatJid
+      localChatState = "typing"
+    }
+    localTypingPauseTimer.restart()
+    return true
   }
 
   function groupParticipantRequestPending(jid) {
@@ -170,6 +332,28 @@ Item {
       var source = output[i] || {}
       var receipt = Math.floor(Number(source.receipt || 0))
       source.receipt = isFinite(receipt) ? Math.max(0, Math.min(4, receipt)) : 0
+      var deliveredAt = Math.floor(Number(source.delivered_at || 0))
+      source.delivered_at = isFinite(deliveredAt) && deliveredAt > 0
+        ? deliveredAt : 0
+      var readAt = Math.floor(Number(source.read_at || 0))
+      source.read_at = isFinite(readAt) && readAt > 0 ? readAt : 0
+      var readers = copyArray(source.read_by)
+      var normalizedReaders = []
+      var seenReaders = ({})
+      for (var readerIndex = 0; readerIndex < readers.length; readerIndex++) {
+        var reader = readers[readerIndex] || {}
+        var readerJid = String(reader.jid || "")
+        if (!readerJid || seenReaders[readerJid] === true) continue
+        seenReaders[readerJid] = true
+        var readerReadAt = Math.floor(Number(reader.read_at || 0))
+        normalizedReaders.push({
+          jid: readerJid,
+          name: String(reader.name || ""),
+          read_at: isFinite(readerReadAt) && readerReadAt > 0
+            ? readerReadAt : 0
+        })
+      }
+      source.read_by = normalizedReaders
       var reactions = source.reactions
       var normalized = []
       if (reactions && typeof reactions.length === "number")
@@ -178,6 +362,11 @@ Item {
       output[i] = source
     }
     return output
+  }
+
+  function replaceMessages(value, preservePosition) {
+    messagesWillChange(preservePosition === true)
+    messages = copyArray(value)
   }
 
   function applyReceipts(frame) {
@@ -190,17 +379,75 @@ Item {
       wanted[String(messageIds[i] || "")] = true
     var updated = messages.slice()
     var changed = false
+    var eventTimestamp = Math.floor(Number(frame ? frame.timestamp || 0 : 0))
+    if (!isFinite(eventTimestamp) || eventTimestamp <= 0) eventTimestamp = 0
+    var eventReader = frame && frame.reader ? frame.reader : null
+    var eventReaderJid = String(eventReader ? eventReader.jid || "" : "")
     for (var messageIndex = 0; messageIndex < updated.length; messageIndex++) {
       var message = updated[messageIndex] || {}
-      if (message.from_me === true && wanted[String(message.id || "")] === true
-          && Number(message.receipt || 0) < nextReceipt) {
-        var replacement = Object.assign({}, message)
+      if (message.from_me !== true || wanted[String(message.id || "")] !== true)
+        continue
+      var replacement = null
+      if (Number(message.receipt || 0) < nextReceipt) {
+        replacement = Object.assign({}, message)
         replacement.receipt = nextReceipt
-        updated[messageIndex] = replacement
-        changed = true
       }
+      var deliveredAt = Math.floor(Number(message.delivered_at || 0))
+      if (nextReceipt === 2 && eventTimestamp
+          && (!deliveredAt || eventTimestamp < deliveredAt)) {
+        if (!replacement) replacement = Object.assign({}, message)
+        replacement.delivered_at = eventTimestamp
+      }
+      var readAt = Math.floor(Number(message.read_at || 0))
+      if (nextReceipt >= 3 && eventTimestamp
+          && (!readAt || eventTimestamp < readAt)) {
+        if (!replacement) replacement = Object.assign({}, message)
+        replacement.read_at = eventTimestamp
+      }
+      if (nextReceipt >= 3 && eventReaderJid) {
+        var readBy = copyArray(message.read_by)
+        var existingReader = -1
+        for (var readIndex = 0; readIndex < readBy.length; readIndex++)
+          if (String((readBy[readIndex] || {}).jid || "") === eventReaderJid) {
+            existingReader = readIndex
+            break
+          }
+        var nextReaderAt = Math.floor(Number(
+          eventReader.read_at || eventTimestamp || 0))
+        if (!isFinite(nextReaderAt) || nextReaderAt <= 0) nextReaderAt = 0
+        var nextReader = {
+          jid: eventReaderJid,
+          name: String(eventReader.name || ""),
+          read_at: nextReaderAt
+        }
+        if (existingReader < 0) {
+          readBy.push(nextReader)
+          if (!replacement) replacement = Object.assign({}, message)
+          replacement.read_by = readBy
+        } else {
+          var currentReader = readBy[existingReader] || {}
+          var currentReaderAt = Math.floor(Number(currentReader.read_at || 0))
+          var readerNameChanged = nextReader.name
+            && String(currentReader.name || "") !== nextReader.name
+          var readerTimeChanged = nextReader.read_at
+            && (!currentReaderAt || nextReader.read_at < currentReaderAt)
+          if (readerNameChanged || readerTimeChanged) {
+            readBy[existingReader] = {
+              jid: eventReaderJid,
+              name: readerNameChanged ? nextReader.name
+                : String(currentReader.name || ""),
+              read_at: readerTimeChanged ? nextReader.read_at : currentReaderAt
+            }
+            if (!replacement) replacement = Object.assign({}, message)
+            replacement.read_by = readBy
+          }
+        }
+      }
+      if (!replacement) continue
+      updated[messageIndex] = replacement
+      changed = true
     }
-    if (changed) messages = updated
+    if (changed) replaceMessages(updated, true)
     return changed
   }
 
@@ -433,7 +680,7 @@ Item {
       messagesChatJid = ""
       messagesFirstUnreadId = ""
       messagesNavigationSerial++
-      messages = []
+      replaceMessages([], false)
     }
     if (changed || messagesChatJid !== value) requestMessages(value)
     if (changed) refreshSelectedGroupParticipants()
@@ -446,6 +693,7 @@ Item {
     var body = String(text || "")
     if (!selectedChatJid || !body.trim()) return false
     send("send_message", { chat_jid: selectedChatJid, text: body })
+    pauseComposing()
     return true
   }
 
@@ -543,7 +791,9 @@ Item {
   function setPanelState(visible, focused) {
     panelVisible = visible === true
     panelFocused = focused === true
+    if (!panelVisible || !panelFocused) pauseComposing()
     updateActiveChat()
+    sendPresence()
   }
 
   function openPanel(chatJid) {
@@ -565,6 +815,13 @@ Item {
     connectionDetail = String(status.reason || status.message || "")
     pairingExpiresAt = Number(status.expires_at || 0)
     unreadTotal = Number(frame.unread_total || 0)
+    if (connectionState !== "connected") {
+      clearPresenceState()
+      sentPresenceState = -1
+    } else {
+      sendPresence()
+      updateActiveChat()
+    }
   }
 
   function handleLine(line) {
@@ -603,17 +860,22 @@ Item {
       applyDownloadedMedia(frame)
     } else if (frame.event === "receipts") {
       applyReceipts(frame)
+    } else if (frame.event === "presence") {
+      applyPresence(frame)
+    } else if (frame.event === "chat_state") {
+      applyChatState(frame)
     } else if (frame.event === "messages") {
       if (String(frame.chat_jid || "") === selectedChatJid) {
-        messagesWillChange(requestedMessagesJid === ""
-          && messagesChatJid === selectedChatJid && messages.length > 0)
+        var preserveMessagePosition = messagesChatJid === selectedChatJid
+          && messages.length > 0
         messagesResponseHasFollowup = queuedMessagesJid === selectedChatJid
         messagesChatJid = String(frame.chat_jid || "")
         messagesFirstUnreadId = String(frame.first_unread_message_id || "")
+        var normalizedMessages = normalizeMessages(frame.messages)
+        replaceMessages(normalizedMessages, preserveMessagePosition)
         mediaRevision++
         mediaOverrides = ({})
         mediaOverrideRevisions = ({})
-        messages = normalizeMessages(frame.messages)
         messagesResponseSerial++
         var requested = {}
         for (var i = messages.length - 1; i >= 0 && i >= messages.length - 40; i--) {
@@ -629,7 +891,10 @@ Item {
       send("list_chats", { limit: 500 })
       if (String(message.chat_jid || "") === selectedChatJid) {
         if (frame.event === "sent") messageSentSerial++
-        else incomingMessageSerial++
+        else {
+          incomingMessageSerial++
+          clearChatState(message.chat_jid, message.sender_jid)
+        }
         requestMessages(selectedChatJid, true)
       }
     } else if (frame.event === "unread") {
@@ -659,9 +924,19 @@ Item {
       requestMessages(queuedMessagesJid)
   }
 
-  onPanelVisibleChanged: updateActiveChat()
-  onPanelFocusedChanged: updateActiveChat()
-  onSelectedChatJidChanged: updateActiveChat()
+  onPanelVisibleChanged: {
+    updateActiveChat()
+    sendPresence()
+  }
+  onPanelFocusedChanged: {
+    if (!panelFocused) pauseComposing()
+    updateActiveChat()
+    sendPresence()
+  }
+  onSelectedChatJidChanged: {
+    pauseComposing()
+    updateActiveChat()
+  }
 
   Component {
     id: socketComponent
@@ -683,12 +958,20 @@ Item {
           root.pollCreateRequestId = 0
           root.reconnectAttempt = 0
           root.lastError = ""
+          root.sentPresenceState = -1
           root.refresh()
+          root.updateActiveChat()
+          root.sendPresence(true)
+        } else {
+          root.clearPresenceState()
+          root.sentPresenceState = -1
         }
       }
       onError: function(_error) {
         root.connected = false
         root.connectionState = "starting"
+        root.clearPresenceState()
+        root.sentPresenceState = -1
       }
     }
   }
@@ -709,6 +992,23 @@ Item {
       if (root.reconnectAttempt === 2) daemonStarter.running = true
       socketLoader.active = false
       socketLoader.active = true
+    }
+  }
+
+  Timer {
+    id: localTypingPauseTimer
+    interval: 5000
+    repeat: false
+    onTriggered: root.pauseComposing()
+  }
+
+  Timer {
+    interval: 1000
+    repeat: true
+    running: Object.keys(root.chatStates).length > 0
+    onTriggered: {
+      root.presenceClock = Date.now() / 1000
+      root.expireChatStates(root.presenceClock)
     }
   }
 
@@ -799,5 +1099,9 @@ Item {
   }
 
   Component.onCompleted: daemonStarter.running = true
-  Component.onDestruction: send("set_active_chat", { chat_jid: null })
+  Component.onDestruction: {
+    pauseComposing()
+    send("set_presence", { available: false })
+    send("set_active_chat", { chat_jid: null })
+  }
 }

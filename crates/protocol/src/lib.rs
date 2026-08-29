@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 19;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -48,6 +48,14 @@ pub struct ChatParticipant {
     pub is_me: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatState {
+    Typing,
+    Recording,
+    Paused,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     pub id: String,
@@ -61,9 +69,23 @@ pub struct Message {
     #[serde(default)]
     pub receipt: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_by: Vec<MessageReader>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MessageMedia>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<Reaction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageReader {
+    pub jid: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,6 +234,13 @@ pub enum Command {
     SetActiveChat {
         chat_jid: Option<String>,
     },
+    SetPresence {
+        available: bool,
+    },
+    SetChatState {
+        chat_jid: String,
+        state: ChatState,
+    },
     Logout,
     Ping,
 }
@@ -268,6 +297,22 @@ pub enum ServerEvent {
     Receipts {
         message_ids: Vec<String>,
         receipt: u8,
+        #[serde(default)]
+        timestamp: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reader: Option<MessageReader>,
+    },
+    Presence {
+        jid: String,
+        available: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_seen: Option<i64>,
+    },
+    ChatState {
+        chat_jid: String,
+        sender_jid: String,
+        sender_name: String,
+        state: ChatState,
     },
     Unread {
         total: u32,
@@ -380,6 +425,43 @@ mod tests {
         );
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn presence_and_chat_state_round_trips_are_stable() {
+        for command in [
+            Command::SetPresence { available: true },
+            Command::SetChatState {
+                chat_jid: "1@s.whatsapp.net".into(),
+                state: ChatState::Typing,
+            },
+            Command::SetChatState {
+                chat_jid: "123-456@g.us".into(),
+                state: ChatState::Paused,
+            },
+        ] {
+            let frame = ClientFrame::new(Some(8), command);
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+        }
+
+        for event in [
+            ServerEvent::Presence {
+                jid: "1@s.whatsapp.net".into(),
+                available: false,
+                last_seen: Some(42),
+            },
+            ServerEvent::ChatState {
+                chat_jid: "123-456@g.us".into(),
+                sender_jid: "1@s.whatsapp.net".into(),
+                sender_name: "Ada".into(),
+                state: ChatState::Recording,
+            },
+        ] {
+            let frame = ServerFrame::event(event);
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+        }
     }
 
     #[test]
@@ -579,6 +661,13 @@ mod tests {
             timestamp: 42,
             from_me: false,
             receipt: 3,
+            delivered_at: Some(40),
+            read_at: Some(41),
+            read_by: vec![MessageReader {
+                jid: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                read_at: Some(41),
+            }],
             media: Some(MessageMedia::Image {
                 path: "/private/cache/image-1.img".into(),
                 thumbnail_path: "/private/cache/image-1.thumbnail.jpg".into(),
@@ -604,6 +693,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(message.receipt, 0);
+        assert_eq!(message.delivered_at, None);
+        assert_eq!(message.read_at, None);
+        assert!(message.read_by.is_empty());
     }
 
     #[test]
@@ -611,6 +703,12 @@ mod tests {
         let frame = ServerFrame::event(ServerEvent::Receipts {
             message_ids: vec!["message-1".into(), "message-2".into()],
             receipt: 3,
+            timestamp: 42,
+            reader: Some(MessageReader {
+                jid: "1@s.whatsapp.net".into(),
+                name: "Ada".into(),
+                read_at: Some(42),
+            }),
         });
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
