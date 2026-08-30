@@ -102,6 +102,55 @@ TestCase {
     compare(frames[frames.length - 1].command, "list_voice_outbox")
   }
 
+  function test_chat_state_resync_request_lifecycle_and_recovery() {
+    service.connectionState = "disconnected"
+    compare(service.requestChatStateResync(), false)
+    service.connectionState = "connected"
+    compare(service.requestChatStateResync(), true)
+    var request = lastFrame()
+    compare(request.command, "resync_chat_state")
+    compare(service.chatStateResyncRequestId, request.id)
+    compare(service.chatStateResyncStatus, "requested")
+    compare(service.chatStateResyncBusy, true)
+    compare(service.requestChatStateResync(), false)
+
+    service.handleLine(JSON.stringify({
+      event: "chat_state_resync",
+      status: "syncing",
+      message: "Requesting authoritative chat state from WhatsApp"
+    }))
+    compare(service.chatStateResyncStatus, "syncing")
+    compare(service.chatStateResyncMessage,
+      "Requesting authoritative chat state from WhatsApp")
+    compare(service.applyChatStateResync({ status: "unexpected" }), false)
+    compare(service.chatStateResyncStatus, "syncing")
+
+    service.handleLine(JSON.stringify({
+      event: "chat_state_resync",
+      status: "succeeded",
+      message: "WhatsApp chat state is up to date"
+    }))
+    compare(service.chatStateResyncStatus, "succeeded")
+    compare(service.chatStateResyncBusy, false)
+    compare(service.requestChatStateResync(), true)
+    var failedRequest = lastFrame()
+    service.handleLine(JSON.stringify({
+      id: failedRequest.id,
+      event: "error",
+      message: "Synthetic replay failure"
+    }))
+    compare(service.chatStateResyncRequestId, 0)
+    compare(service.chatStateResyncStatus, "failed")
+    compare(service.chatStateResyncMessage, "Synthetic replay failure")
+    compare(service.chatStateResyncBusy, false)
+
+    service.handleLine(JSON.stringify({
+      event: "chat_state_resync", status: "idle"
+    }))
+    compare(service.chatStateResyncStatus, "idle")
+    compare(service.chatStateResyncMessage, "")
+  }
+
   function test_protocol_handshake_rejects_version_skew_and_drives_resync() {
     TestIo.socketWrites = []
     service.handleLine(JSON.stringify({

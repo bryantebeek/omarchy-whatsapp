@@ -154,6 +154,27 @@ are stored as per-sender updates and exposed as aggregated chips; an empty
 reaction removes that sender's prior choice. Local mark-read also writes the
 app-state action back to WhatsApp so other devices converge.
 
+Unread state is an event-sourced projection rather than a phone poll. Incoming
+messages increment the materialized count; cross-device self-read receipts and
+ranged `MarkChatAsRead` actions advance a monotonic per-chat watermark plus
+explicit same-second message IDs. The separate explicit-unread marker represents
+only WhatsApp's `read=false` app-state action, so ordinary incoming messages
+cannot masquerade as a synchronized “mark unread”. Full app-state replay repairs
+the projection, while delayed read events cannot clear messages newer than their
+wire boundary or resurrect messages already covered by a newer event.
+
+The local unread tables are a materialized projection: they let the shell render
+immediately, work while the linked device is temporarily offline, and combine
+incremental events without querying the phone. They are not an independent
+source of truth. A “local unread reset” would directly zero those tables without
+a corresponding WhatsApp event, hiding drift while destroying the evidence
+needed to converge correctly. The More-menu **Resync chat state** recovery action
+instead asks the daemon to perform a controlled client reconnect, resets only
+the linked-device app-state cursors, and rebuilds the projection from WhatsApp's
+authoritative event replay. Pairing, messages, media, and local history remain
+untouched; the daemon reports requested, syncing, succeeded, or failed state to
+the shell over IPC.
+
 Poll creation messages retain their encryption secret only in the daemon's
 private database. Incoming vote updates are decrypted there, applied with
 last-vote-wins semantics per participant, and broadcast as refreshed aggregate

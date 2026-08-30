@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 23;
+pub const PROTOCOL_VERSION: u16 = 24;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -54,6 +54,16 @@ pub enum ChatState {
     Typing,
     Recording,
     Paused,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatStateResyncStatus {
+    Idle,
+    Requested,
+    Syncing,
+    Succeeded,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -297,6 +307,7 @@ pub enum Command {
         chat_jid: String,
         state: ChatState,
     },
+    ResyncChatState,
     Logout,
     Ping,
 }
@@ -371,6 +382,11 @@ pub enum ServerEvent {
         sender_jid: String,
         sender_name: String,
         state: ChatState,
+    },
+    ChatStateResync {
+        status: ChatStateResyncStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     Unread {
         total: u32,
@@ -645,6 +661,27 @@ mod tests {
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(json, r#"{"id":10,"command":"logout"}"#);
         assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn chat_state_resync_round_trip_is_stable() {
+        let request = ClientFrame::new(Some(11), Command::ResyncChatState);
+        let request_json = serde_json::to_string(&request).unwrap();
+        assert_eq!(request_json, r#"{"id":11,"command":"resync_chat_state"}"#);
+        assert_eq!(
+            serde_json::from_str::<ClientFrame>(&request_json).unwrap(),
+            request
+        );
+
+        let response = ServerFrame::event(ServerEvent::ChatStateResync {
+            status: ChatStateResyncStatus::Failed,
+            message: Some("synthetic failure".into()),
+        });
+        let response_json = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ServerFrame>(&response_json).unwrap(),
+            response
+        );
     }
 
     #[test]

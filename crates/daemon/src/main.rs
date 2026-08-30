@@ -14,9 +14,9 @@ use clap::Parser;
 use database::Database;
 use futures::StreamExt;
 use omarchy_whatsapp_protocol::{
-    AppPaths, Chat, ChatParticipant, ChatState, ClientFrame, Command, ConnectionStatus, Message,
-    MessageDelivery, MessageMedia, MessageReader, PROTOCOL_VERSION, PollOption, ServerEvent,
-    ServerFrame,
+    AppPaths, Chat, ChatParticipant, ChatState, ChatStateResyncStatus, ClientFrame, Command,
+    ConnectionStatus, Message, MessageDelivery, MessageMedia, MessageReader, PROTOCOL_VERSION,
+    PollOption, ServerEvent, ServerFrame,
 };
 use qrcode::{QrCode, render::svg};
 use std::collections::{HashMap, HashSet};
@@ -28,7 +28,7 @@ use std::sync::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, error, info, warn};
 use whatsapp_rust::prelude::*;
@@ -72,6 +72,9 @@ struct Shared {
     voice_outbox_dir: PathBuf,
     avatar_revision: AtomicU64,
     app_state_failed: AtomicBool,
+    chat_state_resync: RwLock<(ChatStateResyncStatus, Option<String>)>,
+    chat_state_resync_requested: AtomicBool,
+    chat_state_resync_notify: Notify,
     logout_requested: AtomicBool,
     avatar_sync: Mutex<()>,
     group_name_sync: Mutex<()>,
@@ -186,6 +189,21 @@ impl Shared {
             status,
             unread_total: total,
         }));
+    }
+
+    async fn chat_state_resync_event(&self) -> ServerEvent {
+        let (status, message) = self.chat_state_resync.read().await.clone();
+        ServerEvent::ChatStateResync { status, message }
+    }
+
+    async fn set_chat_state_resync(&self, status: ChatStateResyncStatus, message: Option<String>) {
+        *self.chat_state_resync.write().await = (status, message.clone());
+        let _ = self
+            .events
+            .send(ServerFrame::event(ServerEvent::ChatStateResync {
+                status,
+                message,
+            }));
     }
 
     fn write_pairing_qr(&self, status: &ConnectionStatus) {
@@ -2242,6 +2260,19 @@ const APP_EVENT_KINDS: &[EventKind] = &[
     EventKind::AppStateSyncFailed,
 ];
 
+fn read_action_boundary(
+    action: &wa::sync_action_value::MarkChatAsReadAction,
+) -> (Option<i64>, Vec<String>) {
+    let range = action.message_range.as_option();
+    let timestamp = range.and_then(|range| range.last_message_timestamp);
+    let ids = range
+        .into_iter()
+        .flat_map(|range| range.messages.iter())
+        .filter_map(|message| message.key.as_option()?.id.clone())
+        .collect();
+    (timestamp, ids)
+}
+
 async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Client>) {
     match &*event {
         Event::Receipt(receipt) => {
@@ -2253,8 +2284,18 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                     &receipt.message_ids,
                     receipt.timestamp.timestamp(),
                 ) {
-                    Ok(true) => broadcast_snapshot(&shared),
-                    Ok(false) => {}
+                    Ok(changed) => {
+                        info!(
+                            receipt_type,
+                            message_count = receipt.message_ids.len(),
+                            offline = receipt.offline,
+                            changed,
+                            "applied cross-device WhatsApp read receipt"
+                        );
+                        if changed {
+                            broadcast_snapshot(&shared);
+                        }
+                    }
                     Err(error) => {
                         warn!(%error, "could not apply cross-device WhatsApp read receipt");
                     }
@@ -2502,10 +2543,28 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
         }
         Event::MarkChatAsReadUpdate(update) => {
             let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
-            if let Some(read) = update.action.read
-                && let Err(error) = shared.database.apply_read_state(&jid, read)
-            {
-                warn!(%error, "could not apply cross-device WhatsApp read state");
+            if let Some(read) = update.action.read {
+                let range = update.action.message_range.as_option();
+                let (boundary_timestamp, boundary_ids) = read_action_boundary(&update.action);
+                match shared.database.apply_synced_read_state(
+                    &jid,
+                    read,
+                    boundary_timestamp,
+                    &boundary_ids,
+                    update.timestamp.timestamp(),
+                ) {
+                    Ok(changed) => info!(
+                        read,
+                        from_full_sync = update.from_full_sync,
+                        has_range = range.is_some(),
+                        boundary_message_count = boundary_ids.len(),
+                        changed,
+                        "applied cross-device WhatsApp chat read state"
+                    ),
+                    Err(error) => {
+                        warn!(%error, "could not apply cross-device WhatsApp read state");
+                    }
+                }
             }
             broadcast_snapshot(&shared);
         }
@@ -2681,6 +2740,17 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                 failure.skipped.len()
             );
             warn!(%detail);
+            if shared
+                .chat_state_resync_requested
+                .swap(false, Ordering::SeqCst)
+            {
+                shared
+                    .set_chat_state_resync(
+                        ChatStateResyncStatus::Failed,
+                        Some("WhatsApp could not complete the chat-state replay".to_owned()),
+                    )
+                    .await;
+            }
             notification::send_event("WhatsApp synchronization incomplete", &detail, "normal");
             if !failure.connected || !failure.fatal.is_empty() {
                 shared
@@ -2853,12 +2923,15 @@ async fn main() -> Result<()> {
         pairing_qr: paths.runtime_dir.join("pairing.svg"),
         contact_sync_marker: paths.state_dir.join("contact-names-v2"),
         contact_history_marker: paths.state_dir.join("contact-history-names-v1"),
-        event_sync_marker: paths.state_dir.join("event-state-v5"),
+        event_sync_marker: paths.state_dir.join("event-state-v6"),
         avatar_dir,
         media_dir,
         voice_outbox_dir,
         avatar_revision: AtomicU64::new(0),
         app_state_failed: AtomicBool::new(false),
+        chat_state_resync: RwLock::new((ChatStateResyncStatus::Idle, None)),
+        chat_state_resync_requested: AtomicBool::new(false),
+        chat_state_resync_notify: Notify::new(),
         logout_requested: AtomicBool::new(false),
         avatar_sync: Mutex::new(()),
         group_name_sync: Mutex::new(()),
@@ -2887,6 +2960,17 @@ async fn main() -> Result<()> {
             prepare_event_state_resync(&paths.protocol_db, &shared.event_sync_marker)
         {
             warn!(%error, "could not prepare WhatsApp chat-state event resync");
+            if shared
+                .chat_state_resync_requested
+                .swap(false, Ordering::SeqCst)
+            {
+                shared
+                    .set_chat_state_resync(
+                        ChatStateResyncStatus::Failed,
+                        Some("Could not prepare the WhatsApp chat-state replay".to_owned()),
+                    )
+                    .await;
+            }
         }
         let store = SqliteStore::new(paths.protocol_db.to_string_lossy().as_ref())
             .await
@@ -2955,14 +3039,61 @@ async fn main() -> Result<()> {
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                             if !marker_shared.app_state_failed.load(Ordering::Relaxed) {
-                                match marker_shared.database.reconcile_unread_after_full_sync() {
+                                let result = marker_shared
+                                    .database
+                                    .reconcile_unread_after_full_sync();
+                                match result {
                                     Ok(changed) => {
                                         info!(changed, "reconciled imported unread counters with full app-state");
                                         broadcast_snapshot(&marker_shared);
+                                        marker_shared.mark_event_sync_complete();
+                                        if marker_shared
+                                            .chat_state_resync_requested
+                                            .swap(false, Ordering::SeqCst)
+                                        {
+                                            let (status, message) = if marker_shared
+                                                .event_sync_marker
+                                                .exists()
+                                            {
+                                                (
+                                                    ChatStateResyncStatus::Succeeded,
+                                                    Some(
+                                                        "WhatsApp chat state is up to date"
+                                                            .to_owned(),
+                                                    ),
+                                                )
+                                            } else {
+                                                (
+                                                    ChatStateResyncStatus::Failed,
+                                                    Some(
+                                                        "WhatsApp did not finish the chat-state replay"
+                                                            .to_owned(),
+                                                    ),
+                                                )
+                                            };
+                                            marker_shared
+                                                .set_chat_state_resync(status, message)
+                                                .await;
+                                        }
                                     }
-                                    Err(error) => warn!(%error, "could not reconcile WhatsApp unread counters"),
+                                    Err(error) => {
+                                        warn!(%error, "could not reconcile WhatsApp unread counters");
+                                        if marker_shared
+                                            .chat_state_resync_requested
+                                            .swap(false, Ordering::SeqCst)
+                                        {
+                                            marker_shared
+                                                .set_chat_state_resync(
+                                                    ChatStateResyncStatus::Failed,
+                                                    Some(
+                                                        "Could not reconcile the replayed WhatsApp chat state"
+                                                            .to_owned(),
+                                                    ),
+                                                )
+                                                .await;
+                                        }
+                                    }
                                 }
-                                marker_shared.mark_event_sync_complete();
                             }
                         });
                     }
@@ -3136,6 +3267,22 @@ async fn main() -> Result<()> {
                 false
             }
             () = &mut bot_handle => true,
+            () = shared.chat_state_resync_notify.notified() => {
+                shared
+                    .set_chat_state_resync(
+                        ChatStateResyncStatus::Syncing,
+                        Some("Requesting authoritative chat state from WhatsApp".to_owned()),
+                    )
+                    .await;
+                shared
+                    .set_status(ConnectionStatus::Disconnected {
+                        reason: "Resynchronizing WhatsApp chat state".to_owned(),
+                    })
+                    .await;
+                info!("restarting WhatsApp client for requested chat-state resync");
+                bot_handle.shutdown().await;
+                true
+            }
             result = &mut ipc_task => {
                 result.context("IPC task panicked")??;
                 bail!("IPC server stopped unexpectedly");
@@ -3151,6 +3298,8 @@ async fn main() -> Result<()> {
                 .context("clearing local WhatsApp account data after logout")?;
             shared.set_status(ConnectionStatus::LoggedOut).await;
             info!("cleared local WhatsApp account data after logout");
+        } else if shared.chat_state_resync_requested.load(Ordering::SeqCst) {
+            info!("WhatsApp client stopped for requested chat-state resync");
         } else {
             shared
                 .set_status(ConnectionStatus::Disconnected {
@@ -3188,7 +3337,12 @@ async fn write_connection_sync(
         }),
     )
     .await?;
-    write_frame(write, &ServerFrame::event(shared.state_event().await)).await
+    write_frame(write, &ServerFrame::event(shared.state_event().await)).await?;
+    write_frame(
+        write,
+        &ServerFrame::event(shared.chat_state_resync_event().await),
+    )
+    .await
 }
 
 async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()> {
@@ -4384,6 +4538,40 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             }
             Ok(ServerEvent::Ack)
         }
+        Command::ResyncChatState => {
+            if !matches!(*shared.status.read().await, ConnectionStatus::Connected) {
+                bail!("WhatsApp must be connected before chat state can be resynchronized");
+            }
+            if shared
+                .chat_state_resync_requested
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                bail!("a WhatsApp chat-state resync is already in progress");
+            }
+            if let Err(error) = std::fs::remove_file(&shared.event_sync_marker)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                shared
+                    .chat_state_resync_requested
+                    .store(false, Ordering::SeqCst);
+                shared
+                    .set_chat_state_resync(
+                        ChatStateResyncStatus::Failed,
+                        Some("Could not schedule the WhatsApp chat-state replay".to_owned()),
+                    )
+                    .await;
+                return Err(error).context("arming WhatsApp chat-state resync");
+            }
+            shared
+                .set_chat_state_resync(
+                    ChatStateResyncStatus::Requested,
+                    Some("Chat-state resync requested".to_owned()),
+                )
+                .await;
+            shared.chat_state_resync_notify.notify_one();
+            Ok(ServerEvent::Ack)
+        }
         Command::Logout => {
             let client = shared
                 .client
@@ -4419,12 +4607,15 @@ mod tests {
             pairing_qr: directory.path().join("pairing.svg"),
             contact_sync_marker: directory.path().join("contact-names-v2"),
             contact_history_marker: directory.path().join("contact-history-names-v1"),
-            event_sync_marker: directory.path().join("event-state-v5"),
+            event_sync_marker: directory.path().join("event-state-v6"),
             avatar_dir: directory.path().join("avatars"),
             media_dir: directory.path().join("media"),
             voice_outbox_dir: directory.path().join("outbox"),
             avatar_revision: AtomicU64::new(0),
             app_state_failed: AtomicBool::new(false),
+            chat_state_resync: RwLock::new((ChatStateResyncStatus::Idle, None)),
+            chat_state_resync_requested: AtomicBool::new(false),
+            chat_state_resync_notify: Notify::new(),
             logout_requested: AtomicBool::new(false),
             avatar_sync: Mutex::new(()),
             group_name_sync: Mutex::new(()),
@@ -4449,6 +4640,32 @@ mod tests {
         assert_eq!(
             protocol_chat_state(ChatPresence::Paused, ChatPresenceMedia::Audio),
             ChatState::Paused
+        );
+    }
+
+    #[test]
+    fn chat_read_action_preserves_wire_boundary_and_named_messages() {
+        let action = wa::sync_action_value::MarkChatAsReadAction {
+            read: Some(true),
+            message_range: MessageField::some(wa::sync_action_value::SyncActionMessageRange {
+                last_message_timestamp: Some(1_700_000_000),
+                messages: vec![
+                    wa::sync_action_value::SyncActionMessage {
+                        key: MessageField::some(wa::MessageKey {
+                            id: Some("covered".into()),
+                            ..Default::default()
+                        }),
+                        timestamp: Some(1_700_000_000),
+                    },
+                    wa::sync_action_value::SyncActionMessage::default(),
+                ],
+                ..Default::default()
+            }),
+        };
+
+        assert_eq!(
+            read_action_boundary(&action),
+            (Some(1_700_000_000), vec!["covered".to_owned()])
         );
     }
 
@@ -4489,6 +4706,47 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_state_resync_requires_connection_and_arms_one_controlled_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        assert!(
+            handle_command(Command::ResyncChatState, &shared)
+                .await
+                .is_err()
+        );
+
+        *shared.status.write().await = ConnectionStatus::Connected;
+        write_private_marker(&shared.event_sync_marker).unwrap();
+        let mut events = shared.events.subscribe();
+        assert_eq!(
+            handle_command(Command::ResyncChatState, &shared)
+                .await
+                .unwrap(),
+            ServerEvent::Ack
+        );
+        assert!(!shared.event_sync_marker.exists());
+        assert!(shared.chat_state_resync_requested.load(Ordering::SeqCst));
+        assert_eq!(
+            events.recv().await.unwrap().event,
+            ServerEvent::ChatStateResync {
+                status: ChatStateResyncStatus::Requested,
+                message: Some("Chat-state resync requested".into()),
+            }
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            shared.chat_state_resync_notify.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            handle_command(Command::ResyncChatState, &shared)
+                .await
+                .is_err()
         );
     }
 
@@ -4567,7 +4825,7 @@ mod tests {
         shared.mark_event_sync_complete();
         assert!(!shared.event_sync_marker.exists());
         std::fs::remove_file(&blocked_parent).unwrap();
-        shared.event_sync_marker = directory.path().join("event-state-v5");
+        shared.event_sync_marker = directory.path().join("event-state-v6");
         shared.mark_event_sync_complete();
         assert!(shared.event_sync_marker.exists());
     }
@@ -4662,7 +4920,7 @@ mod tests {
             tokio::spawn(async move { serve_connection(server_stream, server_shared).await });
 
         let mut buffer = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             buffer.clear();
             read_test_frame(&mut client_stream, &mut buffer).await;
         }
@@ -4702,7 +4960,7 @@ mod tests {
             tokio::spawn(async move { serve_connection(server_stream, server_shared).await });
 
         let mut buffer = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             buffer.clear();
             read_test_frame(&mut client_stream, &mut buffer).await;
         }
@@ -4735,6 +4993,14 @@ mod tests {
             read_test_frame(&mut client_stream, &mut buffer).await.event,
             ServerEvent::State { .. }
         ));
+        buffer.clear();
+        assert_eq!(
+            read_test_frame(&mut client_stream, &mut buffer).await.event,
+            ServerEvent::ChatStateResync {
+                status: ChatStateResyncStatus::Idle,
+                message: None,
+            }
+        );
 
         drop(client_stream);
         // Pending oversized broadcasts can observe the intentional client
@@ -4753,7 +5019,7 @@ mod tests {
             tokio::spawn(async move { serve_connection(server_stream, server_shared).await });
 
         let mut buffer = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             buffer.clear();
             read_test_frame(&mut client_stream, &mut buffer).await;
         }
@@ -5414,7 +5680,7 @@ mod tests {
     fn event_resync_resets_bootstrap_and_regular_collections() {
         let directory = tempfile::tempdir().unwrap();
         let protocol_db = directory.path().join("session.db");
-        let marker = directory.path().join("event-state-v5");
+        let marker = directory.path().join("event-state-v6");
         let connection = rusqlite::Connection::open(&protocol_db).unwrap();
         connection
             .execute_batch(

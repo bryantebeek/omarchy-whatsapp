@@ -113,6 +113,8 @@ MUTATIONS = [
     mutation("service-selection-change", S, TS, "var changed = value !== selectedChatJid", "var changed = value === selectedChatJid"),
     mutation("service-empty-message", S, TS, "if (!selectedChatJid || !body.trim()) return false", "if (!selectedChatJid && !body.trim()) return false"),
     mutation("service-chat-pin-value", S, TS, "pinned: pinned === true", "pinned: pinned !== true"),
+    mutation("service-resync-connection-guard", S, TS, 'connectionState !== "connected" || chatStateResyncBusy', 'connectionState !== "connected" && chatStateResyncBusy'),
+    mutation("service-resync-event-status", S, TS, 'chatStateResyncStatus = status\n    chatStateResyncMessage', 'chatStateResyncStatus = "idle"\n    chatStateResyncMessage'),
     mutation("service-unlink-state", S, TS, 'if (connectionState !== "connected") return false', 'if (connectionState === "connected") return false'),
     mutation("service-reaction-owner", S, TS, "target_from_me: message.from_me === true", "target_from_me: message.from_me !== true"),
     mutation("service-active-chat-focus", S, TS, "panelVisible && panelFocused && selectedChatJid", "panelVisible || panelFocused || selectedChatJid"),

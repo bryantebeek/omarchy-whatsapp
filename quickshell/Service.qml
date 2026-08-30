@@ -29,7 +29,7 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
-  readonly property int protocolVersion: 23
+  readonly property int protocolVersion: 24
 
   property bool connected: false
   property bool protocolCompatible: false
@@ -81,6 +81,11 @@ Item {
   property int reconnectAttempt: 0
   property bool launcherSyncPending: false
   property string lastError: ""
+  property string chatStateResyncStatus: "idle"
+  property string chatStateResyncMessage: ""
+  property int chatStateResyncRequestId: 0
+  readonly property bool chatStateResyncBusy:
+    chatStateResyncStatus === "requested" || chatStateResyncStatus === "syncing"
   property bool unreadOnly: false
   property bool uiPreferencesReady: false
   property bool uiPreferencesDirty: false
@@ -989,6 +994,37 @@ Item {
     }) > 0
   }
 
+  function requestChatStateResync() {
+    if (connectionState !== "connected" || chatStateResyncBusy) return false
+    var requestId = send("resync_chat_state")
+    if (!requestId) return false
+    chatStateResyncRequestId = requestId
+    chatStateResyncStatus = "requested"
+    chatStateResyncMessage = "Chat-state resync requested"
+    return true
+  }
+
+  function applyChatStateResync(frame) {
+    var status = String(frame ? frame.status || "" : "")
+    if (["idle", "requested", "syncing", "succeeded", "failed"]
+        .indexOf(status) < 0) return false
+    chatStateResyncStatus = status
+    chatStateResyncMessage = String(frame.message || "")
+    return true
+  }
+
+  function finishChatStateResyncRequest(frame) {
+    if (!frame || frame.id === undefined || frame.id === null
+        || Number(frame.id) !== chatStateResyncRequestId) return false
+    chatStateResyncRequestId = 0
+    if (frame.event === "error") {
+      chatStateResyncStatus = "failed"
+      chatStateResyncMessage = String(
+        frame.message || "Could not request a WhatsApp chat-state resync")
+    }
+    return true
+  }
+
   function createPoll(question, options, multipleAnswers) {
     var title = String(question || "").trim()
     var normalized = []
@@ -1149,6 +1185,7 @@ Item {
     finishPollRequest(frame)
     finishMediaDownloadRequest(frame)
     finishVoiceMessageRequest(frame)
+    finishChatStateResyncRequest(frame)
     var queuedMessagesJid = finishMessagesRequest(frame)
     lastError = ""
     if (frame.event === "state") {
@@ -1175,6 +1212,8 @@ Item {
       applyPresence(frame)
     } else if (frame.event === "chat_state") {
       applyChatState(frame)
+    } else if (frame.event === "chat_state_resync") {
+      applyChatStateResync(frame)
     } else if (frame.event === "voice_outbox") {
       applyVoiceOutbox(frame)
     } else if (frame.event === "messages") {

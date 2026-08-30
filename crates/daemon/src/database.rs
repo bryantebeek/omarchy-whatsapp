@@ -160,6 +160,7 @@ impl Database {
                 muted                     INTEGER,
                 mute_end                  INTEGER,
                 read_state                INTEGER,
+                explicit_unread           INTEGER NOT NULL DEFAULT 0,
                 status_muted              INTEGER,
                 disappearing_duration     INTEGER,
                 disappearing_updated_at   INTEGER,
@@ -331,6 +332,12 @@ impl Database {
             "chat_settings",
             "read_boundary_ids",
             "read_boundary_ids TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "chat_settings",
+            "explicit_unread",
+            "explicit_unread INTEGER NOT NULL DEFAULT 0",
         )?;
         // A JID is an identifier, never a chat name. Legacy databases stored
         // it in `name` as a rendering fallback, which made later syncs unable
@@ -588,11 +595,6 @@ impl Database {
                 "UPDATE chats SET unread = unread + 1 WHERE jid = ?1",
                 [&message.chat_jid],
             )?;
-            transaction.execute(
-                "INSERT INTO chat_settings (jid, read_state) VALUES (?1, 0)
-                 ON CONFLICT(jid) DO UPDATE SET read_state = 0",
-                [&message.chat_jid],
-            )?;
         }
         // Keep history bounded without a background cleaner. Protocol state is in a
         // separate database and is never touched by this retention policy.
@@ -631,7 +633,9 @@ impl Database {
                     ), ''),
                     chats.last_timestamp,
                     CASE WHEN COALESCE(chat_settings.archived, 0) = 0
-                         THEN chats.unread ELSE 0 END,
+                         THEN MAX(chats.unread,
+                                  COALESCE(chat_settings.explicit_unread, 0))
+                         ELSE 0 END,
                     COALESCE(chat_settings.pinned, 0) = 1,
                     COALESCE(chat_settings.muted, 0) = 1
                       AND (COALESCE(chat_settings.mute_end, 0) <= 0
@@ -742,15 +746,6 @@ impl Database {
                 chat.is_group,
                 CHAT_NAME_UNKNOWN,
             ],
-        )?;
-        transaction.execute(
-            "UPDATE chats SET unread = CASE
-                 (SELECT read_state FROM chat_settings WHERE jid = chats.jid)
-                 WHEN 1 THEN 0
-                 WHEN 0 THEN MAX(unread, 1)
-                 ELSE unread END
-             WHERE jid = ?1",
-            [&chat.jid],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1223,7 +1218,10 @@ impl Database {
         // archived chats, but every unarchived unread message still counts.
         connection
             .query_row(
-                "SELECT COALESCE(SUM(chats.unread), 0)
+                "SELECT COALESCE(SUM(MAX(
+                            chats.unread,
+                            COALESCE(chat_settings.explicit_unread, 0)
+                        )), 0)
                  FROM chats
                  LEFT JOIN chat_settings ON chat_settings.jid = chats.jid
                  WHERE COALESCE(chat_settings.archived, 0) = 0",
@@ -1275,35 +1273,92 @@ impl Database {
 
     pub fn mark_read(&self, chat_jid: &str) -> Result<()> {
         let connection = self.connection();
-        let transaction = connection.unchecked_transaction()?;
-        transaction.execute("UPDATE chats SET unread = 0 WHERE jid = ?1", [chat_jid])?;
-        transaction.execute(
-            "UPDATE messages SET read = 1 WHERE chat_jid = ?1",
-            [chat_jid],
-        )?;
-        transaction.execute(
-            "INSERT INTO chat_settings (jid, read_state) VALUES (?1, 1)
-             ON CONFLICT(jid) DO UPDATE SET read_state = 1",
-            [chat_jid],
-        )?;
-        transaction.commit()?;
+        let boundary = connection
+            .query_row(
+                "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?1",
+                [chat_jid],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .unwrap_or(0);
+        drop(connection);
+        self.apply_read_boundary(chat_jid, boundary, &[])?;
         Ok(())
     }
 
-    pub fn apply_read_state(&self, chat_jid: &str, read: bool) -> Result<()> {
+    pub fn apply_read_state(&self, chat_jid: &str, read: bool) -> Result<bool> {
         if read {
-            return self.mark_read(chat_jid);
+            let connection = self.connection();
+            let boundary = connection
+                .query_row(
+                    "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?1",
+                    [chat_jid],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?
+                .unwrap_or(0);
+            drop(connection);
+            return self.apply_read_boundary(chat_jid, boundary, &[]);
         }
         let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
+        let previous = transaction
+            .query_row(
+                "SELECT explicit_unread FROM chat_settings WHERE jid = ?1",
+                [chat_jid],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false);
         transaction.execute(
-            "INSERT INTO chat_settings (jid, read_state) VALUES (?1, 0)
-             ON CONFLICT(jid) DO UPDATE SET read_state = 0",
+            "INSERT INTO chat_settings (jid, read_state, explicit_unread)
+             VALUES (?1, 0, 1)
+             ON CONFLICT(jid) DO UPDATE SET
+                read_state = 0,
+                explicit_unread = 1",
             [chat_jid],
         )?;
-        transaction.execute("UPDATE chats SET unread = 1 WHERE jid = ?1", [chat_jid])?;
         transaction.commit()?;
-        Ok(())
+        Ok(!previous)
+    }
+
+    pub fn apply_synced_read_state(
+        &self,
+        chat_jid: &str,
+        read: bool,
+        boundary_timestamp: Option<i64>,
+        boundary_ids: &[String],
+        event_timestamp: i64,
+    ) -> Result<bool> {
+        if !read {
+            return self.apply_read_state(chat_jid, false);
+        }
+        let boundary = if let Some(boundary) = boundary_timestamp {
+            boundary
+        } else {
+            let connection = self.connection();
+            let covered = boundary_ids.iter().try_fold(None, |newest, id| {
+                let timestamp = connection
+                    .query_row(
+                        "SELECT timestamp FROM messages
+                         WHERE chat_jid = ?1 AND id = ?2",
+                        params![chat_jid, id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                Ok::<_, rusqlite::Error>(newest.max(timestamp))
+            })?;
+            if boundary_ids.is_empty() {
+                connection
+                    .query_row(
+                        "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?1",
+                        [chat_jid],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )?
+                    .unwrap_or(event_timestamp)
+            } else {
+                covered.unwrap_or(event_timestamp)
+            }
+        };
+        self.apply_read_boundary(chat_jid, boundary, boundary_ids)
     }
 
     pub fn reconcile_unread_after_full_sync(&self) -> Result<u64> {
@@ -1313,17 +1368,18 @@ impl Database {
         let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
         let changed = transaction.execute(
-            "UPDATE chats SET unread = 0
-             WHERE unread > 0 AND NOT EXISTS (
-                 SELECT 1 FROM chat_settings
-                 WHERE chat_settings.jid = chats.jid
-                   AND chat_settings.read_state = 0
+            "UPDATE chats SET unread = (
+                 SELECT COUNT(*) FROM messages
+                 WHERE messages.chat_jid = chats.jid
+                   AND messages.from_me = 0
+                   AND messages.read = 0
+             )
+             WHERE unread != (
+                 SELECT COUNT(*) FROM messages
+                 WHERE messages.chat_jid = chats.jid
+                   AND messages.from_me = 0
+                   AND messages.read = 0
              )",
-            [],
-        )?;
-        transaction.execute(
-            "UPDATE messages SET read = 1
-             WHERE chat_jid IN (SELECT jid FROM chats WHERE unread = 0)",
             [],
         )?;
         transaction.commit()?;
@@ -1521,15 +1577,12 @@ impl Database {
         Ok(changed)
     }
 
-    pub fn apply_self_read_receipt(
+    fn apply_read_boundary(
         &self,
         chat_jid: &str,
-        message_ids: &[String],
-        receipt_timestamp: i64,
+        boundary_timestamp: i64,
+        boundary_ids: &[String],
     ) -> Result<bool> {
-        if message_ids.is_empty() {
-            return Ok(false);
-        }
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
         transaction.execute(
@@ -1537,36 +1590,33 @@ impl Database {
              ON CONFLICT(jid) DO NOTHING",
             [chat_jid],
         )?;
-        let (old_boundary, boundary_ids_json) = transaction.query_row(
-            "SELECT read_boundary, read_boundary_ids
+        let (old_boundary, boundary_ids_json, was_explicit_unread) = transaction.query_row(
+            "SELECT read_boundary, read_boundary_ids, explicit_unread
              FROM chat_settings WHERE jid = ?1",
             [chat_jid],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
         )?;
         let mut covered_ids = read_boundary_ids(boundary_ids_json);
-        let mut newest_covered: Option<i64> = None;
-        for id in message_ids {
-            let timestamp = transaction
-                .query_row(
-                    "SELECT timestamp FROM messages
-                     WHERE chat_jid = ?1 AND id = ?2",
-                    params![chat_jid, id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()?;
-            newest_covered = newest_covered.max(timestamp);
+        for id in boundary_ids {
             if !covered_ids.contains(id) {
                 covered_ids.push(id.clone());
             }
         }
-        // WhatsApp self-read receipts are a read-through watermark. Stop just
-        // before the boundary second and keep its named IDs separately so an
-        // unlisted message with the same wire timestamp remains unread.
-        let new_boundary = old_boundary.max(
-            newest_covered
-                .unwrap_or(receipt_timestamp)
-                .saturating_sub(1),
-        );
+        // A keyed boundary covers only the named messages in its wire second;
+        // an unkeyed boundary covers that entire second. Preserve both pieces
+        // monotonically so stale replay cannot resurrect an older badge.
+        let candidate_boundary = if boundary_ids.is_empty() {
+            boundary_timestamp
+        } else {
+            boundary_timestamp.saturating_sub(1)
+        };
+        let new_boundary = old_boundary.max(candidate_boundary);
         let mut extra_ids = Vec::with_capacity(covered_ids.len());
         for id in covered_ids {
             let timestamp = transaction
@@ -1591,7 +1641,10 @@ impl Database {
         };
         transaction.execute(
             "UPDATE chat_settings
-             SET read_boundary = ?2, read_boundary_ids = ?3
+             SET read_boundary = ?2,
+                 read_boundary_ids = ?3,
+                 read_state = 1,
+                 explicit_unread = 0
              WHERE jid = ?1",
             params![chat_jid, new_boundary, covered_ids_json],
         )?;
@@ -1601,7 +1654,7 @@ impl Database {
                AND timestamp <= ?2",
             params![chat_jid, new_boundary],
         )?;
-        for id in message_ids {
+        for id in boundary_ids {
             marked += transaction.execute(
                 "UPDATE messages SET read = 1
                  WHERE chat_jid = ?1 AND id = ?2 AND from_me = 0 AND read = 0",
@@ -1625,12 +1678,41 @@ impl Database {
             "UPDATE chats SET unread = ?2 WHERE jid = ?1",
             params![chat_jid, unread],
         )?;
-        transaction.execute(
-            "UPDATE chat_settings SET read_state = ?2 WHERE jid = ?1",
-            params![chat_jid, i64::from(unread == 0)],
-        )?;
         transaction.commit()?;
-        Ok(marked > 0 || previous_unread.is_some_and(|previous| previous != unread))
+        Ok(marked > 0
+            || was_explicit_unread
+            || new_boundary != old_boundary
+            || previous_unread.is_some_and(|previous| previous != unread))
+    }
+
+    pub fn apply_self_read_receipt(
+        &self,
+        chat_jid: &str,
+        message_ids: &[String],
+        receipt_timestamp: i64,
+    ) -> Result<bool> {
+        if message_ids.is_empty() {
+            return Ok(false);
+        }
+        let connection = self.connection();
+        let mut newest_covered: Option<i64> = None;
+        for id in message_ids {
+            let timestamp = connection
+                .query_row(
+                    "SELECT timestamp FROM messages
+                     WHERE chat_jid = ?1 AND id = ?2",
+                    params![chat_jid, id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            newest_covered = newest_covered.max(timestamp);
+        }
+        drop(connection);
+        self.apply_read_boundary(
+            chat_jid,
+            newest_covered.unwrap_or(receipt_timestamp),
+            message_ids,
+        )
     }
 
     pub fn delete_chat(&self, chat_jid: &str, timestamp: i64) -> Result<()> {
@@ -1665,9 +1747,12 @@ impl Database {
             [chat_jid],
         )?;
         transaction.execute(
-            "INSERT INTO chat_settings (jid, read_state, cleared_at) VALUES (?1, 1, ?2)
+            "INSERT INTO chat_settings
+             (jid, read_state, explicit_unread, cleared_at) VALUES (?1, 1, 0, ?2)
              ON CONFLICT(jid) DO UPDATE SET
-                read_state = 1, cleared_at = MAX(cleared_at, ?2)",
+                read_state = 1,
+                explicit_unread = 0,
+                cleared_at = MAX(cleared_at, ?2)",
             params![chat_jid, timestamp],
         )?;
         transaction.commit()?;
@@ -2185,10 +2270,10 @@ impl Database {
         transaction.execute("DELETE FROM chat_labels WHERE chat_jid = ?1", [old_jid])?;
         transaction.execute(
             "INSERT INTO chat_settings
-             (jid, pinned, archived, muted, mute_end, read_state, status_muted,
+             (jid, pinned, archived, muted, mute_end, read_state, explicit_unread, status_muted,
               disappearing_duration, disappearing_updated_at, deleted, cleared_at,
               read_boundary, read_boundary_ids)
-             SELECT ?2, pinned, archived, muted, mute_end, read_state, status_muted,
+             SELECT ?2, pinned, archived, muted, mute_end, read_state, explicit_unread, status_muted,
                     disappearing_duration, disappearing_updated_at, deleted, cleared_at,
                     read_boundary, read_boundary_ids
              FROM chat_settings WHERE jid = ?1
@@ -2198,6 +2283,8 @@ impl Database {
                 muted = COALESCE(excluded.muted, chat_settings.muted),
                 mute_end = COALESCE(excluded.mute_end, chat_settings.mute_end),
                 read_state = COALESCE(excluded.read_state, chat_settings.read_state),
+                explicit_unread = MAX(
+                    chat_settings.explicit_unread, excluded.explicit_unread),
                 status_muted = COALESCE(excluded.status_muted, chat_settings.status_muted),
                 disappearing_duration = CASE
                     WHEN COALESCE(excluded.disappearing_updated_at, 0)
@@ -2714,11 +2801,119 @@ mod tests {
     }
 
     #[test]
+    fn incoming_messages_do_not_become_explicit_unread_sync_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        database
+            .insert_message(&message("incoming", 1), "Ada", false, true)
+            .unwrap();
+
+        let connection = database.connection();
+        let explicit = connection
+            .query_row(
+                "SELECT explicit_unread FROM chat_settings WHERE jid = ?1",
+                ["1@s.whatsapp.net"],
+                |row| row.get::<_, Option<bool>>(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten()
+            .unwrap_or(false);
+        assert!(!explicit);
+        drop(connection);
+        assert_eq!(database.unread_total().unwrap(), 1);
+    }
+
+    #[test]
+    fn explicit_unread_marker_is_separate_from_message_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        database
+            .insert_message(&message("incoming", 1), "Ada", false, true)
+            .unwrap();
+        database.mark_read("1@s.whatsapp.net").unwrap();
+
+        assert!(
+            database
+                .apply_read_state("1@s.whatsapp.net", false)
+                .unwrap()
+        );
+        assert_eq!(database.unread_total().unwrap(), 1);
+        assert_eq!(database.list_chats(1).unwrap()[0].unread, 1);
+        assert!(
+            database
+                .first_unread_message_id("1@s.whatsapp.net")
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(database.apply_read_state("1@s.whatsapp.net", true).unwrap());
+        assert_eq!(database.unread_total().unwrap(), 0);
+    }
+
+    #[test]
+    fn ranged_read_state_is_keyed_and_monotonic() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        for (id, timestamp) in [("older", 1), ("covered", 2), ("sibling", 2), ("newer", 3)] {
+            database
+                .insert_message(&message(id, timestamp), "Ada", false, true)
+                .unwrap();
+        }
+
+        assert!(
+            database
+                .apply_synced_read_state("1@s.whatsapp.net", true, Some(2), &["covered".into()], 4,)
+                .unwrap()
+        );
+        assert_eq!(database.unread_total().unwrap(), 2);
+        assert_eq!(
+            database
+                .first_unread_message_id("1@s.whatsapp.net")
+                .unwrap()
+                .as_deref(),
+            Some("sibling")
+        );
+
+        assert!(
+            database
+                .apply_synced_read_state("1@s.whatsapp.net", true, Some(3), &[], 4)
+                .unwrap()
+        );
+        assert_eq!(database.unread_total().unwrap(), 0);
+        assert!(
+            !database
+                .apply_synced_read_state("1@s.whatsapp.net", true, Some(1), &["older".into()], 5,)
+                .unwrap()
+        );
+        assert_eq!(database.unread_total().unwrap(), 0);
+    }
+
+    #[test]
+    fn self_read_receipts_reconcile_direct_and_group_chats() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        for (jid, is_group) in [("1@s.whatsapp.net", false), ("team@g.us", true)] {
+            let mut incoming = message("incoming", 1);
+            incoming.chat_jid = jid.into();
+            database
+                .insert_message(&incoming, "Chat", is_group, true)
+                .unwrap();
+            assert!(
+                database
+                    .apply_self_read_receipt(jid, &["incoming".into()], 2)
+                    .unwrap()
+            );
+        }
+        assert_eq!(database.unread_total().unwrap(), 0);
+    }
+
+    #[test]
     fn delayed_self_read_receipts_cover_messages_inserted_afterward() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(&directory.path().join("history.db")).unwrap();
         assert!(
-            !database
+            database
                 .apply_self_read_receipt("1@s.whatsapp.net", &["boundary".into()], 10)
                 .unwrap()
         );
@@ -3580,7 +3775,7 @@ mod tests {
     }
 
     #[test]
-    fn full_state_reconciliation_clears_only_unmarked_history_counts() {
+    fn full_state_reconciliation_rebuilds_counts_without_clearing_explicit_marker() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(&directory.path().join("history.db")).unwrap();
         for (jid, unread) in [("stale@g.us", 60), ("explicit@g.us", 7)] {
@@ -3601,7 +3796,7 @@ mod tests {
         }
         database.apply_read_state("explicit@g.us", false).unwrap();
         assert_eq!(database.reconcile_unread_after_full_sync().unwrap(), 0);
-        assert_eq!(database.unread_total().unwrap(), 61);
+        assert_eq!(database.unread_total().unwrap(), 67);
 
         let protocol = Connection::open(directory.path().join("session.db")).unwrap();
         protocol
@@ -3611,7 +3806,7 @@ mod tests {
                     ('regular'), ('regular_low'), ('regular_high');",
             )
             .unwrap();
-        assert_eq!(database.reconcile_unread_after_full_sync().unwrap(), 1);
+        assert_eq!(database.reconcile_unread_after_full_sync().unwrap(), 2);
         let chats = database.list_chats(10).unwrap();
         let counts = chats
             .into_iter()
@@ -3619,6 +3814,33 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(counts["stale@g.us"], 0);
         assert_eq!(counts["explicit@g.us"], 1);
+    }
+
+    #[test]
+    fn full_state_reconciliation_preserves_event_sourced_unread_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        database
+            .insert_message(&message("live", 10), "Ada", false, true)
+            .unwrap();
+        let protocol = Connection::open(directory.path().join("session.db")).unwrap();
+        protocol
+            .execute_batch(
+                "CREATE TABLE app_state_versions (name TEXT NOT NULL);
+                 INSERT INTO app_state_versions (name) VALUES
+                    ('regular'), ('regular_low'), ('regular_high');",
+            )
+            .unwrap();
+
+        assert_eq!(database.reconcile_unread_after_full_sync().unwrap(), 0);
+        assert_eq!(database.unread_total().unwrap(), 1);
+        assert_eq!(
+            database
+                .first_unread_message_id("1@s.whatsapp.net")
+                .unwrap()
+                .as_deref(),
+            Some("live")
+        );
     }
 
     #[test]
