@@ -26,20 +26,42 @@ mind.
 - A hardened user systemd service, launcher entry, scalable icon, installer,
   uninstaller, and Arch `PKGBUILD`.
 
-The app renders contact, group, and group-participant avatars; online and
-last-seen presence; direct and group typing/recording indicators; encrypted
-image, video, and voice messages; documents; static/live-location cards; and
-static and animated WebP stickers, downloaded automatically when their
-conversation loads. It also synchronizes emoji reactions. Lottie
-stickers show their embedded static preview without passing sender-controlled
-animation JSON to Qt's in-process Lottie renderer. Poll cards show live vote
-totals and let you vote or revise your selection; new single- or multiple-answer
-polls can be created from the composer. Voice notes can be recorded, uploaded,
-sent, downloaded on demand, and played inline. Reaction chips aggregate matching
-emoji and support adding, changing, and removing your reaction. Location cards
-open in the system browser using OpenStreetMap, avoiding an embedded browser
-engine. Full calling, search, and group administration are not yet implemented.
-The roadmap below separates package-backed work from app-specific scope.
+## Current app state
+
+- **Conversations:** search names, recent-message previews, and JIDs; keep an
+  unread-only filter between launches; start a direct chat from a phone number
+  or JID; and pin or unpin chats. The list reflects synchronized
+  pinned and muted state, unread counts, avatars, typing/recording activity, and
+  message previews. Group headers show participant summaries.
+- **Text and interaction:** send text through a durable, idempotent outbox;
+  retry or discard a failed send; mark visible conversations read; inspect
+  sent, delivered, read, and played receipts (including participant detail in
+  groups); and add, change, or remove emoji reactions. History uses local date
+  dividers and preserves the reader position while older or incoming messages
+  are added.
+- **Polls and voice notes:** create single- or multiple-answer polls, see live
+  vote totals, and cast or revise a vote. Record Ogg Opus voice notes and retry
+  interrupted sends; received voice notes download on demand and play inline.
+- **Media:** render encrypted images and videos with in-app preview or playback,
+  voice and regular audio, documents with open/save actions, static and live
+  locations, and static or animated WebP stickers. Sticker downloads start when
+  their conversation loads. Lottie stickers use only their embedded static
+  preview, so sender-controlled animation JSON is not loaded into Qt's
+  in-process Lottie renderer.
+- **Presence and shell integration:** show online and last-seen presence plus
+  direct and group typing/recording indicators; publish local availability and
+  composer activity; open location cards in OpenStreetMap; deep-link from native
+  notifications and Omarchy search; and expose connection/unread state in the
+  bar widget.
+- **Recovery:** reconnect automatically, recover durable incoming work, text
+  sends, voice sends, and read intents across interruptions, and offer a manual
+  chat-state resync for unread, pinned, archived, and muted state without
+  clearing the linked account or local history.
+
+Calls, message-content search, group administration, replies/forwarding/editing,
+and outbound attachments other than recorded voice notes are not yet
+implemented. The roadmap below separates package-backed work from app-specific
+scope.
 
 ## Roadmap
 
@@ -253,6 +275,9 @@ jq '.chats | length' < <(omarchy-whatsappctl chats --limit 500)
 journalctl --user -u omarchy-whatsapp.service -f
 ```
 
+Treat the service journal as private account data; see the logging warning in
+[Privacy and footprint](#privacy-and-footprint) before sharing diagnostics.
+
 The shell refreshes the conversation search index after chat-list changes. It
 contains conversation names, contact/group type, and the deep-link identifier;
 message text is never indexed. The generated, marker-delimited block lives in
@@ -289,16 +314,26 @@ only the explicit `--purge-data` option removes it.
   `~/.local/state/omarchy-whatsapp/session.db`.
 - The UI index lives separately in `history.db` and retains at most 1,000
   messages per chat. Poll creation secrets and each participant's latest vote
-  stay in this private database and are not exposed through shell IPC. Raster
-  images are limited to 25 MiB each and the private media cache is pruned to
-  256 MiB; profile previews are capped at 1 MiB each and 64 MiB total. Voice
-  recordings are created in an owner-only outbox and structurally validated as
-  Ogg Opus. Failed sends can be retried with the same delivery ID; the outbox is
-  capped at eight entries and 64 MiB with seven-day retention, while abandoned
-  recordings expire after 24 hours. Successful audio is copied into the private
-  media cache before its outbox entry is removed.
+  stay in this private database and are not exposed through shell IPC. Incoming
+  work, outgoing text, and read intents are committed locally before their
+  asynchronous processing completes, so reconnects or daemon restarts can
+  safely resume them. Text delivery uses a stable message identity, exposes
+  failed entries for retry or explicit discard, and prunes older failures as
+  new messages are queued.
+- Images, stickers, and audio are limited to 25 MiB each; videos and documents
+  are limited to 100 MiB each. The private media cache is pruned to 256 MiB;
+  profile previews are capped at 1 MiB each and 64 MiB total. Voice recordings
+  are created in an owner-only outbox and structurally validated as Ogg Opus.
+  Failed voice sends can be retried with the same recording identity; the
+  outbox is capped at eight entries and 64 MiB with seven-day retention, while
+  abandoned recordings expire after 24 hours. Successful audio is copied into
+  the private media cache before its outbox entry is removed.
 - Notification content is passed as argv, never through a shell. Clicking a
   notification asks Omarchy Shell to open the app at the relevant conversation.
+- At the default `info` log level, the daemon records full decoded WhatsApp
+  event diagnostics. Journal entries can contain JIDs, names, message content,
+  message identifiers, and media or group metadata. Treat them as private and
+  redact them before attaching logs to a public issue.
 - Offline history sync is indexed but does not create desktop notifications.
 - The systemd service has a read-only home view except for its private state
   directory and can access only Unix, IPv4, and IPv6 sockets.
