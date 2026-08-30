@@ -28,6 +28,7 @@ QtObject {
   property int voiceRecordingTestDurationMs: 2400
   property int voiceRecordingSerial: 0
   property var voiceOutboxEntries: []
+  property var textOutboxEntries: []
   property var pollVotes: []
   property var createdPolls: []
   property string selectedChatJid: ""
@@ -52,6 +53,7 @@ QtObject {
   }
 
   signal messagesWillChange(bool preservePosition)
+  signal textMessageAccepted(string deliveryId, string chatJid, string text)
 
   function record(name, value) {
     calls = calls.concat([{ name: name, value: value }])
@@ -135,6 +137,30 @@ QtObject {
     return true
   }
 
+  function textOutboxForChat(chatJid) {
+    for (var i = textOutboxEntries.length - 1; i >= 0; i--)
+      if (String(textOutboxEntries[i].chat_jid || "") === String(chatJid || ""))
+        if (String(textOutboxEntries[i].status || "") === "failed")
+          return textOutboxEntries[i]
+    return null
+  }
+
+  function retryTextMessage(entry) {
+    if (!entry || entry.status !== "failed") return false
+    textOutboxEntries = textOutboxEntries.filter(function(value) {
+      return value.delivery_id !== entry.delivery_id
+    })
+    return true
+  }
+
+  function discardTextMessage(entry) {
+    if (!entry || entry.status === "sending") return false
+    textOutboxEntries = textOutboxEntries.filter(function(value) {
+      return value.delivery_id !== entry.delivery_id
+    })
+    return true
+  }
+
   function chatStateLabel(jid) {
     return String(chatStateLabels[String(jid || "")] || chatStateLabelResult)
   }
@@ -147,6 +173,8 @@ QtObject {
     if (!selectedChatJid || !body.trim()) return false
     sentMessages = sentMessages.concat([body])
     messageSentSerial++
+    textMessageAccepted(
+      "fixture-" + String(messageSentSerial), selectedChatJid, body)
     return true
   }
 

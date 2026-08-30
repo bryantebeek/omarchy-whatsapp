@@ -54,37 +54,39 @@ approval dismissal when a second maintainer with write access is added.
 
 ## Coverage contract
 
-`scripts/coverage.sh` applies three independent policies:
+`scripts/coverage.sh` requires 100% Rust source-line coverage across the
+workspace. It runs the complete all-features test matrix under the pinned
+nightly toolchain, exports LCOV, and fails with exact `file:line` diagnostics if
+any executable `DA` source line has a zero execution count. In CI, the existing
+diff check also requires every executable line added or changed relative to the
+pull-request base (or previous pushed commit) to be covered.
 
-1. Total Rust line coverage may not fall below 54.8%, the measured
-   whole-program baseline when this policy was last ratcheted.
-2. Every line in the deterministic contract layer must be covered. This is the
-   protocol crate, the durable voice-outbox state machine, and the exhaustive
-   upstream-event policy in `event_coverage.rs`; the threshold is both 100%
-   overall and 100% per file.
-3. In CI, every executable Rust line added or changed relative to the pull
-   request base (or previous pushed commit) must be covered. Diff coverage is
-   therefore 100%, preventing new coverage debt while legacy integration
-   boundaries remain visible in the whole-program report.
+The source-line definition is deliberate and reproducible. LLVM's aggregate
+`LF`/`LH` counters also invent locations for macro expansions, generic
+monomorphizations, and `?` continuations that have no LCOV `DA` mapping to a
+Rust source line. Those synthetic locations are not developer-addressable and
+are not part of the gate. Test-module bodies are excluded from the denominator;
+their calls still execute the instrumented production code.
 
-The following executable or integration-boundary files are deliberately outside
-the 100% contract metric and remain visible in the whole-program report:
+Production exclusions must remain narrow and explicit:
 
-| Boundary | Verification |
-| --- | --- |
-| `daemon/main.rs` | Rust tests, release build, isolated daemon/IPC smoke test, CodeQL |
-| `daemon/database.rs` | SQLite unit tests, smoke test, whole-program coverage floor |
-| `daemon/assets.rs` | Filesystem/media unit tests, whole-program coverage floor |
-| `daemon/notification.rs` | Message-rendering unit tests, whole-program coverage floor |
-| `ctl/main.rs` | Launcher-generation unit tests and daemon/IPC smoke test |
-| Quickshell QML/JS | Qt Quick unit/component/state/workflow tests, 100% portable behavioral-contract coverage, 100% semantic mutation score, `qmlformat`, strict local `qmllint`, and Omarchy plugin validation locally |
-| Installer/service/package | ShellCheck, version and metadata checks, locked release build, packaged plugin discovery test, isolated install/update/uninstall lifecycle test, live install verification |
+- `coverage(off)` is allowed only on process/bootstrap loops, filesystem or
+  SQLite row-decoding adapters, and upstream SDK/network calls whose behavior
+  terminates outside this process. Deterministic decoding, validation, identity,
+  ordering, revision, cryptographic, and state-transition helpers stay measured.
+- `daemon/src/live_location/transport.rs` is the sole filename exclusion. It is
+  the `async_trait` adapter that acknowledges an encrypted stanza through a live
+  WhatsApp client. The cryptographic parser and ratchet state machine remain in
+  `live_location.rs` and are fully source-line covered.
+- Broad crate, module, or application-file exclusions are forbidden.
 
-This boundary is explicit because reporting 100% by silently excluding
-uncovered application code would be misleading. Contract and diff coverage
-guarantee that stable and newly changed testable code is fully exercised, while
-the total threshold keeps legacy integration code visible and can only ratchet
-upward. Raise the total baseline whenever new tests improve it.
+SQLite migrations and the excluded live transport are still exercised by
+dedicated integration or deployment smoke tests. Quickshell QML/JS separately
+requires the four Qt Quick suites, 100% portable behavioral-contract coverage,
+100% semantic mutation score, `qmlformat`, strict local `qmllint`, and Omarchy
+plugin validation. Installer, service, and package behavior is checked by
+ShellCheck, metadata validation, locked release builds, isolated lifecycle
+smoke tests, and live installation verification.
 
 Coverage is evidence that lines executed, not proof that every behavior is
 correct. Tests should still cover success, failure, boundary, and regression

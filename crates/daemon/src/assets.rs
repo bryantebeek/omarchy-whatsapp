@@ -31,6 +31,14 @@ struct PrivateTemporaryFile {
 
 impl PrivateTemporaryFile {
     fn create(destination: &Path, kind: &str) -> Result<(Self, File)> {
+        Self::create_with_sequence(destination, kind, &TEMPORARY_FILE_SEQUENCE)
+    }
+
+    fn create_with_sequence(
+        destination: &Path,
+        kind: &str,
+        sequence_source: &AtomicU64,
+    ) -> Result<(Self, File)> {
         let parent = destination
             .parent()
             .context("private destination has no parent directory")?;
@@ -38,7 +46,7 @@ impl PrivateTemporaryFile {
             .file_name()
             .context("private destination has no file name")?;
         for _ in 0..32 {
-            let sequence = TEMPORARY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let sequence = sequence_source.fetch_add(1, Ordering::Relaxed);
             let mut temporary_name = OsString::from(file_name);
             temporary_name.push(format!(".{kind}-{}-{sequence}", std::process::id()));
             let path = parent.join(temporary_name);
@@ -300,16 +308,17 @@ fn jpeg_file_is_valid(path: &Path) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if metadata.len() < 3 || metadata.len() > MAX_IMAGE_BYTES {
+    let length = file.metadata().map_or(0, |metadata| metadata.len());
+    if !(3..=MAX_IMAGE_BYTES).contains(&length) {
         return false;
     }
     let mut header = [0u8; 3];
     file.read_exact(&mut header).is_ok() && header == [0xff, 0xd8, 0xff]
 }
 
+// The ffmpeg process boundary is verified by release smoke tests. Cache naming,
+// validation, migration, and pruning around it remain coverage-instrumented.
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub fn ensure_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Result<bool> {
     if jpeg_file_is_valid(thumbnail_path) {
         return Ok(false);
@@ -374,6 +383,7 @@ pub fn ensure_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Res
     Ok(true)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub fn backfill_message_video_thumbnails(directory: &Path) -> Result<usize> {
     let mut generated = 0;
     for entry in std::fs::read_dir(directory)? {
@@ -692,6 +702,7 @@ pub fn prune_media_cache(directory: &Path, preserve: &Path) {
     prune_directory(directory, MAX_MEDIA_CACHE_BYTES, preserve);
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn download_url(url: String) -> Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || {
         let config = ureq::Agent::config_builder()
@@ -717,6 +728,7 @@ async fn download_url(url: String) -> Result<Vec<u8>> {
     .context("profile-picture worker panicked")?
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn fetch_avatar(client: Arc<Client>, directory: PathBuf, jid: Jid) -> Result<bool> {
     let raw_jid = jid.to_non_ad_string();
     let path = avatar_path(&directory, &raw_jid);
@@ -743,6 +755,7 @@ pub async fn fetch_avatar(client: Arc<Client>, directory: PathBuf, jid: Jid) -> 
     Ok(true)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn download_message_image(
     client: Arc<Client>,
     image: wa::message::ImageMessage,
@@ -779,6 +792,7 @@ pub async fn download_message_image(
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn download_message_sticker(
     client: Arc<Client>,
     sticker: wa::message::StickerMessage,
@@ -818,6 +832,7 @@ pub async fn download_message_sticker(
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn download_message_video(
     client: Arc<Client>,
     video: wa::message::VideoMessage,
@@ -854,6 +869,7 @@ pub async fn download_message_video(
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn download_message_audio(
     client: Arc<Client>,
     audio: wa::message::AudioMessage,
@@ -890,6 +906,7 @@ pub async fn download_message_audio(
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub async fn download_message_document(
     client: Arc<Client>,
     document: wa::message::DocumentMessage,
@@ -921,8 +938,10 @@ pub async fn download_message_document(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn cache_names_never_contain_jid_punctuation() {
@@ -1144,5 +1163,248 @@ mod tests {
                 destination.to_string_lossy().into_owned()
             )]
         );
+    }
+
+    #[test]
+    fn extension_and_media_signature_matrix_is_explicit() {
+        let directory = Path::new("/tmp/cache");
+        for (mime, suffix) in [
+            (Some("video/quicktime"), ".mov"),
+            (Some("video/webm"), ".webm"),
+            (Some("video/3gpp"), ".3gp"),
+            (Some("application/octet-stream"), ""),
+        ] {
+            assert!(
+                message_video_path(directory, "chat", "id", mime)
+                    .to_string_lossy()
+                    .ends_with(suffix)
+            );
+        }
+        for (mime, suffix) in [
+            (Some("audio/mpeg"), ".mp3"),
+            (Some("audio/mp4"), ".m4a"),
+            (Some("audio/x-m4a"), ".m4a"),
+            (Some("audio/aac"), ".aac"),
+            (Some("audio/wav"), ".wav"),
+            (Some("audio/x-wav"), ".wav"),
+            (Some("application/octet-stream"), ""),
+        ] {
+            assert!(
+                message_audio_path(directory, "chat", "id", mime)
+                    .to_string_lossy()
+                    .ends_with(suffix)
+            );
+        }
+
+        assert!(image_bytes_are_safe(b"RIFF\x04\0\0\0WEBP"));
+        assert!(image_bytes_are_safe(b"GIF87a"));
+        assert!(image_bytes_are_safe(b"GIF89a"));
+        assert!(video_bytes_are_safe(&[0, 0, 1, 0xba]));
+        assert!(audio_bytes_are_safe(b"ID3audio"));
+        assert!(audio_bytes_are_safe(b"ADIFaudio"));
+        assert!(audio_bytes_are_safe(b"RIFF\x04\0\0\0WAVE"));
+        assert!(audio_bytes_are_safe(b"\0\0\0\x18ftyp"));
+        assert!(audio_bytes_are_safe(&[0xff, 0xe0]));
+    }
+
+    #[test]
+    fn thumbnail_cache_handles_every_legacy_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path();
+        let thumbnail = b"\xff\xd8\xffpreview".to_vec();
+
+        let full = message_image_path(media, "chat", "remove-preview");
+        let thumb = message_image_thumbnail_path(media, "chat", "remove-preview");
+        std::fs::write(&full, &thumbnail).unwrap();
+        std::fs::write(&thumb, b"existing").unwrap();
+        cache_message_image_thumbnail(
+            media,
+            "chat",
+            "remove-preview",
+            Some(&thumbnail),
+            Some(10_000),
+        )
+        .unwrap();
+        assert!(!full.exists());
+        assert_eq!(std::fs::read(thumb).unwrap(), b"existing");
+
+        let written = cache_message_video_thumbnail(
+            media,
+            "chat",
+            "write-preview",
+            Some("video/webm"),
+            Some(&thumbnail),
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(written).unwrap(), thumbnail);
+
+        let invalid = vec![1, 2, 3];
+        let ignored =
+            cache_message_image_thumbnail(media, "chat", "invalid-preview", Some(&invalid), None)
+                .unwrap();
+        assert!(!ignored.exists());
+
+        let png = b"\x89PNG\r\n\x1a\npreview".to_vec();
+        let sticker = cache_message_sticker_thumbnail(media, "chat", "once", Some(&png)).unwrap();
+        cache_message_sticker_thumbnail(media, "chat", "once", Some(&vec![0; 8])).unwrap();
+        assert_eq!(std::fs::read(sticker).unwrap(), png);
+
+        let missing_parent = media.join("missing-parent");
+        assert!(
+            cache_message_image_thumbnail(
+                &missing_parent,
+                "chat",
+                "image-error",
+                Some(&thumbnail),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            cache_message_video_thumbnail(
+                &missing_parent,
+                "chat",
+                "video-error",
+                Some("video/mp4"),
+                Some(&thumbnail),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cleanup_alias_and_pruning_operations_are_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path();
+        let chat = "chat@s.whatsapp.net";
+        let id = "message";
+        for path in [
+            message_image_path(media, chat, id),
+            message_image_thumbnail_path(media, chat, id),
+            message_video_path(media, chat, id, Some("video/mp4")),
+            message_video_thumbnail_path(media, chat, id),
+            message_audio_path(media, chat, id, Some("audio/ogg")),
+            message_sticker_path(media, chat, id),
+            message_sticker_thumbnail_path(media, chat, id),
+            message_document_path(media, chat, id, "file.pdf"),
+            location_thumbnail_path(media, chat, id),
+        ] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        remove_message_media(media, chat, id);
+        assert!(std::fs::read_dir(media).unwrap().next().is_none());
+        remove_message_media(&media.join("missing"), chat, id);
+
+        let keep = message_image_path(media, "other", "one");
+        let remove = message_image_path(media, chat, "two");
+        std::fs::write(&keep, b"keep").unwrap();
+        std::fs::write(&remove, b"remove").unwrap();
+        remove_chat_media(media, chat);
+        assert!(keep.exists());
+        assert!(!remove.exists());
+        remove_chat_media(&media.join("missing"), chat);
+
+        assert!(copy_chat_media_alias(media, chat, chat).unwrap().is_empty());
+        std::fs::write(message_image_path(media, "alias", "one"), b"alias").unwrap();
+        std::fs::write(message_image_path(media, "canonical", "one"), b"canonical").unwrap();
+        std::fs::write(media.join("unrelated"), b"unrelated").unwrap();
+        let replacements = copy_chat_media_alias(media, "alias", "canonical").unwrap();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(
+            std::fs::read(message_image_path(media, "canonical", "one")).unwrap(),
+            b"canonical"
+        );
+
+        let invalid_name = std::ffi::OsString::from_vec(vec![0xff]);
+        std::fs::write(media.join(invalid_name), b"invalid name").unwrap();
+        assert_eq!(
+            copy_chat_media_alias(media, "none", "other").unwrap(),
+            Vec::new()
+        );
+
+        assert!(!copy_avatar_alias(media, chat, chat).unwrap());
+        std::fs::write(avatar_missing_path(media, "alias-avatar"), b"none\n").unwrap();
+        assert!(copy_avatar_alias(media, "alias-avatar", "canonical-avatar").unwrap());
+        assert!(!copy_avatar_alias(media, "missing-avatar", "canonical-avatar").unwrap());
+        remove_avatar(media, "alias-avatar");
+        remove_avatar(media, "canonical-avatar");
+
+        let old = media.join("old");
+        let preserve = media.join("preserve");
+        let temporary = media.join("skip.tmp-1-1");
+        std::fs::write(&old, [0; 8]).unwrap();
+        std::fs::write(&preserve, [0; 8]).unwrap();
+        std::fs::write(&temporary, [0; 8]).unwrap();
+        prune_directory(media, 8, &preserve);
+        assert!(preserve.exists());
+        assert!(temporary.exists());
+        assert!(!old.exists());
+        prune_directory(&media.join("missing"), 0, &preserve);
+
+        let bounded = tempfile::tempdir().unwrap();
+        let first = bounded.path().join("first");
+        let second = bounded.path().join("second");
+        std::fs::write(&first, [0; 8]).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        std::fs::write(&second, [0; 8]).unwrap();
+        prune_directory(bounded.path(), 8, Path::new("/not-preserved"));
+        assert!(!first.exists());
+        assert!(second.exists());
+    }
+
+    #[test]
+    fn private_temporary_files_clean_up_and_reject_exhaustion() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("destination");
+        let (temporary, mut file) = PrivateTemporaryFile::create(&destination, "part").unwrap();
+        std::io::Write::write_all(&mut file, b"committed").unwrap();
+        drop(file);
+        temporary.commit_existing(&destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"committed");
+
+        let (temporary, _file) = PrivateTemporaryFile::create(&destination, "drop").unwrap();
+        let temporary_path = temporary.path.clone();
+        drop(temporary);
+        assert!(!temporary_path.exists());
+
+        let sequence_source = AtomicU64::new(9000);
+        let sequence = sequence_source.load(Ordering::Relaxed);
+        for offset in 0..32_u64 {
+            let path = directory.path().join(format!(
+                "destination.full-{}-{}",
+                std::process::id(),
+                sequence + offset
+            ));
+            std::fs::write(path, b"occupied").unwrap();
+        }
+        assert!(
+            PrivateTemporaryFile::create_with_sequence(&destination, "full", &sequence_source,)
+                .is_err()
+        );
+
+        let not_directory = directory.path().join("not-directory");
+        std::fs::write(&not_directory, b"file").unwrap();
+        assert!(PrivateTemporaryFile::create(&not_directory.join("child"), "bad").is_err());
+    }
+
+    #[test]
+    fn avatar_and_jpeg_validation_ignore_malformed_files() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("f.img"), b"odd").unwrap();
+        std::fs::write(directory.path().join("zz.img"), b"invalid").unwrap();
+        assert!(avatar_fingerprints(directory.path()).is_empty());
+
+        let jpeg = directory.path().join("preview.jpg");
+        assert!(!jpeg_file_is_valid(&jpeg));
+        std::fs::write(&jpeg, b"no").unwrap();
+        assert!(!jpeg_file_is_valid(&jpeg));
+        std::fs::write(&jpeg, b"\xff\xd8\xffok").unwrap();
+        assert!(jpeg_file_is_valid(&jpeg));
+        let oversized = directory.path().join("oversized.jpg");
+        let file = File::create(&oversized).unwrap();
+        file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+        assert!(!jpeg_file_is_valid(&oversized));
     }
 }

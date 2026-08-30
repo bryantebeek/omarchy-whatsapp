@@ -62,6 +62,9 @@ Item {
       if (String(entries[i].chat_jid || "") === selected) return entries[i]
     return null
   }
+  readonly property var textOutboxEntry: service
+    && typeof service.textOutboxForChat === "function"
+    ? service.textOutboxForChat(service.selectedChatJid) : null
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "io.github.bryantebeek.whatsapp"
@@ -480,8 +483,6 @@ Item {
 
   function submitMessage() {
     if (!service || !service.sendMessage(composer.text)) return
-    composer.text = ""
-    scheduleConversationScroll("bottom", "")
   }
 
   function startVoiceRecording() {
@@ -1104,6 +1105,11 @@ Item {
 
   Connections {
     target: root.service
+    function onTextMessageAccepted(_deliveryId, chatJid, text) {
+      if (root.service && root.service.selectedChatJid === String(chatJid || "")
+          && composer.text === String(text || "")) composer.text = ""
+      root.scheduleConversationScroll("bottom", "")
+    }
     function onSelectedChatJidChanged() {
       root.stopVoiceRecording(false)
       imagePreviewPopup.close()
@@ -4191,6 +4197,7 @@ Item {
                       anchors.verticalCenter: parent.verticalCenter
                       spacing: Style.space(8)
                       visible: !root.voiceRecordingActive && !root.voiceOutboxEntry
+                        && !root.textOutboxEntry
                       CrispTextField {
                         id: composer
                         objectName: "composer"
@@ -4239,6 +4246,65 @@ Item {
                         foreground: root.foreground
                         tooltipText: "Send message"
                         onClicked: root.submitMessage()
+                      }
+                    }
+                    Row {
+                      id: textOutboxControls
+                      objectName: "textOutboxControls"
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.leftMargin: Style.space(14)
+                      anchors.rightMargin: Style.space(14)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(8)
+                      visible: !root.voiceRecordingActive && !root.voiceOutboxEntry
+                        && !!root.textOutboxEntry
+
+                      Text {
+                        id: textOutboxStatus
+                        objectName: "textOutboxStatus"
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: {
+                          if (!root.textOutboxEntry) return ""
+                          var preview = String(root.textOutboxEntry.text || "")
+                          if (preview.length > 52) preview = preview.substring(0, 51) + "…"
+                          return root.textOutboxEntry.status === "failed"
+                            ? "Message failed  " + preview : "Sending message…  " + preview
+                        }
+                        elide: Text.ElideRight
+                        color: root.textOutboxEntry
+                          && root.textOutboxEntry.status === "failed"
+                          ? Color.urgent : root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        width: Math.max(0, parent.width - textRetryButton.width
+                          - textOutboxDiscardButton.width - parent.spacing * 2)
+                      }
+                      CrispButton {
+                        id: textOutboxDiscardButton
+                        objectName: "textOutboxDiscardButton"
+                        iconText: "󰅖"
+                        bordered: true
+                        visible: !!root.textOutboxEntry
+                          && root.textOutboxEntry.status !== "sending"
+                        enabled: visible && root.service !== null
+                        foreground: root.foreground
+                        tooltipText: "Discard pending message"
+                        onClicked: root.service.discardTextMessage(root.textOutboxEntry)
+                      }
+                      CrispButton {
+                        id: textRetryButton
+                        objectName: "textRetryButton"
+                        iconText: "󰑐"
+                        bordered: true
+                        visible: !!root.textOutboxEntry
+                          && root.textOutboxEntry.status === "failed"
+                        enabled: visible && root.service !== null
+                          && root.service.connectionState === "connected"
+                        foreground: root.foreground
+                        tooltipText: root.textOutboxEntry
+                          ? String(root.textOutboxEntry.error || "Retry message") : ""
+                        onClicked: root.service.retryTextMessage(root.textOutboxEntry)
                       }
                     }
                     Row {

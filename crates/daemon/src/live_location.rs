@@ -1,21 +1,17 @@
 use aes::Aes256;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 use anyhow::{Context, Result, anyhow, bail};
-use async_trait::async_trait;
 use cbc::Decryptor;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use whatsapp_rust::bot::MessageContext;
-use whatsapp_rust::types::enc_handler::EncHandler;
-use whatsapp_rust::types::jid::JidExt as SignalJidExt;
 use whatsapp_rust::wacore::libsignal::protocol::{PublicKey, SenderKeyMessage};
-use whatsapp_rust::wacore_binary::{Node, builder::NodeBuilder};
-use whatsapp_rust::{Client, wacore};
 
 use super::Shared;
+
+mod transport;
 
 const FAST_RATCHET_CHAINS: usize = 8;
 const FAST_RATCHET_KEY_BYTES: usize = 32;
@@ -31,9 +27,9 @@ pub(crate) struct FastRatchetState {
 
 impl FastRatchetState {
     pub(crate) fn from_distribution(bytes: &[u8]) -> Result<Self> {
-        let (&version, protobuf) = bytes
-            .split_first()
-            .ok_or_else(|| anyhow!("empty fast-ratchet sender-key distribution"))?;
+        let Some((&version, protobuf)) = bytes.split_first() else {
+            bail!("empty fast-ratchet sender-key distribution");
+        };
         if version >> 4 != SIGNAL_MESSAGE_VERSION {
             bail!("unsupported fast-ratchet distribution version");
         }
@@ -42,7 +38,7 @@ impl FastRatchetState {
         let mut iteration = None;
         let mut chain_keys = Vec::with_capacity(FAST_RATCHET_CHAINS);
         let mut signing_key = None;
-        decode_fields(protobuf, |field, wire, value| {
+        for (field, wire, value) in decode_fields(protobuf)? {
             match (field, wire, value) {
                 (1, 0, ProtobufValue::Varint(value)) => {
                     sender_key_id = Some(u32::try_from(value).context("fast-ratchet key id")?);
@@ -54,24 +50,32 @@ impl FastRatchetState {
                 (4, 2, ProtobufValue::Bytes(value)) => signing_key = Some(value.to_vec()),
                 _ => {}
             }
-            Ok(())
-        })?;
+        }
 
-        let chain_keys: [[u8; FAST_RATCHET_KEY_BYTES]; FAST_RATCHET_CHAINS] = chain_keys
-            .into_iter()
-            .map(|key| {
-                key.try_into()
-                    .map_err(|_| anyhow!("invalid fast-ratchet chain-key length"))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .try_into()
-            .map_err(|_| anyhow!("fast-ratchet distribution must contain eight chain keys"))?;
-        let signing_key = signing_key.ok_or_else(|| anyhow!("missing fast-ratchet signing key"))?;
+        let mut fixed_chain_keys = Vec::with_capacity(chain_keys.len());
+        for key in chain_keys {
+            let Ok(key) = key.try_into() else {
+                bail!("invalid fast-ratchet chain-key length");
+            };
+            fixed_chain_keys.push(key);
+        }
+        let Ok(chain_keys) = fixed_chain_keys.try_into() else {
+            bail!("fast-ratchet distribution must contain eight chain keys");
+        };
+        let Some(signing_key) = signing_key else {
+            bail!("missing fast-ratchet signing key");
+        };
         PublicKey::try_from(signing_key.as_slice()).context("invalid fast-ratchet signing key")?;
 
+        let Some(sender_key_id) = sender_key_id else {
+            bail!("missing fast-ratchet key id");
+        };
+        let Some(iteration) = iteration else {
+            bail!("missing fast-ratchet iteration");
+        };
         Ok(Self {
-            sender_key_id: sender_key_id.ok_or_else(|| anyhow!("missing fast-ratchet key id"))?,
-            iteration: iteration.ok_or_else(|| anyhow!("missing fast-ratchet iteration"))?,
+            sender_key_id,
+            iteration,
             chain_keys,
             signing_key,
         })
@@ -119,29 +123,34 @@ impl FastRatchetState {
             bail!("fast-ratchet update is older than the stored state");
         }
 
-        self.advance_to(message.iteration())?;
-        let message_seed = hmac_sha256(&self.chain_keys[FAST_RATCHET_CHAINS - 1], 1)?;
+        self.advance_forward(message.iteration());
+        let message_seed = hmac_sha256(&self.chain_keys[FAST_RATCHET_CHAINS - 1], 1);
         let mut derived = [0_u8; 48];
         Hkdf::<Sha256>::new(None, &message_seed)
             .expand(b"WhisperGroup", &mut derived)
-            .map_err(|_| anyhow!("could not derive fast-ratchet message key"))?;
-        let plaintext = Decryptor::<Aes256>::new_from_slices(&derived[16..], &derived[..16])
-            .map_err(|_| anyhow!("invalid fast-ratchet AES key"))?
-            .decrypt_padded_vec::<Pkcs7>(message.ciphertext()?)
-            .map_err(|_| anyhow!("fast-ratchet message decryption failed"))?;
-        self.advance_to(
-            message
-                .iteration()
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("fast-ratchet iteration overflow"))?,
-        )?;
+            .expect("48-byte SHA-256 HKDF output is valid");
+        let decryptor = Decryptor::<Aes256>::new_from_slices(&derived[16..], &derived[..16])
+            .expect("AES-256 key and block-sized IV lengths are fixed");
+        let Ok(plaintext) = decryptor.decrypt_padded_vec::<Pkcs7>(message.ciphertext()?) else {
+            bail!("fast-ratchet message decryption failed");
+        };
+        let Some(next_iteration) = message.iteration().checked_add(1) else {
+            bail!("fast-ratchet iteration overflow");
+        };
+        self.advance_forward(next_iteration);
         Ok(plaintext)
     }
 
+    #[cfg(test)]
     fn advance_to(&mut self, target: u32) -> Result<()> {
         if target < self.iteration {
             bail!("cannot rewind a fast-ratchet state");
         }
+        self.advance_forward(target);
+        Ok(())
+    }
+
+    fn advance_forward(&mut self, target: u32) {
         let mut current = chain_iterations(self.iteration);
         let target_iterations = chain_iterations(target);
         for chain in 0..FAST_RATCHET_CHAINS {
@@ -151,18 +160,17 @@ impl FastRatchetState {
                     self.chain_keys[chain + 1] = hmac_sha256(
                         &self.chain_keys[chain],
                         u8::try_from(chain + 3).expect("chain index fits in u8"),
-                    )?;
+                    );
                     current[chain + 1] = 0;
                 }
                 self.chain_keys[chain] = hmac_sha256(
                     &self.chain_keys[chain],
                     u8::try_from(chain + 2).expect("chain index fits in u8"),
-                )?;
+                );
                 current[chain] += 1;
             }
         }
         self.iteration = target;
-        Ok(())
     }
 }
 
@@ -177,11 +185,11 @@ fn chain_iterations(iteration: u32) -> [u32; FAST_RATCHET_CHAINS] {
     values
 }
 
-fn hmac_sha256(key: &[u8], value: u8) -> Result<[u8; 32]> {
+fn hmac_sha256(key: &[u8], value: u8) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
-        .map_err(|_| anyhow!("invalid fast-ratchet HMAC key"))?;
+        .expect("HMAC accepts keys of every length");
     mac.update(&[value]);
-    Ok(mac.finalize().into_bytes().into())
+    mac.finalize().into_bytes().into()
 }
 
 enum ProtobufValue<'a> {
@@ -205,10 +213,8 @@ fn take_varint(input: &mut &[u8]) -> Result<u64> {
     bail!("protobuf varint is too long")
 }
 
-fn decode_fields<'a>(
-    mut input: &'a [u8],
-    mut visit: impl FnMut(u32, u8, ProtobufValue<'a>) -> Result<()>,
-) -> Result<()> {
+fn decode_fields(mut input: &[u8]) -> Result<Vec<(u32, u8, ProtobufValue<'_>)>> {
+    let mut fields = Vec::new();
     while !input.is_empty() {
         let tag = take_varint(&mut input)?;
         let field = u32::try_from(tag >> 3).context("protobuf field number")?;
@@ -216,13 +222,13 @@ fn decode_fields<'a>(
         match wire {
             0 => {
                 let value = take_varint(&mut input)?;
-                visit(field, wire, ProtobufValue::Varint(value))?;
+                fields.push((field, wire, ProtobufValue::Varint(value)));
             }
             1 => {
                 input = input
                     .get(8..)
                     .ok_or_else(|| anyhow!("truncated fixed64 protobuf field"))?;
-                visit(field, wire, ProtobufValue::Ignored)?;
+                fields.push((field, wire, ProtobufValue::Ignored));
             }
             2 => {
                 let length =
@@ -231,18 +237,18 @@ fn decode_fields<'a>(
                     .split_at_checked(length)
                     .ok_or_else(|| anyhow!("truncated protobuf bytes field"))?;
                 input = rest;
-                visit(field, wire, ProtobufValue::Bytes(value))?;
+                fields.push((field, wire, ProtobufValue::Bytes(value)));
             }
             5 => {
                 input = input
                     .get(4..)
                     .ok_or_else(|| anyhow!("truncated fixed32 protobuf field"))?;
-                visit(field, wire, ProtobufValue::Ignored)?;
+                fields.push((field, wire, ProtobufValue::Ignored));
             }
             _ => bail!("unsupported protobuf wire type {wire}"),
         }
     }
-    Ok(())
+    Ok(fields)
 }
 
 pub(crate) struct FastRatchetHandler {
@@ -259,75 +265,23 @@ impl FastRatchetHandler {
     }
 }
 
-#[async_trait]
-impl EncHandler for FastRatchetHandler {
-    async fn handle(
-        &self,
-        client: Arc<Client>,
-        enc_node: &Node,
-        info: &wacore::types::message::MessageInfo,
-    ) -> Result<()> {
-        let enc_node_ref = enc_node.as_node_ref();
-        let ciphertext = enc_node_ref
-            .content_bytes()
-            .ok_or_else(|| anyhow!("fast-ratchet enc node has no byte payload"))?;
-        let sender_id = info.source.sender.to_signal_address_string();
-        let _guard = self.decrypt_lock.lock().await;
-        let message =
-            SenderKeyMessage::try_from(ciphertext).context("reading fast-ratchet envelope")?;
-        let mut state = self
-            .shared
-            .database
-            .fast_ratchet_state(&sender_id, message.chain_id())?
-            .ok_or_else(|| anyhow!("no fast-ratchet sender key for live-location update"))?;
-        let plaintext = state.decrypt(ciphertext)?;
-
-        let padding_version = enc_node
-            .attrs()
-            .optional_string("v")
-            .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or(2);
-        let message = wacore::messages::decode_plaintext(&plaintext, padding_version)
-            .context("decoding live-location update")?;
-        let context = MessageContext::from_parts(&message, info, Arc::clone(&client));
-        self.shared.receive_live_location_update(context).await?;
-        // Advance the durable ratchet only after the location update commits.
-        // If persistence fails, leaving the stanza unacked lets WhatsApp retry
-        // it with the still-usable key instead of losing the update forever.
-        self.shared
-            .database
-            .store_fast_ratchet_state(&sender_id, &state)?;
-
-        let from = if info.source.is_group {
-            &info.source.chat
-        } else {
-            &info.source.sender
-        };
-        let mut ack_source = NodeBuilder::new("message")
-            .attr("id", &info.id)
-            .attr("from", from);
-        if let Some(recipient) = &info.source.recipient {
-            ack_source = ack_source.attr("recipient", recipient);
-        }
-        if info.source.is_group {
-            ack_source = ack_source.attr("participant", &info.source.sender);
-        }
-        let ack_source = ack_source.build();
-        client
-            .acknowledge_stanza(&ack_source.as_node_ref())
-            .await
-            .context("acknowledging live-location update")?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use aes::cipher::BlockModeEncrypt;
     use cbc::Encryptor;
     use rand::{SeedableRng, rngs::StdRng};
     use whatsapp_rust::wacore::libsignal::protocol::PrivateKey;
+
+    #[test]
+    fn handler_construction_retains_shared_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(crate::tests::test_shared(&directory));
+        let handler = FastRatchetHandler::new(Arc::clone(&shared));
+        assert!(Arc::ptr_eq(&handler.shared, &shared));
+        assert!(handler.decrypt_lock.try_lock().is_ok());
+    }
 
     fn field_varint(field: u8, value: u32, output: &mut Vec<u8>) {
         output.push(field << 3);
@@ -348,6 +302,7 @@ mod tests {
     #[test]
     fn distribution_parser_reads_all_fast_ratchet_chains() {
         let mut bytes = vec![0x33];
+        field_varint(7, 99, &mut bytes);
         field_varint(1, 42, &mut bytes);
         field_varint(2, 7, &mut bytes);
         for value in 1..=8 {
@@ -389,6 +344,32 @@ mod tests {
         }
         field_bytes(4, &[5; 33], &mut wrong_chain_length);
         assert!(FastRatchetState::from_distribution(&wrong_chain_length).is_err());
+
+        let signing_key = PrivateKey::deserialize(&[7; 32])
+            .unwrap()
+            .public_key()
+            .unwrap()
+            .serialize();
+        for (include_id, include_iteration, include_signing_key) in [
+            (true, true, false),
+            (false, true, true),
+            (true, false, true),
+        ] {
+            let mut missing = vec![0x33];
+            if include_id {
+                field_varint(1, 42, &mut missing);
+            }
+            if include_iteration {
+                field_varint(2, 7, &mut missing);
+            }
+            for _ in 0..8 {
+                field_bytes(3, &[1; 32], &mut missing);
+            }
+            if include_signing_key {
+                field_bytes(4, &signing_key, &mut missing);
+            }
+            assert!(FastRatchetState::from_distribution(&missing).is_err());
+        }
     }
 
     #[test]
@@ -413,24 +394,24 @@ mod tests {
 
     #[test]
     fn protobuf_decoder_rejects_truncated_and_unsupported_fields() {
-        assert!(decode_fields(&[0x08, 0x80], |_, _, _| Ok(())).is_err());
-        assert!(decode_fields(&[0x09, 0, 0, 0, 0], |_, _, _| Ok(())).is_err());
-        assert!(decode_fields(&[0x12, 0x02, 0x01], |_, _, _| Ok(())).is_err());
-        assert!(decode_fields(&[0x1d, 0, 0, 0], |_, _, _| Ok(())).is_err());
-        assert!(decode_fields(&[0x1b], |_, _, _| Ok(())).is_err());
+        assert!(decode_fields(&[0x08, 0x80]).is_err());
+        assert!(decode_fields(&[0x09, 0, 0, 0, 0]).is_err());
+        assert!(decode_fields(&[0x12, 0x02, 0x01]).is_err());
+        assert!(decode_fields(&[0x1d, 0, 0, 0]).is_err());
+        assert!(decode_fields(&[0x1b]).is_err());
+        assert!(take_varint(&mut &[0x80; 10][..]).is_err());
 
-        let mut visited = 0;
         let mut fixed_fields = vec![0x09];
         fixed_fields.extend_from_slice(&[0; 8]);
         fixed_fields.push(0x15);
         fixed_fields.extend_from_slice(&[0; 4]);
-        decode_fields(&fixed_fields, |_, _, value| {
-            assert!(matches!(value, ProtobufValue::Ignored));
-            visited += 1;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(visited, 2);
+        let fields = decode_fields(&fixed_fields).unwrap();
+        assert!(
+            fields
+                .iter()
+                .all(|(_, _, value)| matches!(value, ProtobufValue::Ignored))
+        );
+        assert_eq!(fields.len(), 2);
     }
 
     #[test]
@@ -462,7 +443,7 @@ mod tests {
         };
         let mut sender = state.clone();
         sender.advance_to(17).unwrap();
-        let seed = hmac_sha256(&sender.chain_keys[FAST_RATCHET_CHAINS - 1], 1).unwrap();
+        let seed = hmac_sha256(&sender.chain_keys[FAST_RATCHET_CHAINS - 1], 1);
         let mut derived = [0_u8; 48];
         Hkdf::<Sha256>::new(None, &seed)
             .expand(b"WhisperGroup", &mut derived)
@@ -484,5 +465,90 @@ mod tests {
 
         assert_eq!(state.decrypt(envelope.serialized()).unwrap(), plaintext);
         assert_eq!(state.iteration, 18);
+    }
+
+    #[test]
+    fn decrypt_rejects_wrong_identity_signature_iteration_and_padding() {
+        let signing_key = PrivateKey::deserialize(&[7; 32]).unwrap();
+        let other_key = PrivateKey::deserialize(&[8; 32]).unwrap();
+        let base = FastRatchetState {
+            sender_key_id: 42,
+            iteration: 2,
+            chain_keys: std::array::from_fn(|index| [u8::try_from(index).unwrap() + 1; 32]),
+            signing_key: signing_key.public_key().unwrap().serialize().to_vec(),
+        };
+        let mut rng = StdRng::seed_from_u64(10);
+
+        let wrong_id = SenderKeyMessage::new(
+            SIGNAL_MESSAGE_VERSION,
+            41,
+            2,
+            vec![0; 16].into_boxed_slice(),
+            &mut rng,
+            &signing_key,
+        )
+        .unwrap();
+        assert!(base.clone().decrypt(wrong_id.serialized()).is_err());
+
+        let wrong_signature = SenderKeyMessage::new(
+            SIGNAL_MESSAGE_VERSION,
+            42,
+            2,
+            vec![0; 16].into_boxed_slice(),
+            &mut rng,
+            &other_key,
+        )
+        .unwrap();
+        assert!(base.clone().decrypt(wrong_signature.serialized()).is_err());
+
+        let old = SenderKeyMessage::new(
+            SIGNAL_MESSAGE_VERSION,
+            42,
+            1,
+            vec![0; 16].into_boxed_slice(),
+            &mut rng,
+            &signing_key,
+        )
+        .unwrap();
+        assert!(base.clone().decrypt(old.serialized()).is_err());
+
+        let invalid_padding = SenderKeyMessage::new(
+            SIGNAL_MESSAGE_VERSION,
+            42,
+            2,
+            vec![0; 16].into_boxed_slice(),
+            &mut rng,
+            &signing_key,
+        )
+        .unwrap();
+        assert!(base.clone().decrypt(invalid_padding.serialized()).is_err());
+
+        let mut max_sender = FastRatchetState {
+            iteration: 0,
+            ..base.clone()
+        };
+        max_sender.advance_to(u32::MAX).unwrap();
+        let seed = hmac_sha256(&max_sender.chain_keys[FAST_RATCHET_CHAINS - 1], 1);
+        let mut derived = [0_u8; 48];
+        Hkdf::<Sha256>::new(None, &seed)
+            .expand(b"WhisperGroup", &mut derived)
+            .unwrap();
+        let ciphertext = Encryptor::<Aes256>::new_from_slices(&derived[16..], &derived[..16])
+            .unwrap()
+            .encrypt_padded_vec::<Pkcs7>(b"valid at max iteration");
+        let max_iteration = SenderKeyMessage::new(
+            SIGNAL_MESSAGE_VERSION,
+            42,
+            u32::MAX,
+            ciphertext.into_boxed_slice(),
+            &mut rng,
+            &signing_key,
+        )
+        .unwrap();
+        let mut max_receiver = FastRatchetState {
+            iteration: 0,
+            ..base
+        };
+        assert!(max_receiver.decrypt(max_iteration.serialized()).is_err());
     }
 }

@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use omarchy_whatsapp_protocol::{AppPaths, Chat, ClientFrame, Command, ServerEvent, ServerFrame};
@@ -8,6 +10,7 @@ use std::io::Write as IoWrite;
 use std::ops::Range;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -75,8 +78,16 @@ enum Action {
     Ping,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run() -> Result<()> {
     let options = Options::parse();
     let socket = options
         .socket
@@ -133,6 +144,14 @@ fn command_for_action(action: Action) -> Result<Command> {
         Action::Send { chat, text } => Command::SendMessage {
             chat_jid: chat,
             text,
+            delivery_id: format!(
+                "ctl-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
         },
         Action::PollCreate {
             chat,
@@ -165,6 +184,37 @@ fn command_for_action(action: Action) -> Result<Command> {
 }
 
 async fn request(socket: &Path, command: Command) -> Result<ServerEvent> {
+    let timeout = request_timeout(&command);
+    request_with_timeout(socket, command, timeout).await
+}
+
+async fn request_with_timeout(
+    socket: &Path,
+    command: Command,
+    timeout: Duration,
+) -> Result<ServerEvent> {
+    tokio::time::timeout(timeout, request_inner(socket, command))
+        .await
+        .with_context(|| {
+            format!(
+                "daemon request timed out after {} seconds",
+                timeout.as_secs()
+            )
+        })?
+}
+
+fn request_timeout(command: &Command) -> Duration {
+    match command {
+        Command::CreatePoll { .. } | Command::SendVoiceMessage { .. } => Duration::from_secs(130),
+        Command::DownloadImage { .. }
+        | Command::DownloadSticker { .. }
+        | Command::DownloadVideo { .. }
+        | Command::DownloadAudio { .. } => Duration::from_secs(70),
+        _ => Duration::from_secs(40),
+    }
+}
+
+async fn request_inner(socket: &Path, command: Command) -> Result<ServerEvent> {
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connecting to {}", socket.display()))?;
@@ -183,6 +233,7 @@ async fn request(socket: &Path, command: Command) -> Result<ServerEvent> {
     bail!("daemon disconnected before responding")
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn menu_path_from_environment() -> Result<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -408,9 +459,11 @@ fn write_if_changed(path: &Path, existing: &str, updated: &str) -> Result<bool> 
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use tokio::net::UnixListener;
 
     fn chat(jid: &str, name: &str, is_group: bool) -> Chat {
         Chat {
@@ -483,5 +536,225 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("without an end marker"));
+    }
+
+    #[test]
+    fn every_cli_action_maps_to_the_expected_protocol_command_and_timeout() {
+        assert_eq!(
+            command_for_action(Action::Status).unwrap(),
+            Command::GetState
+        );
+        assert_eq!(
+            command_for_action(Action::Chats { limit: 3 }).unwrap(),
+            Command::ListChats { limit: 3 }
+        );
+        assert!(matches!(
+            command_for_action(Action::Messages { chat: "c".into(), limit: 4 }).unwrap(),
+            Command::GetMessages { chat_jid, limit: 4 } if chat_jid == "c"
+        ));
+        let send = command_for_action(Action::Send {
+            chat: "c".into(),
+            text: "hello".into(),
+        })
+        .unwrap();
+        assert!(
+            matches!(send, Command::SendMessage { chat_jid, text, delivery_id }
+            if chat_jid == "c" && text == "hello" && delivery_id.starts_with("ctl-"))
+        );
+        let poll = command_for_action(Action::PollCreate {
+            chat: "c".into(),
+            question: "q".into(),
+            options: vec!["a".into(), "b".into()],
+            selectable_count: 2,
+            correct_option_index: Some(1),
+        })
+        .unwrap();
+        assert_eq!(request_timeout(&poll), Duration::from_secs(130));
+        assert!(matches!(
+            poll,
+            Command::CreatePoll {
+                selectable_count: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            command_for_action(Action::PollVote {
+                chat: "c".into(),
+                message_id: "m".into(),
+                selected_options: vec!["a".into()],
+            })
+            .unwrap(),
+            Command::VotePoll { message_id, .. } if message_id == "m"
+        ));
+        assert_eq!(
+            command_for_action(Action::MarkRead { chat: "c".into() }).unwrap(),
+            Command::MarkRead {
+                chat_jid: "c".into()
+            }
+        );
+        assert_eq!(command_for_action(Action::Ping).unwrap(), Command::Ping);
+        assert!(
+            command_for_action(Action::LauncherSync {
+                limit: 1,
+                menu_path: None
+            })
+            .is_err()
+        );
+        assert!(command_for_action(Action::LauncherRemove { menu_path: None }).is_err());
+
+        assert_eq!(request_timeout(&Command::Ping), Duration::from_secs(40));
+        assert_eq!(
+            request_timeout(&Command::DownloadImage {
+                chat_jid: "c".into(),
+                message_id: "m".into(),
+            }),
+            Duration::from_secs(70)
+        );
+        assert_eq!(
+            request_timeout(&Command::DownloadSticker {
+                chat_jid: "c".into(),
+                message_id: "m".into(),
+            }),
+            Duration::from_secs(70)
+        );
+        assert_eq!(
+            request_timeout(&Command::DownloadVideo {
+                chat_jid: "c".into(),
+                message_id: "m".into(),
+            }),
+            Duration::from_secs(70)
+        );
+        assert_eq!(
+            request_timeout(&Command::DownloadAudio {
+                chat_jid: "c".into(),
+                message_id: "m".into(),
+            }),
+            Duration::from_secs(70)
+        );
+        assert_eq!(
+            request_timeout(&Command::SendVoiceMessage {
+                chat_jid: "c".into(),
+                recording_id: "r".into(),
+            }),
+            Duration::from_secs(130)
+        );
+    }
+
+    #[tokio::test]
+    async fn ipc_request_ignores_broadcasts_and_returns_matching_response() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let request: ClientFrame =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(request.id, Some(1));
+            write
+                .write_all(b"{\"event\":\"unread\",\"total\":2}\n")
+                .await
+                .unwrap();
+            write
+                .write_all(b"{\"id\":1,\"event\":\"pong\"}\n")
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            request(&socket, Command::Ping).await.unwrap(),
+            ServerEvent::Pong
+        );
+        server.await.unwrap();
+
+        let missing = directory.path().join("missing.sock");
+        assert!(request_inner(&missing, Command::Ping).await.is_err());
+
+        let disconnect_socket = directory.path().join("disconnect.sock");
+        let listener = UnixListener::bind(&disconnect_socket).unwrap();
+        let disconnect = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, _write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let _ = lines.next_line().await.unwrap();
+        });
+        assert!(
+            request_inner(&disconnect_socket, Command::Ping)
+                .await
+                .is_err()
+        );
+        disconnect.await.unwrap();
+
+        let timeout_socket = directory.path().join("timeout.sock");
+        let listener = UnixListener::bind(&timeout_socket).unwrap();
+        let stalled = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(stream);
+        });
+        let error = request_with_timeout(&timeout_socket, Command::Ping, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out after 0 seconds"));
+        stalled.await.unwrap();
+    }
+
+    #[test]
+    fn launcher_parser_and_filesystem_edges_are_explicit() {
+        let block = render_menu_block(&[chat("1@s.whatsapp.net", "  ", false)]);
+        assert!(block.contains("\"label\":\"1@s.whatsapp.net\""));
+
+        assert!(generated_block_span(MENU_BLOCK_END).is_err());
+        assert!(
+            generated_block_span(&format!(
+                "{MENU_BLOCK_BEGIN}\n{MENU_BLOCK_BEGIN}\n{MENU_BLOCK_END}"
+            ))
+            .is_err()
+        );
+        assert!(
+            generated_block_span(&format!(
+                "{MENU_BLOCK_BEGIN}\n{MENU_BLOCK_END}\n{MENU_BLOCK_END}"
+            ))
+            .is_err()
+        );
+        let commented = " \n// comment\n\t{";
+        assert_eq!(root_object_open(commented), commented.find('{'));
+        assert_eq!(root_object_open("[]"), None);
+        assert_eq!(root_object_open("  \n"), None);
+        assert!(upsert_menu_block("[]", &render_menu_block(&[])).is_err());
+
+        let directory = tempdir().unwrap();
+        let missing = directory.path().join("nested/omarchy-menu.jsonc");
+        assert!(!remove_launcher_menu(&missing).unwrap());
+        assert!(sync_launcher_menu(&missing, &[]).unwrap());
+        assert!(!sync_launcher_menu(&missing, &[]).unwrap());
+
+        let unreadable = directory.path().join("directory-as-menu");
+        fs::create_dir(&unreadable).unwrap();
+        assert!(read_menu_or_default(&unreadable).is_err());
+        assert!(remove_launcher_menu(&unreadable).is_err());
+        assert!(write_if_changed(&unreadable, "old", "new").is_err());
+
+        assert!(!write_if_changed(&missing, "same", "same").unwrap());
+        assert!(write_if_changed(Path::new(""), "old", "new").is_err());
+
+        let collision_path = directory.path().join("collisions/menu.jsonc");
+        fs::create_dir_all(collision_path.parent().unwrap()).unwrap();
+        for attempt in 0..100_u32 {
+            fs::write(
+                collision_path.parent().unwrap().join(format!(
+                    ".menu.jsonc.omarchy-whatsapp.{}.{}.tmp",
+                    std::process::id(),
+                    attempt
+                )),
+                b"occupied",
+            )
+            .unwrap();
+        }
+        assert!(write_if_changed(&collision_path, "old", "new").is_err());
+
+        let long_name = "x".repeat(250);
+        let too_long = directory.path().join(long_name);
+        assert!(write_if_changed(&too_long, "old", "new").is_err());
     }
 }

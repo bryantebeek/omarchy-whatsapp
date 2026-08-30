@@ -135,6 +135,34 @@ TestCase {
     compare(service.sentMessages[0], "Hello from the test")
     compare(composer.text, "")
     compare(service.chatStateUpdates[service.chatStateUpdates.length - 1], "paused")
+    composer.text = "same draft in another chat"
+    service.selectedChatJid = "other@s.whatsapp.net"
+    service.textMessageAccepted(
+      "old-delivery", "3161234@s.whatsapp.net", "same draft in another chat")
+    compare(composer.text, "same draft in another chat")
+    service.textMessageAccepted(
+      "current-delivery", "other@s.whatsapp.net", "same draft in another chat")
+    compare(composer.text, "")
+
+    service.textOutboxEntries = [{
+      delivery_id: "failed-text",
+      chat_jid: "other@s.whatsapp.net",
+      text: "Could not send this",
+      status: "failed",
+      error: "Network unavailable"
+    }]
+    compare(control("textOutboxStatus").text, "Message failed  Could not send this")
+    compare(control("textRetryButton").tooltipText, "Network unavailable")
+    control("textRetryButton").click()
+    compare(service.textOutboxEntries.length, 0)
+    service.textOutboxEntries = [{
+      delivery_id: "discard-text",
+      chat_jid: "other@s.whatsapp.net",
+      text: "Discard this",
+      status: "failed"
+    }]
+    control("textOutboxDiscardButton").click()
+    compare(service.textOutboxEntries.length, 0)
     wait(10)
   }
 

@@ -113,6 +113,7 @@ fn event_command(helper: Option<&str>, title: &str, body: &str, urgency: &str) -
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -147,6 +148,20 @@ mod tests {
         let message = message("friends@g.us", "joyce@s.whatsapp.net", "Hello");
 
         assert_eq!(message_body(&message, true), "Joyce Bakker: Hello");
+    }
+
+    #[test]
+    fn long_message_bodies_are_unicode_safely_truncated() {
+        let text = "🦀".repeat(241);
+        let message = message("joyce@s.whatsapp.net", "joyce@s.whatsapp.net", &text);
+
+        let body = message_body(&message, false);
+        assert_eq!(body.chars().count(), 240);
+        assert!(body.ends_with('…'));
+        assert_eq!(
+            body.chars().filter(|character| *character == '🦀').count(),
+            239
+        );
     }
 
     #[test]

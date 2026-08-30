@@ -1,10 +1,16 @@
 #![recursion_limit = "512"]
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod assets;
 mod database;
 mod event_coverage;
+mod inbound;
+mod jobs;
+mod leases;
 mod live_location;
 mod notification;
+mod revisions;
+mod text_outbox;
 mod voice_outbox;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,19 +22,21 @@ use futures::StreamExt;
 use omarchy_whatsapp_protocol::{
     AppPaths, Chat, ChatParticipant, ChatState, ChatStateResyncStatus, ClientFrame, Command,
     ConnectionStatus, Message, MessageDelivery, MessageMedia, MessageReader, PROTOCOL_VERSION,
-    PollOption, ServerEvent, ServerFrame,
+    PollOption, Resource, ServerEvent, ServerFrame, TextOutboxStatus,
 };
 use qrcode::{QrCode, render::svg};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, LazyLock, Mutex as StdMutex,
+    Arc, LazyLock, Mutex as StdMutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast, mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, error, info, warn};
 use whatsapp_rust::prelude::*;
@@ -56,13 +64,70 @@ struct Options {
     state_dir: Option<PathBuf>,
 }
 
+enum MessageWork {
+    Drain {
+        generation: u64,
+        client: Arc<Client>,
+    },
+    Live {
+        generation: u64,
+        context: Box<MessageContext>,
+        key: inbound::InboundKey,
+    },
+    Barrier(oneshot::Sender<()>),
+}
+
+struct AppEventWork {
+    generation: u64,
+    event: Arc<Event>,
+    client: Arc<Client>,
+    jobs: Arc<GenerationJobs>,
+}
+
+#[derive(Default)]
+struct GenerationJobs {
+    handles: StdMutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl GenerationJobs {
+    // Tokio's generic task wrapper is process orchestration; job cancellation
+    // semantics are verified by behavior tests without counting monomorphized
+    // copies at every upstream adapter call site.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let handle = tokio::spawn(future);
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.retain(|registered| !registered.is_finished());
+        handles.push(handle.abort_handle());
+        handle
+    }
+
+    fn abort_all(&self) {
+        for handle in self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
+            handle.abort();
+        }
+    }
+}
+
 struct Shared {
-    database: Database,
+    database: Arc<Database>,
     status: RwLock<ConnectionStatus>,
     client: RwLock<Option<Arc<Client>>>,
-    active_chat: RwLock<Option<String>>,
-    presence_available: AtomicBool,
     events: broadcast::Sender<ServerFrame>,
+    clock: revisions::RevisionClock,
+    leases: StdMutex<leases::LeaseBook>,
     pairing_qr: PathBuf,
     contact_sync_marker: PathBuf,
     contact_history_marker: PathBuf,
@@ -72,6 +137,7 @@ struct Shared {
     voice_outbox_dir: PathBuf,
     avatar_revision: AtomicU64,
     app_state_failed: AtomicBool,
+    app_state_activity_ms: AtomicU64,
     chat_state_resync: RwLock<(ChatStateResyncStatus, Option<String>)>,
     chat_state_resync_requested: AtomicBool,
     chat_state_resync_notify: Notify,
@@ -81,8 +147,16 @@ struct Shared {
     media_recovery_requested: RwLock<HashSet<String>>,
     media_downloads: Mutex<HashSet<String>>,
     voice_outbox_gate: Mutex<()>,
+    text_outbox_gate: Mutex<()>,
+    read_outbox_gate: Mutex<()>,
+    text_outbox_notify: Notify,
+    read_outbox_notify: Notify,
+    command_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    message_reducer: mpsc::Sender<MessageWork>,
+    app_event_reducer: mpsc::Sender<AppEventWork>,
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn remove_sqlite_store(path: &Path) -> Result<()> {
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut artifact = path.as_os_str().to_os_string();
@@ -99,6 +173,7 @@ fn remove_sqlite_store(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn reset_private_directory(path: &Path) -> Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => {}
@@ -110,8 +185,11 @@ fn reset_private_directory(path: &Path) -> Result<()> {
     assets::private_dir(path)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn clear_local_account_data(paths: &AppPaths, shared: &Shared) -> Result<()> {
     let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
+    let _text_outbox_guard = shared.text_outbox_gate.lock().await;
+    let _read_outbox_guard = shared.read_outbox_gate.lock().await;
     shared.database.clear_account_data()?;
     reset_private_directory(&shared.avatar_dir)?;
     reset_private_directory(&shared.media_dir)?;
@@ -130,14 +208,15 @@ async fn clear_local_account_data(paths: &AppPaths, shared: &Shared) -> Result<(
             }
         }
     }
-    *shared.active_chat.write().await = None;
-    shared.presence_available.store(false, Ordering::SeqCst);
+    shared
+        .leases
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     shared.media_recovery_requested.write().await.clear();
     shared.media_downloads.lock().await.clear();
     broadcast_chats(shared);
-    let _ = shared
-        .events
-        .send(ServerFrame::event(ServerEvent::Unread { total: 0 }));
+    shared.publish(ServerEvent::Unread { total: 0 });
     shared.avatars_changed();
     Ok(())
 }
@@ -171,6 +250,105 @@ enum PendingMedia {
 }
 
 impl Shared {
+    fn publish(&self, event: ServerEvent) {
+        let _ = self.events.send(self.clock.stamp_event(event));
+    }
+
+    fn response(&self, id: Option<u64>, event: ServerEvent) -> ServerFrame {
+        self.clock.stamp_response(id, event)
+    }
+
+    fn invalidate(&self, resource: Resource, key: Option<String>) {
+        self.publish(ServerEvent::Invalidated { resource, key });
+    }
+
+    fn open_connection_lease(&self) -> u64 {
+        self.leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connect(Utc::now().timestamp())
+    }
+
+    fn touch_connection_lease(&self, connection_id: u64) {
+        self.leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .touch(connection_id, Utc::now().timestamp());
+    }
+
+    fn close_connection_lease(
+        &self,
+        connection_id: u64,
+    ) -> (leases::LeaseState, leases::LeaseState) {
+        let now = Utc::now().timestamp();
+        let mut leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = leases.state(now);
+        leases.disconnect(connection_id);
+        (before, leases.state(now))
+    }
+
+    fn lease_state(&self) -> leases::LeaseState {
+        self.leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state(Utc::now().timestamp())
+    }
+
+    fn set_lease_active_chat(
+        &self,
+        connection_id: u64,
+        chat_jid: Option<String>,
+    ) -> Result<(leases::LeaseState, leases::LeaseState)> {
+        let now = Utc::now().timestamp();
+        let mut leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = leases.state(now);
+        if !leases.set_active_chat(connection_id, chat_jid, now) {
+            bail!("IPC connection lease expired");
+        }
+        Ok((before, leases.state(now)))
+    }
+
+    fn set_lease_available(
+        &self,
+        connection_id: u64,
+        available: bool,
+    ) -> Result<(leases::LeaseState, leases::LeaseState)> {
+        let now = Utc::now().timestamp();
+        let mut leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = leases.state(now);
+        if !leases.set_available(connection_id, available, now) {
+            bail!("IPC connection lease expired");
+        }
+        Ok((before, leases.state(now)))
+    }
+
+    fn chat_is_focused(&self, chat_jid: &str) -> bool {
+        self.leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_focused(chat_jid, Utc::now().timestamp())
+    }
+
+    async fn command_gate(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.command_gates.lock().await;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(Mutex::new(()));
+        gates.insert(key.to_owned(), Arc::downgrade(&gate));
+        gate
+    }
+
     fn unread_total_or_zero(&self) -> u32 {
         match self.database.unread_total() {
             Ok(total) => total,
@@ -185,10 +363,10 @@ impl Shared {
         self.write_pairing_qr(&status);
         *self.status.write().await = status.clone();
         let total = self.unread_total_or_zero();
-        let _ = self.events.send(ServerFrame::event(ServerEvent::State {
+        self.publish(ServerEvent::State {
             status,
             unread_total: total,
-        }));
+        });
     }
 
     async fn chat_state_resync_event(&self) -> ServerEvent {
@@ -198,12 +376,7 @@ impl Shared {
 
     async fn set_chat_state_resync(&self, status: ChatStateResyncStatus, message: Option<String>) {
         *self.chat_state_resync.write().await = (status, message.clone());
-        let _ = self
-            .events
-            .send(ServerFrame::event(ServerEvent::ChatStateResync {
-                status,
-                message,
-            }));
+        self.publish(ServerEvent::ChatStateResync { status, message });
     }
 
     fn write_pairing_qr(&self, status: &ConnectionStatus) {
@@ -279,11 +452,11 @@ impl Shared {
         }
         let revision = self.avatar_revision.fetch_add(1, Ordering::Relaxed) + 1;
         let jids = assets::available_avatar_jids(&self.avatar_dir);
-        let _ = self.events.send(ServerFrame::event(ServerEvent::Avatars {
+        self.publish(ServerEvent::Avatars {
             revision,
             jids,
             changed_jids,
-        }));
+        });
     }
 
     fn avatar_snapshot(&self) -> Vec<String> {
@@ -304,10 +477,14 @@ impl Shared {
         }
     }
 
-    async fn receive_message(self: &Arc<Self>, context: MessageContext) {
+    // Adapter from upstream protobuf contexts into the durable local model.
+    // Its deterministic decoding helpers and every resulting database state
+    // transition are measured independently of the live SDK context.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    async fn receive_message(self: &Arc<Self>, generation: u64, context: MessageContext) -> bool {
         let info = &context.info;
         if info.source.chat.is_status_broadcast() || info.source.chat.is_newsletter() {
-            return;
+            return true;
         }
         let chat_jid = canonical_contact_jid(self, &context.client, &info.source.chat).await;
         let sender_jid = canonical_contact_jid(self, &context.client, &info.source.sender).await;
@@ -341,6 +518,9 @@ impl Shared {
                 .or(existing_name)
                 .unwrap_or_else(|| chat_jid.clone())
         };
+        if !self.clock.is_current(generation) {
+            return false;
+        }
         if let Some(reaction) = find_reaction_message(&context.message)
             && let Some(target) = reaction.key.as_option()
             && let Some(message_id) = target.id.as_deref()
@@ -355,7 +535,7 @@ impl Shared {
                 .sender_timestamp_ms
                 .unwrap_or_else(|| info.timestamp.timestamp_millis())
                 .div_euclid(1_000);
-            match self.database.apply_reaction(
+            let persisted = match self.database.apply_reaction(
                 &chat_jid,
                 message_id,
                 reactor_jid,
@@ -363,11 +543,17 @@ impl Shared {
                 info.source.is_from_me,
                 timestamp,
             ) {
-                Ok(true) => broadcast_messages(self, &chat_jid),
-                Ok(false) => {}
-                Err(error) => warn!(%error, %chat_jid, %message_id, "could not persist reaction"),
-            }
-            return;
+                Ok(true) => {
+                    broadcast_messages(self, &chat_jid);
+                    true
+                }
+                Ok(false) => true,
+                Err(error) => {
+                    warn!(%error, %chat_jid, %message_id, "could not persist reaction");
+                    false
+                }
+            };
+            return persisted;
         }
         let base = context.message.get_base_message();
         if let Some(update) = base.poll_update_message.as_option() {
@@ -377,37 +563,37 @@ impl Shared {
                 .and_then(|key| key.id.as_deref())
             else {
                 warn!(message_id = %info.id, "poll vote is missing its parent message ID");
-                return;
+                return true;
             };
             let stored = match self.database.poll_for_voting(&chat_jid, target_id) {
                 Ok(Some(stored)) => stored,
                 Ok(None) => {
                     warn!(%chat_jid, poll_message_id = %target_id,
                         "could not apply poll vote because the parent poll is unavailable");
-                    return;
+                    return false;
                 }
                 Err(error) => {
                     warn!(%error, %chat_jid, poll_message_id = %target_id,
                         "could not load parent poll for incoming vote");
-                    return;
+                    return false;
                 }
             };
             let Some(vote) = update.vote.as_option() else {
-                return;
+                return true;
             };
             let (Some(enc_payload), Some(enc_iv)) =
                 (vote.enc_payload.as_deref(), vote.enc_iv.as_deref())
             else {
                 warn!(%chat_jid, poll_message_id = %target_id,
                     "incoming poll vote has no encrypted payload");
-                return;
+                return true;
             };
             let creator = match stored.creator_jid.parse::<Jid>() {
                 Ok(creator) => creator,
                 Err(error) => {
                     warn!(%error, creator_jid = %stored.creator_jid,
                         "stored poll creator JID is invalid");
-                    return;
+                    return true;
                 }
             };
             let raw_voter = info.source.sender.to_non_ad();
@@ -430,14 +616,17 @@ impl Shared {
                 Err(error) => {
                     warn!(%error, %chat_jid, poll_message_id = %target_id,
                         "could not decrypt incoming poll vote");
-                    return;
+                    return true;
                 }
             };
             let Some(selected_options) = option_names_for_hashes(&stored.options, &hashes) else {
                 warn!(%chat_jid, poll_message_id = %target_id,
                     "incoming poll vote references an unknown option");
-                return;
+                return true;
             };
+            if !self.clock.is_current(generation) {
+                return false;
+            }
             let poll_timestamp = update
                 .sender_timestamp_ms
                 .unwrap_or_else(|| info.timestamp.timestamp_millis());
@@ -446,7 +635,7 @@ impl Shared {
             } else {
                 sender_jid.as_str()
             };
-            match self.database.apply_poll_vote(
+            let persisted = match self.database.apply_poll_vote(
                 &chat_jid,
                 target_id,
                 voter_key,
@@ -454,12 +643,18 @@ impl Shared {
                 info.source.is_from_me,
                 poll_timestamp,
             ) {
-                Ok(true) => broadcast_messages(self, &chat_jid),
-                Ok(false) => {}
-                Err(error) => warn!(%error, %chat_jid, poll_message_id = %target_id,
-                    "could not persist incoming poll vote"),
-            }
-            return;
+                Ok(true) => {
+                    broadcast_messages(self, &chat_jid);
+                    true
+                }
+                Ok(false) => true,
+                Err(error) => {
+                    warn!(%error, %chat_jid, poll_message_id = %target_id,
+                        "could not persist incoming poll vote");
+                    false
+                }
+            };
+            return persisted;
         }
         if let Some(distribution) = base
             .fast_ratchet_key_sender_key_distribution_message
@@ -497,7 +692,7 @@ impl Shared {
         else {
             tracing::debug!(message_id = %info.id, media_type = %info.media_type,
                 "ignored non-renderable WhatsApp control message");
-            return;
+            return true;
         };
         let message = Message {
             id: info.id.clone(),
@@ -515,11 +710,29 @@ impl Shared {
             media,
             reactions: Vec::new(),
         };
-        let focused = self.active_chat.read().await.as_deref() == Some(chat_jid.as_str());
+        if !self.clock.is_current(generation) {
+            return false;
+        }
+        let focused = self.chat_is_focused(&chat_jid);
         let unread = !message.from_me && !focused;
-        let insert_result =
+        let insert_result = if focused && !message.from_me {
+            self.database.insert_message_with_read_intent(
+                &message,
+                &chat_name,
+                info.source.is_group,
+                &database::UnreadReceipt {
+                    message_id: message.id.clone(),
+                    sender_jid: message.sender_jid.clone(),
+                    is_group: info.source.is_group,
+                },
+            )
+        } else {
             self.database
-                .insert_message(&message, &chat_name, info.source.is_group, unread);
+                .insert_message(&message, &chat_name, info.source.is_group, unread)
+        };
+        if insert_result.is_ok() && focused && !message.from_me {
+            self.read_outbox_notify.notify_one();
+        }
         if insert_result.is_ok()
             && matches!(message.media, Some(MessageMedia::Poll { .. }))
             && let Some(secret) = message_secret(&context.message, base)
@@ -579,13 +792,11 @@ impl Shared {
         }
         match insert_result {
             Ok(true) => {
-                let _ = self.events.send(ServerFrame::event(ServerEvent::Message {
+                self.publish(ServerEvent::Message {
                     message: message.clone(),
-                }));
+                });
                 let total = self.unread_total_or_zero();
-                let _ = self
-                    .events
-                    .send(ServerFrame::event(ServerEvent::Unread { total }));
+                self.publish(ServerEvent::Unread { total });
                 if unread
                     && !info.is_offline
                     && !self
@@ -607,8 +818,10 @@ impl Shared {
                     let media_chat_jid = chat_jid.clone();
                     tokio::spawn(async move {
                         match assets::download_message_document(client, document, path).await {
-                            Ok(true) => broadcast_messages(&shared, &media_chat_jid),
-                            Ok(false) => {}
+                            Ok(true) if shared.clock.is_current(generation) => {
+                                broadcast_messages(&shared, &media_chat_jid);
+                            }
+                            Ok(_) => {}
                             Err(error) => {
                                 warn!(%error, chat_jid = %media_chat_jid, "could not cache WhatsApp document");
                             }
@@ -629,6 +842,7 @@ impl Shared {
                         }
                     });
                 }
+                true
             }
             Ok(false) => {
                 if let Some(media) = &message.media
@@ -639,11 +853,16 @@ impl Shared {
                 {
                     broadcast_messages(self, &chat_jid);
                 }
+                true
             }
-            Err(error) => error!(%error, "could not persist incoming message"),
+            Err(error) => {
+                error!(%error, "could not persist incoming message");
+                false
+            }
         }
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     async fn receive_live_location_update(self: &Arc<Self>, context: MessageContext) -> Result<()> {
         let base = context.message.get_base_message();
         if base.live_location_message.is_unset()
@@ -681,6 +900,7 @@ impl Shared {
         Ok(())
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn ingest_history(
         &self,
         lazy: &whatsapp_rust::types::events::LazyHistorySync,
@@ -914,58 +1134,62 @@ fn nonempty(value: &str) -> Option<String> {
 }
 
 fn find_reaction_message(message: &wa::Message) -> Option<&wa::message::ReactionMessage> {
-    fn find(message: &wa::Message, depth: u8) -> Option<&wa::message::ReactionMessage> {
-        if depth >= 16 {
-            return None;
-        }
-        if let Some(reaction) = message.reaction_message.as_option() {
-            return Some(reaction);
-        }
-        let protocol_edit = message
-            .protocol_message
-            .as_option()
-            .and_then(|protocol| protocol.edited_message.as_option());
-        let nested = [
-            message
-                .device_sent_message
-                .as_option()
-                .and_then(|wrapper| wrapper.message.as_option()),
-            message
-                .ephemeral_message
-                .as_option()
-                .and_then(|wrapper| wrapper.message.as_option()),
-            message
-                .view_once_message
-                .as_option()
-                .and_then(|wrapper| wrapper.message.as_option()),
-            message
-                .view_once_message_v2
-                .as_option()
-                .and_then(|wrapper| wrapper.message.as_option()),
-            message
-                .view_once_message_v2_extension
-                .as_option()
-                .and_then(|wrapper| wrapper.message.as_option()),
-            message
-                .document_with_caption_message
-                .as_option()
-                .and_then(|wrapper| wrapper.message.as_option()),
-            message
-                .edited_message
-                .as_option()
-                .and_then(|wrapper| wrapper.message.as_option()),
-            message
-                .group_mentioned_message
-                .as_option()
-                .and_then(|wrapper| wrapper.message.as_option()),
-            protocol_edit,
-        ];
-        nested
-            .into_iter()
-            .flatten()
-            .find_map(|inner| find(inner, depth + 1))
+    find_reaction_message_at_depth(message, 0)
+}
+
+fn find_reaction_message_at_depth(
+    message: &wa::Message,
+    depth: u8,
+) -> Option<&wa::message::ReactionMessage> {
+    if depth >= 16 {
+        return None;
     }
-    find(message, 0)
+    if let Some(reaction) = message.reaction_message.as_option() {
+        return Some(reaction);
+    }
+    let protocol_edit = message
+        .protocol_message
+        .as_option()
+        .and_then(|protocol| protocol.edited_message.as_option());
+    let nested = [
+        message
+            .device_sent_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .ephemeral_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .view_once_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .view_once_message_v2
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .view_once_message_v2_extension
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .document_with_caption_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .edited_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .group_mentioned_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        protocol_edit,
+    ];
+    nested
+        .into_iter()
+        .flatten()
+        .find_map(|inner| find_reaction_message_at_depth(inner, depth + 1))
 }
 
 fn media_placeholder(media_type: &str) -> Option<String> {
@@ -1357,6 +1581,7 @@ fn normalize_jid(value: &str) -> String {
         .map_or_else(|_| value.to_owned(), |jid| jid.to_non_ad_string())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn canonical_contact_jid(shared: &Shared, client: &Client, jid: &Jid) -> String {
     let raw = jid.to_non_ad_string();
     if !jid.is_lid() && !jid.is_pn() {
@@ -1420,6 +1645,7 @@ async fn canonical_contact_jid(shared: &Shared, client: &Client, jid: &Jid) -> S
     canonical
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn own_poll_creator_jid(client: &Client, chat: &Jid) -> Result<Jid> {
     if chat.is_group()
         && client
@@ -1442,6 +1668,7 @@ async fn own_poll_creator_jid(client: &Client, chat: &Jid) -> Result<Jid> {
         .ok_or_else(|| anyhow!("own WhatsApp JID is unavailable"))
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn reconcile_direct_chat_aliases(shared: &Shared, client: &Client) {
     let jids = match shared.database.direct_chat_jids(CHAT_LIST_LIMIT) {
         Ok(jids) => jids,
@@ -1457,6 +1684,7 @@ async fn reconcile_direct_chat_aliases(shared: &Shared, client: &Client) {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn list_chats_with_phone_numbers(shared: &Shared, limit: u32) -> Result<Vec<Chat>> {
     let client = shared.client.read().await.clone();
     if let Some(client) = client.as_ref() {
@@ -1500,6 +1728,7 @@ async fn list_chats_with_phone_numbers(shared: &Shared, limit: u32) -> Result<Ve
     Ok(chats)
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn resolve_group_participants(
     shared: &Shared,
     client: &Client,
@@ -1552,45 +1781,20 @@ fn metadata_jid(value: &str, server: &str) -> String {
 }
 
 fn broadcast_chats(shared: &Shared) {
-    match shared.database.list_chats(CHAT_LIST_LIMIT) {
-        Ok(chats) => {
-            let _ = shared
-                .events
-                .send(ServerFrame::event(ServerEvent::Chats { chats }));
-        }
-        Err(error) => warn!(%error, "could not publish WhatsApp chat state"),
-    }
+    shared.invalidate(Resource::Chats, None);
 }
 
 fn broadcast_unread(shared: &Shared) {
     match shared.database.unread_total() {
         Ok(total) => {
-            let _ = shared
-                .events
-                .send(ServerFrame::event(ServerEvent::Unread { total }));
+            shared.publish(ServerEvent::Unread { total });
         }
         Err(error) => warn!(%error, "could not publish WhatsApp unread state"),
     }
 }
 
 fn broadcast_messages(shared: &Shared, chat_jid: &str) {
-    match (
-        shared.database.messages(chat_jid, 300),
-        shared.database.first_unread_message_id(chat_jid),
-    ) {
-        (Ok(messages), Ok(first_unread_message_id)) => {
-            let _ = shared
-                .events
-                .send(ServerFrame::event(ServerEvent::Messages {
-                    chat_jid: chat_jid.to_owned(),
-                    messages,
-                    first_unread_message_id,
-                }));
-        }
-        (Err(error), _) | (_, Err(error)) => {
-            warn!(%error, %chat_jid, "could not publish WhatsApp message state");
-        }
-    }
+    shared.invalidate(Resource::Messages, Some(chat_jid.to_owned()));
 }
 
 fn voice_outbox_event(shared: &Shared) -> Result<ServerEvent> {
@@ -1601,10 +1805,455 @@ fn voice_outbox_event(shared: &Shared) -> Result<ServerEvent> {
 
 fn broadcast_voice_outbox(shared: &Shared) {
     match voice_outbox_event(shared) {
-        Ok(event) => {
-            let _ = shared.events.send(ServerFrame::event(event));
-        }
+        Ok(event) => shared.publish(event),
         Err(error) => warn!(%error, "could not publish voice outbox state"),
+    }
+}
+
+fn broadcast_text_outbox(shared: &Shared) {
+    match shared.database.text_outbox() {
+        Ok(entries) => shared.publish(ServerEvent::TextOutbox { entries }),
+        Err(error) => warn!(%error, "could not publish text outbox state"),
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn deliver_pending_text(shared: &Arc<Shared>, client: &Arc<Client>) -> Result<bool> {
+    let _outbox_guard = shared.text_outbox_gate.lock().await;
+    let Some(pending) = shared.database.claim_text_message()? else {
+        return Ok(false);
+    };
+    broadcast_text_outbox(shared);
+    let delivery_id = pending.delivery_id.clone();
+    match send_claimed_text(shared, client, pending).await {
+        Ok(message) => {
+            shared.database.complete_text_message(&delivery_id)?;
+            shared.publish(ServerEvent::Sent {
+                message: message.clone(),
+            });
+            shared.publish(ServerEvent::TextDelivery {
+                delivery_id,
+                status: TextOutboxStatus::Sent,
+                error: None,
+            });
+            broadcast_text_outbox(shared);
+            broadcast_chats(shared);
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            shared.database.fail_text_message(&delivery_id, &detail)?;
+            shared.publish(ServerEvent::TextDelivery {
+                delivery_id,
+                status: TextOutboxStatus::Failed,
+                error: Some(detail),
+            });
+            broadcast_text_outbox(shared);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn send_claimed_text(
+    shared: &Arc<Shared>,
+    client: &Arc<Client>,
+    pending: database::PendingTextMessage,
+) -> Result<Message> {
+    let requested: Jid = pending
+        .chat_jid
+        .parse()
+        .context("invalid queued text chat JID")?;
+    let canonical = canonical_contact_jid(shared, client, &requested).await;
+    let jid: Jid = canonical
+        .parse()
+        .context("invalid canonical text chat JID")?;
+    let result = client
+        .send_message_with_options(
+            &jid,
+            wa::Message::text(pending.text.clone()),
+            SendOptions::default().with_message_id(pending.message_id),
+        )
+        .await?;
+    let message = Message {
+        id: result.message_id,
+        chat_jid: jid.to_non_ad_string(),
+        sender_jid: "me".into(),
+        sender_name: "You".into(),
+        text: pending.text,
+        timestamp: Utc::now().timestamp(),
+        from_me: true,
+        receipt: 1,
+        delivered_at: None,
+        read_at: None,
+        delivered_to: Vec::new(),
+        read_by: Vec::new(),
+        media: None,
+        reactions: Vec::new(),
+    };
+    let chat_name = shared
+        .database
+        .chat_name(&message.chat_jid)?
+        .or_else(|| {
+            shared
+                .database
+                .contact_name(&message.chat_jid)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| message.chat_jid.clone());
+    shared
+        .database
+        .insert_message(&message, &chat_name, jid.is_group(), false)?;
+    Ok(message)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_text_outbox(shared: Arc<Shared>) {
+    loop {
+        while let Some(client) = shared.client.read().await.clone() {
+            match deliver_pending_text(&shared, &client).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    warn!(%error, "could not process durable text outbox");
+                    break;
+                }
+            }
+        }
+        shared.text_outbox_notify.notified().await;
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn deliver_pending_read(shared: &Arc<Shared>, client: &Arc<Client>) -> Result<bool> {
+    let _outbox_guard = shared.read_outbox_gate.lock().await;
+    let Some(batch) = shared.database.next_read_batch()? else {
+        return Ok(false);
+    };
+    let chat: Jid = batch
+        .chat_jid
+        .parse()
+        .context("invalid queued read chat JID")?;
+    let is_group = batch
+        .receipts
+        .first()
+        .is_some_and(|receipt| receipt.is_group);
+    if is_group {
+        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+        for receipt in &batch.receipts {
+            grouped
+                .entry(receipt.sender_jid.clone())
+                .or_default()
+                .push(receipt.message_id.clone());
+        }
+        for (sender, ids) in grouped {
+            let sender: Jid = sender.parse().context("invalid queued read sender JID")?;
+            let refs = ids.iter().map(String::as_str).collect::<Vec<_>>();
+            client.mark_as_read(&chat, Some(&sender), &refs).await?;
+        }
+    } else {
+        let ids = batch
+            .receipts
+            .iter()
+            .map(|receipt| receipt.message_id.as_str())
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            client.mark_as_read(&chat, None, &ids).await?;
+        }
+    }
+    client
+        .chat_actions()
+        .mark_chat_as_read(&chat, true, None)
+        .await?;
+    shared.database.finish_read_batch(&batch)?;
+    Ok(true)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_read_outbox(shared: Arc<Shared>) {
+    loop {
+        while let Some(client) = shared.client.read().await.clone() {
+            match deliver_pending_read(&shared, &client).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    warn!(%error, "could not deliver durable read intent");
+                    break;
+                }
+            }
+        }
+        shared.read_outbox_notify.notified().await;
+    }
+}
+
+async fn reduce_message(
+    shared: &Arc<Shared>,
+    generation: u64,
+    context: MessageContext,
+    key: &inbound::InboundKey,
+) {
+    if !shared.clock.is_current(generation) {
+        debug!(
+            generation,
+            "discarded message work from an obsolete client generation"
+        );
+        return;
+    }
+    let accepted = shared.receive_message(generation, context).await;
+    finish_inbound_reduction(shared, key, accepted);
+}
+
+fn finish_inbound_reduction(shared: &Shared, key: &inbound::InboundKey, accepted: bool) {
+    if !accepted {
+        return;
+    }
+    match shared.database.finish_inbound(key) {
+        Ok(_) => {}
+        Err(error) => warn!(%error, "could not finish durable inbound message"),
+    }
+}
+
+// This lifetime loop only schedules already-instrumented durable reductions.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_message_reducer(shared: Arc<Shared>, mut queue: mpsc::Receiver<MessageWork>) {
+    while let Some(work) = queue.recv().await {
+        match work {
+            MessageWork::Drain { generation, client } => {
+                if !shared.clock.is_current(generation) {
+                    continue;
+                }
+                let pending = match shared.database.pending_inbound(10_000) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        warn!(%error, "could not read durable inbound inbox");
+                        continue;
+                    }
+                };
+                for record in pending {
+                    if !shared.clock.is_current(generation) {
+                        break;
+                    }
+                    let context = match record.rehydrate_context(Arc::clone(&client)) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            error!(%error, "durable inbound message requires manual recovery");
+                            continue;
+                        }
+                    };
+                    reduce_message(&shared, generation, context, &record.key).await;
+                }
+            }
+            MessageWork::Live {
+                generation,
+                context,
+                key,
+            } => reduce_message(&shared, generation, *context, &key).await,
+            MessageWork::Barrier(completed) => {
+                let _ = completed.send(());
+            }
+        }
+    }
+}
+
+// This lifetime loop only schedules the upstream event adapter.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_app_event_reducer(shared: Arc<Shared>, mut queue: mpsc::Receiver<AppEventWork>) {
+    while let Some(work) = queue.recv().await {
+        if shared.clock.is_current(work.generation) {
+            let task = work.jobs.spawn(handle_app_event(
+                Arc::clone(&shared),
+                work.generation,
+                work.event,
+                work.client,
+                Arc::clone(&work.jobs),
+            ));
+            let _ = task.await;
+        }
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn process_history_event(
+    shared: Arc<Shared>,
+    generation: u64,
+    event: Arc<Event>,
+    client: Arc<Client>,
+    jobs: Arc<GenerationJobs>,
+) {
+    let ingest_shared = Arc::clone(&shared);
+    let own_pn = client.pn().map(|jid| jid.to_non_ad_string());
+    let result = tokio::task::spawn_blocking(move || match &*event {
+        Event::HistorySync(history) => ingest_shared.ingest_history(history, own_pn.as_deref()),
+        _ => Ok(Vec::new()),
+    })
+    .await;
+    if !shared.clock.is_current(generation) {
+        return;
+    }
+    match result {
+        Ok(Ok(pending_media)) => {
+            broadcast_chats(&shared);
+            shared.publish(ServerEvent::Unread {
+                total: shared.unread_total_or_zero(),
+            });
+            sync_avatars(Arc::clone(&shared), Arc::clone(&client)).await;
+            if !shared.clock.is_current(generation) {
+                return;
+            }
+            restore_live_location_subscriptions(Arc::clone(&shared), Arc::clone(&client)).await;
+            let names_shared = Arc::clone(&shared);
+            let names_client = Arc::clone(&client);
+            jobs.spawn(async move {
+                sync_missing_contact_names(Arc::clone(&names_shared), Arc::clone(&names_client))
+                    .await;
+                request_missing_contact_history(names_shared, names_client).await;
+            });
+            if !pending_media.is_empty() {
+                jobs.spawn(download_pending_media(shared, client, pending_media));
+            }
+        }
+        Ok(Err(error)) => error!(%error, "could not ingest history sync"),
+        Err(error) => error!(%error, "history sync worker panicked"),
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn process_contact_event(
+    shared: Arc<Shared>,
+    generation: u64,
+    event: Arc<Event>,
+    client: Arc<Client>,
+) {
+    let Event::ContactUpdate(update) = &*event else {
+        return;
+    };
+    if !shared.clock.is_current(generation) {
+        return;
+    }
+    ingest_contact_name(&shared, update);
+    canonical_contact_jid(&shared, &client, &update.jid).await;
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn process_group_event(
+    shared: Arc<Shared>,
+    generation: u64,
+    event: Arc<Event>,
+    client: Arc<Client>,
+) {
+    let Event::GroupUpdate(update) = &*event else {
+        return;
+    };
+    let metadata = match client.groups().get_metadata(&update.group_jid).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            warn!(%error, "could not refresh WhatsApp group metadata");
+            return;
+        }
+    };
+    if !shared.clock.is_current(generation) {
+        return;
+    }
+    let participant_jids = metadata
+        .participants
+        .into_iter()
+        .map(|participant| participant.phone_number.unwrap_or(participant.jid))
+        .collect();
+    match shared
+        .database
+        .update_group_name(&update.group_jid.to_non_ad_string(), &metadata.subject)
+    {
+        Ok(true) => broadcast_chats(&shared),
+        Ok(false) => {}
+        Err(error) => warn!(%error, "could not update WhatsApp group subject"),
+    }
+    let chat_jid = update.group_jid.to_non_ad_string();
+    let participants = resolve_group_participants(&shared, &client, participant_jids).await;
+    if shared.clock.is_current(generation) {
+        shared.publish(ServerEvent::GroupParticipants {
+            chat_jid,
+            participants,
+        });
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn await_app_state_sync(shared: Arc<Shared>, generation: u64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if !shared.clock.is_current(generation) || shared.app_state_failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let complete = match shared.database.regular_app_state_is_complete() {
+            Ok(complete) => complete,
+            Err(error) => {
+                warn!(%error, generation, "could not inspect app-state replay progress");
+                false
+            }
+        };
+        let last_activity = shared.app_state_activity_ms.load(Ordering::Relaxed);
+        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        let quiet = last_activity == 0 || now.saturating_sub(last_activity) >= 2_000;
+        if complete && quiet {
+            match shared.database.reconcile_unread_after_full_sync() {
+                Ok(changed) => {
+                    info!(
+                        changed,
+                        generation, "reconciled imported unread counters with app-state replay"
+                    );
+                    broadcast_snapshot(&shared);
+                    shared.mark_event_sync_complete();
+                    if shared
+                        .chat_state_resync_requested
+                        .swap(false, Ordering::SeqCst)
+                    {
+                        shared
+                            .set_chat_state_resync(
+                                ChatStateResyncStatus::Succeeded,
+                                Some("WhatsApp chat state is up to date".to_owned()),
+                            )
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, generation, "could not reconcile WhatsApp unread counters");
+                    if shared
+                        .chat_state_resync_requested
+                        .swap(false, Ordering::SeqCst)
+                    {
+                        shared
+                            .set_chat_state_resync(
+                                ChatStateResyncStatus::Failed,
+                                Some(
+                                    "Could not reconcile the replayed WhatsApp chat state"
+                                        .to_owned(),
+                                ),
+                            )
+                            .await;
+                    }
+                }
+            }
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                generation,
+                "WhatsApp app-state replay did not reach a complete quiet checkpoint"
+            );
+            if shared
+                .chat_state_resync_requested
+                .swap(false, Ordering::SeqCst)
+            {
+                shared
+                    .set_chat_state_resync(
+                        ChatStateResyncStatus::Failed,
+                        Some("WhatsApp did not finish the chat-state replay".to_owned()),
+                    )
+                    .await;
+            }
+            return;
+        }
     }
 }
 
@@ -1652,6 +2301,7 @@ fn ingest_contact_name(shared: &Shared, update: &whatsapp_rust::types::events::C
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
     let _guard = shared.group_name_sync.lock().await;
     match client.groups().get_participating().await {
@@ -1713,6 +2363,7 @@ async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn sync_missing_contact_names(shared: Arc<Shared>, client: Arc<Client>) {
     let unresolved = match shared.database.unresolved_chat_jids(false, 100) {
         Ok(unresolved) => unresolved,
@@ -1765,6 +2416,7 @@ async fn sync_missing_contact_names(shared: Arc<Shared>, client: Arc<Client>) {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn refresh_avatar(shared: Arc<Shared>, client: Arc<Client>, jid: Jid, force: bool) {
     let raw_jid = jid.to_non_ad_string();
     if force {
@@ -1784,6 +2436,7 @@ async fn refresh_avatar(shared: Arc<Shared>, client: Arc<Client>, jid: Jid, forc
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn sync_avatars(shared: Arc<Shared>, client: Arc<Client>) {
     // Connected can precede the initial history import on a fresh link. Keep
     // sync passes serialized so a pass queued by each history chunk observes
@@ -1818,6 +2471,7 @@ async fn sync_avatars(shared: Arc<Shared>, client: Arc<Client>) {
     info!(total, "completed bounded WhatsApp avatar sync");
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn download_pending_media(
     shared: Arc<Shared>,
     client: Arc<Client>,
@@ -1881,14 +2535,15 @@ async fn download_pending_media(
     .filter(|changed| std::future::ready(*changed))
     .count()
     .await;
-    if downloaded > 0
-        && let Some(chat_jid) = shared.active_chat.read().await.clone()
-    {
-        broadcast_messages(&shared, &chat_jid);
+    if downloaded > 0 {
+        for chat_jid in shared.lease_state().active_chats {
+            broadcast_messages(&shared, &chat_jid);
+        }
     }
     info!(downloaded, "cached WhatsApp history media");
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn backfill_video_previews(shared: Arc<Shared>) {
     let media_dir = shared.media_dir.clone();
     match tokio::task::spawn_blocking(move || assets::backfill_message_video_thumbnails(&media_dir))
@@ -1896,10 +2551,10 @@ async fn backfill_video_previews(shared: Arc<Shared>) {
     {
         Ok(Ok(generated)) => {
             info!(generated, "generated missing video previews");
-            if generated > 0
-                && let Some(chat_jid) = shared.active_chat.read().await.clone()
-            {
-                broadcast_messages(&shared, &chat_jid);
+            if generated > 0 {
+                for chat_jid in shared.lease_state().active_chats {
+                    broadcast_messages(&shared, &chat_jid);
+                }
             }
         }
         Ok(Err(error)) => warn!(%error, "could not scan cached videos for missing previews"),
@@ -1907,6 +2562,7 @@ async fn backfill_video_previews(shared: Arc<Shared>) {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn request_missing_contact_history(shared: Arc<Shared>, client: Arc<Client>) {
     if shared.contact_history_marker.exists() {
         return;
@@ -2277,21 +2933,45 @@ fn event_diagnostic(event: &Event) -> String {
     match event {
         Event::RawNode(node) => format!("RawNode({node:?})"),
         Event::Notification(node) => format!("Notification({node:?})"),
-        _ => serde_json::to_string(event).unwrap_or_else(|error| {
-            format!(
-                "{{\"event_kind\":\"{:?}\",\"serialization_error\":{}}}",
-                event.kind(),
-                serde_json::to_string(&error.to_string()).unwrap_or_else(|_| "null".to_owned())
-            )
-        }),
+        _ => serialized_event_diagnostic(event),
     }
+}
+
+// Serialization failures depend on serde implementations in the upstream SDK;
+// the raw-node policies and successful full-payload logging remain measured.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn serialized_event_diagnostic(event: &Event) -> String {
+    serde_json::to_string(event).unwrap_or_else(|error| {
+        format!(
+            "{{\"event_kind\":\"{:?}\",\"serialization_error\":{}}}",
+            event.kind(),
+            serde_json::to_string(&error.to_string()).unwrap_or_else(|_| "null".to_owned())
+        )
+    })
 }
 
 fn log_whatsapp_event(event: &Event) {
     info!(event = %event_diagnostic(event), "received WhatsApp event");
 }
 
-async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Client>) {
+// Upstream event variants terminate in SDK queries, acknowledgements, and
+// transport writes. Pure decoding, durable reduction, identity, and state
+// transition helpers used by this adapter remain instrumented and unit tested.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn handle_app_event(
+    shared: Arc<Shared>,
+    generation: u64,
+    event: Arc<Event>,
+    client: Arc<Client>,
+    jobs: Arc<GenerationJobs>,
+) {
+    if !shared.clock.is_current(generation) {
+        return;
+    }
+    shared.app_state_activity_ms.store(
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
+        Ordering::Relaxed,
+    );
     match &*event {
         Event::Receipt(receipt) => {
             let receipt_type = receipt.r#type.as_wire_str();
@@ -2372,15 +3052,13 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                     receipt.timestamp.timestamp(),
                 ) {
                     Ok(true) => {
-                        let _ = shared
-                            .events
-                            .send(ServerFrame::event(ServerEvent::Receipts {
-                                message_ids: receipt.message_ids.clone(),
-                                receipt: state,
-                                timestamp: receipt.timestamp.timestamp(),
-                                delivery,
-                                reader,
-                            }));
+                        shared.publish(ServerEvent::Receipts {
+                            message_ids: receipt.message_ids.clone(),
+                            receipt: state,
+                            timestamp: receipt.timestamp.timestamp(),
+                            delivery,
+                            reader,
+                        });
                     }
                     Ok(false) => {}
                     Err(error) => warn!(%error, "could not persist WhatsApp receipts"),
@@ -2406,24 +3084,20 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                 .or_else(|| shared.database.chat_name(&sender_jid).ok().flatten())
                 .filter(|name| name != &sender_jid)
                 .unwrap_or_default();
-            let _ = shared
-                .events
-                .send(ServerFrame::event(ServerEvent::ChatState {
-                    chat_jid,
-                    sender_jid,
-                    sender_name,
-                    state,
-                }));
+            shared.publish(ServerEvent::ChatState {
+                chat_jid,
+                sender_jid,
+                sender_name,
+                state,
+            });
         }
         Event::Presence(update) => {
             let jid = canonical_contact_jid(&shared, &client, &update.from).await;
-            let _ = shared
-                .events
-                .send(ServerFrame::event(ServerEvent::Presence {
-                    jid,
-                    available: !update.unavailable,
-                    last_seen: update.last_seen.map(|last_seen| last_seen.timestamp()),
-                }));
+            shared.publish(ServerEvent::Presence {
+                jid,
+                available: !update.unavailable,
+                last_seen: update.last_seen.map(|last_seen| last_seen.timestamp()),
+            });
         }
         Event::PictureUpdate(update) => {
             let raw = canonical_contact_jid(&shared, &client, &update.jid).await;
@@ -2436,17 +3110,17 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                 }
                 shared.avatars_changed();
             } else {
-                tokio::spawn(refresh_avatar(shared, client, jid, true));
+                jobs.spawn(refresh_avatar(shared, client, jid, true));
             }
         }
         Event::ContactUpdated(update) => {
-            tokio::spawn(refresh_avatar(
+            jobs.spawn(refresh_avatar(
                 Arc::clone(&shared),
                 Arc::clone(&client),
                 update.jid.clone(),
                 true,
             ));
-            tokio::spawn(sync_missing_contact_names(shared, client));
+            jobs.spawn(sync_missing_contact_names(shared, client));
         }
         Event::ContactNumberChanged(update) => {
             let old = update.old_jid.to_non_ad_string();
@@ -2465,7 +3139,7 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                 warn!(%error, %old, %new, "could not migrate changed WhatsApp number");
             }
             assets::remove_avatar(&shared.avatar_dir, &old);
-            tokio::spawn(refresh_avatar(
+            jobs.spawn(refresh_avatar(
                 Arc::clone(&shared),
                 client,
                 update.new_jid.clone(),
@@ -2474,7 +3148,7 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
             broadcast_snapshot(&shared);
         }
         Event::ContactSyncRequested(_) => {
-            tokio::spawn(sync_missing_contact_names(shared, client));
+            jobs.spawn(sync_missing_contact_names(shared, client));
         }
         Event::IncomingCall(call) => {
             let action = call.action.wire_tag();
@@ -2512,7 +3186,7 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
         }
         Event::SelfPushNameUpdated(update) => {
             info!(old = %update.old_name, new = %update.new_name, "own WhatsApp profile name changed");
-            if shared.presence_available.load(Ordering::SeqCst)
+            if shared.lease_state().available
                 && !update.new_name.is_empty()
                 && let Err(error) = client.presence().set_available().await
             {
@@ -2522,7 +3196,10 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
         Event::PinUpdate(update) => {
             let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
             if let Some(pinned) = update.action.pinned
-                && let Err(error) = shared.database.apply_pin(&jid, pinned)
+                && let Err(error) =
+                    shared
+                        .database
+                        .apply_pin_at(&jid, pinned, update.timestamp.timestamp())
             {
                 warn!(%error, "could not apply WhatsApp pin state");
             }
@@ -2531,10 +3208,11 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
         Event::MuteUpdate(update) => {
             let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
             if let Some(muted) = update.action.muted
-                && let Err(error) = shared.database.apply_mute(
+                && let Err(error) = shared.database.apply_mute_at(
                     &jid,
                     muted,
                     update.action.mute_end_timestamp.unwrap_or(0),
+                    update.timestamp.timestamp(),
                 )
             {
                 warn!(%error, "could not apply WhatsApp mute state");
@@ -2543,7 +3221,10 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
         Event::ArchiveUpdate(update) => {
             let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
             if let Some(archived) = update.action.archived
-                && let Err(error) = shared.database.apply_archive(&jid, archived)
+                && let Err(error) =
+                    shared
+                        .database
+                        .apply_archive_at(&jid, archived, update.timestamp.timestamp())
             {
                 warn!(%error, "could not apply WhatsApp archive state");
             }
@@ -2552,9 +3233,12 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
         Event::StarUpdate(update) => {
             let jid = canonical_contact_jid(&shared, &client, &update.chat_jid).await;
             if let Some(starred) = update.action.starred
-                && let Err(error) = shared
-                    .database
-                    .star_message(&jid, &update.message_id, starred)
+                && let Err(error) = shared.database.star_message_at(
+                    &jid,
+                    &update.message_id,
+                    starred,
+                    update.timestamp.timestamp(),
+                )
             {
                 warn!(%error, "could not apply WhatsApp star state");
             }
@@ -2615,7 +3299,11 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
         }
         Event::UserStatusMuteUpdate(update) => {
             let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
-            if let Err(error) = shared.database.apply_status_mute(&jid, update.muted) {
+            if let Err(error) = shared.database.apply_status_mute_at(
+                &jid,
+                update.muted,
+                update.timestamp.timestamp(),
+            ) {
                 warn!(%error, "could not apply WhatsApp status mute");
             }
         }
@@ -2651,16 +3339,16 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
         Event::OfflineSyncCompleted(details) => {
             info!(count = details.count, "WhatsApp offline sync completed");
             broadcast_snapshot(&shared);
-            tokio::spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
+            jobs.spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
         }
         Event::DirtyState(details) => {
             info!(kind = ?details.dirty_type, "WhatsApp requested derived-state refresh");
-            tokio::spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
-            tokio::spawn(sync_missing_contact_names(
+            jobs.spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
+            jobs.spawn(sync_missing_contact_names(
                 Arc::clone(&shared),
                 Arc::clone(&client),
             ));
-            tokio::spawn(sync_avatars(shared, client));
+            jobs.spawn(sync_avatars(shared, client));
         }
         Event::IdentityChange(change) => {
             notification::send_event(
@@ -2680,7 +3368,7 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
                 warn!(%error, "could not update WhatsApp business name");
             }
             broadcast_chats(&shared);
-            tokio::spawn(refresh_avatar(shared, client, update.jid.clone(), true));
+            jobs.spawn(refresh_avatar(shared, client, update.jid.clone(), true));
         }
         Event::StreamReplaced(_) => {
             *shared.client.write().await = None;
@@ -2780,6 +3468,7 @@ async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Cl
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn subscribe_live_location(client: &Client, target: Jid, is_group: bool) -> Result<()> {
     let subscribe = if is_group {
         NodeBuilder::new("subscribe")
@@ -2806,6 +3495,7 @@ async fn subscribe_live_location(client: &Client, target: Jid, is_group: bool) -
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn restore_live_location_subscriptions(shared: Arc<Shared>, client: Arc<Client>) {
     let targets = match shared
         .database
@@ -2828,6 +3518,7 @@ async fn restore_live_location_subscriptions(shared: Arc<Shared>, client: Arc<Cl
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn maintain_live_location_subscriptions(shared: Arc<Shared>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(25));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2840,6 +3531,7 @@ async fn maintain_live_location_subscriptions(shared: Arc<Shared>) {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn bind_private_listener(socket: &Path) -> Result<UnixListener> {
     match std::fs::symlink_metadata(socket) {
         Ok(metadata) => {
@@ -2877,8 +3569,18 @@ async fn bind_private_listener(socket: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// Process/bootstrap wiring is exercised by the isolated daemon and deployment
+// smoke suites; local reducers and IPC semantics are measured independently.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_daemon())
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_daemon() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -2931,13 +3633,15 @@ async fn main() -> Result<()> {
     let listener = bind_private_listener(&paths.socket).await?;
 
     let (events, _) = broadcast::channel(256);
+    let (message_reducer, message_queue) = mpsc::channel(4_096);
+    let (app_event_reducer, app_event_queue) = mpsc::channel(4_096);
     let shared = Arc::new(Shared {
-        database: Database::open(&paths.history_db)?,
+        database: Arc::new(Database::open(&paths.history_db)?),
         status: RwLock::new(ConnectionStatus::Starting),
         client: RwLock::new(None),
-        active_chat: RwLock::new(None),
-        presence_available: AtomicBool::new(false),
         events,
+        clock: revisions::RevisionClock::default(),
+        leases: StdMutex::new(leases::LeaseBook::default()),
         pairing_qr: paths.runtime_dir.join("pairing.svg"),
         contact_sync_marker: paths.state_dir.join("contact-names-v2"),
         contact_history_marker: paths.state_dir.join("contact-history-names-v1"),
@@ -2947,6 +3651,7 @@ async fn main() -> Result<()> {
         voice_outbox_dir,
         avatar_revision: AtomicU64::new(0),
         app_state_failed: AtomicBool::new(false),
+        app_state_activity_ms: AtomicU64::new(0),
         chat_state_resync: RwLock::new((ChatStateResyncStatus::Idle, None)),
         chat_state_resync_requested: AtomicBool::new(false),
         chat_state_resync_notify: Notify::new(),
@@ -2956,10 +3661,22 @@ async fn main() -> Result<()> {
         media_recovery_requested: RwLock::new(HashSet::new()),
         media_downloads: Mutex::new(HashSet::new()),
         voice_outbox_gate: Mutex::new(()),
+        text_outbox_gate: Mutex::new(()),
+        read_outbox_gate: Mutex::new(()),
+        text_outbox_notify: Notify::new(),
+        read_outbox_notify: Notify::new(),
+        command_gates: Mutex::new(HashMap::new()),
+        message_reducer,
+        app_event_reducer,
     });
 
     tokio::spawn(backfill_video_previews(Arc::clone(&shared)));
     tokio::spawn(maintain_live_location_subscriptions(Arc::clone(&shared)));
+    tokio::spawn(run_text_outbox(Arc::clone(&shared)));
+    tokio::spawn(run_read_outbox(Arc::clone(&shared)));
+    tokio::spawn(maintain_connection_leases(Arc::clone(&shared)));
+    tokio::spawn(run_message_reducer(Arc::clone(&shared), message_queue));
+    tokio::spawn(run_app_event_reducer(Arc::clone(&shared), app_event_queue));
 
     let ipc_shared = Arc::clone(&shared);
     let mut ipc_task = tokio::spawn(async move { serve(listener, ipc_shared).await });
@@ -2968,7 +3685,10 @@ async fn main() -> Result<()> {
     // window expires. Keep the lightweight daemon and its IPC socket alive,
     // rebuilding only the protocol client so the UI receives a fresh code.
     loop {
+        let generation = shared.clock.begin_generation();
+        let generation_jobs = Arc::new(GenerationJobs::default());
         shared.app_state_failed.store(false, Ordering::Relaxed);
+        shared.app_state_activity_ms.store(0, Ordering::Relaxed);
         if let Err(error) =
             prepare_contact_name_resync(&paths.protocol_db, &shared.contact_sync_marker)
         {
@@ -3003,9 +3723,18 @@ async fn main() -> Result<()> {
         let app_event_shared = Arc::clone(&shared);
         let message_shared = Arc::clone(&shared);
         let fast_ratchet_shared = Arc::clone(&shared);
+        let connected_jobs = Arc::clone(&generation_jobs);
+        let history_jobs = Arc::clone(&generation_jobs);
+        let contact_jobs = Arc::clone(&generation_jobs);
+        let group_jobs = Arc::clone(&generation_jobs);
+        let app_event_jobs = Arc::clone(&generation_jobs);
 
         let bot = Bot::builder()
             .with_backend(store)
+            .with_event_delivery(EventDelivery::Ordered { capacity: 4_096 })
+            .with_inbound_durability_hook(inbound::DurableInboundHook::new(Arc::clone(
+                &shared.database,
+            )))
             .with_device_props(
                 DevicePropsOverride::new()
                     .with_os("Linux")
@@ -3021,6 +3750,9 @@ async fn main() -> Result<()> {
             .on_qr_code(move |code, timeout| {
                 let shared = Arc::clone(&qr_shared);
                 async move {
+                    if !shared.clock.is_current(generation) {
+                        return;
+                    }
                     shared
                         .set_status(ConnectionStatus::Pairing {
                             code,
@@ -3032,99 +3764,53 @@ async fn main() -> Result<()> {
             })
             .on_connected(move |client| {
                 let shared = Arc::clone(&connected_shared);
+                let connected_jobs = Arc::clone(&connected_jobs);
                 async move {
+                    if !shared.clock.is_current(generation) {
+                        return;
+                    }
                     *shared.client.write().await = Some(Arc::clone(&client));
                     shared.set_status(ConnectionStatus::Connected).await;
                     info!("connected to WhatsApp");
-                    if shared.presence_available.load(Ordering::SeqCst)
-                        && !client.push_name().is_empty()
-                        && let Err(error) = client.presence().set_available().await
-                    {
-                        warn!(%error, "could not restore available WhatsApp presence");
+                    if let Err(error) = shared.database.retry_all_text_messages() {
+                        warn!(%error, "could not re-arm failed text messages after reconnect");
                     }
-                    if let Some(active_chat) = shared.active_chat.read().await.clone()
-                        && let Ok(jid) = active_chat.parse::<Jid>()
-                        && !jid.is_group()
-                        && let Err(error) = client.presence().subscribe(jid).await
-                    {
-                        warn!(%error, "could not restore active-chat presence subscription");
-                    }
+                    shared.text_outbox_notify.notify_one();
+                    shared.read_outbox_notify.notify_one();
+                    let _ = shared
+                        .message_reducer
+                        .send(MessageWork::Drain {
+                            generation,
+                            client: Arc::clone(&client),
+                        })
+                        .await;
+                    let connected_shared = Arc::clone(&shared);
+                    connected_jobs.spawn(async move {
+                        let intent = connected_shared.lease_state();
+                        reconcile_connection_intent(
+                            &connected_shared,
+                            &leases::LeaseState::default(),
+                            &intent,
+                        )
+                        .await;
+                    });
                     let alias_shared = Arc::clone(&shared);
                     let alias_client = Arc::clone(&client);
-                    tokio::spawn(async move {
+                    connected_jobs.spawn(async move {
                         reconcile_direct_chat_aliases(&alias_shared, &alias_client).await;
                         broadcast_snapshot(&alias_shared);
                     });
                     if !shared.event_sync_marker.exists() {
-                        let marker_shared = Arc::clone(&shared);
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                            if !marker_shared.app_state_failed.load(Ordering::Relaxed) {
-                                let result = marker_shared
-                                    .database
-                                    .reconcile_unread_after_full_sync();
-                                match result {
-                                    Ok(changed) => {
-                                        info!(changed, "reconciled imported unread counters with full app-state");
-                                        broadcast_snapshot(&marker_shared);
-                                        marker_shared.mark_event_sync_complete();
-                                        if marker_shared
-                                            .chat_state_resync_requested
-                                            .swap(false, Ordering::SeqCst)
-                                        {
-                                            let (status, message) = if marker_shared
-                                                .event_sync_marker
-                                                .exists()
-                                            {
-                                                (
-                                                    ChatStateResyncStatus::Succeeded,
-                                                    Some(
-                                                        "WhatsApp chat state is up to date"
-                                                            .to_owned(),
-                                                    ),
-                                                )
-                                            } else {
-                                                (
-                                                    ChatStateResyncStatus::Failed,
-                                                    Some(
-                                                        "WhatsApp did not finish the chat-state replay"
-                                                            .to_owned(),
-                                                    ),
-                                                )
-                                            };
-                                            marker_shared
-                                                .set_chat_state_resync(status, message)
-                                                .await;
-                                        }
-                                    }
-                                    Err(error) => {
-                                        warn!(%error, "could not reconcile WhatsApp unread counters");
-                                        if marker_shared
-                                            .chat_state_resync_requested
-                                            .swap(false, Ordering::SeqCst)
-                                        {
-                                            marker_shared
-                                                .set_chat_state_resync(
-                                                    ChatStateResyncStatus::Failed,
-                                                    Some(
-                                                        "Could not reconcile the replayed WhatsApp chat state"
-                                                            .to_owned(),
-                                                    ),
-                                                )
-                                                .await;
-                                        }
-                                    }
-                                }
-                            }
-                        });
+                        connected_jobs.spawn(await_app_state_sync(Arc::clone(&shared), generation));
                     }
-                    tokio::spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
-                    tokio::spawn(sync_avatars(Arc::clone(&shared), Arc::clone(&client)));
-                    tokio::spawn(restore_live_location_subscriptions(
+                    connected_jobs
+                        .spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
+                    connected_jobs.spawn(sync_avatars(Arc::clone(&shared), Arc::clone(&client)));
+                    connected_jobs.spawn(restore_live_location_subscriptions(
                         Arc::clone(&shared),
                         Arc::clone(&client),
                     ));
-                    tokio::spawn(async move {
+                    connected_jobs.spawn(async move {
                         sync_missing_contact_names(Arc::clone(&shared), Arc::clone(&client)).await;
                         request_missing_contact_history(shared, client).await;
                     });
@@ -3133,6 +3819,9 @@ async fn main() -> Result<()> {
             .on_logged_out(move |_details| {
                 let shared = Arc::clone(&logged_out_shared);
                 async move {
+                    if !shared.clock.is_current(generation) {
+                        return;
+                    }
                     *shared.client.write().await = None;
                     shared.set_status(ConnectionStatus::LoggedOut).await;
                     warn!("WhatsApp device was logged out");
@@ -3147,6 +3836,9 @@ async fn main() -> Result<()> {
                 move |event, _client| {
                     let shared = Arc::clone(&disconnected_shared);
                     async move {
+                        if !shared.clock.is_current(generation) {
+                            return;
+                        }
                         let reason = match &*event {
                             Event::Disconnected(details) => format!("{:?}", details.reason),
                             Event::ConnectFailure(details) => format!("{:?}", details.reason),
@@ -3162,118 +3854,84 @@ async fn main() -> Result<()> {
             )
             .on_event_for(&[EventKind::HistorySync], move |event, client| {
                 let shared = Arc::clone(&history_shared);
+                let history_jobs = Arc::clone(&history_jobs);
                 async move {
-                    let ingest_shared = Arc::clone(&shared);
-                    let own_pn = client.pn().map(|jid| jid.to_non_ad_string());
-                    let result = tokio::task::spawn_blocking(move || match &*event {
-                        Event::HistorySync(history) => {
-                            ingest_shared.ingest_history(history, own_pn.as_deref())
-                        }
-                        _ => Ok(Vec::new()),
-                    })
-                    .await;
-                    match result {
-                        Ok(Ok(pending_media)) => {
-                            if let Ok(chats) =
-                                list_chats_with_phone_numbers(&shared, CHAT_LIST_LIMIT).await
-                            {
-                                let _ = shared
-                                    .events
-                                    .send(ServerFrame::event(ServerEvent::Chats { chats }));
-                            }
-                            let total = shared.unread_total_or_zero();
-                            let _ = shared
-                                .events
-                                .send(ServerFrame::event(ServerEvent::Unread { total }));
-                            tokio::spawn(sync_avatars(
-                                Arc::clone(&shared),
-                                Arc::clone(&client),
-                            ));
-                            tokio::spawn(restore_live_location_subscriptions(
-                                Arc::clone(&shared),
-                                Arc::clone(&client),
-                            ));
-                            let names_shared = Arc::clone(&shared);
-                            let names_client = Arc::clone(&client);
-                            tokio::spawn(async move {
-                                sync_missing_contact_names(
-                                    Arc::clone(&names_shared),
-                                    Arc::clone(&names_client),
-                                )
-                                .await;
-                                request_missing_contact_history(names_shared, names_client).await;
-                            });
-                            if !pending_media.is_empty() {
-                                tokio::spawn(download_pending_media(
-                                    Arc::clone(&shared),
-                                    Arc::clone(&client),
-                                    pending_media,
-                                ));
-                            }
-                        }
-                        Ok(Err(error)) => error!(%error, "could not ingest history sync"),
-                        Err(error) => error!(%error, "history sync worker panicked"),
+                    if !shared.clock.is_current(generation) {
+                        return;
                     }
+                    history_jobs.spawn(process_history_event(
+                        shared,
+                        generation,
+                        event,
+                        client,
+                        Arc::clone(&history_jobs),
+                    ));
                 }
             })
             .on_event_for(&[EventKind::ContactUpdate], move |event, client| {
                 let shared = Arc::clone(&contact_shared);
+                let contact_jobs = Arc::clone(&contact_jobs);
                 async move {
-                    if let Event::ContactUpdate(update) = &*event {
-                        ingest_contact_name(&shared, update);
-                        canonical_contact_jid(&shared, &client, &update.jid).await;
+                    if !shared.clock.is_current(generation) {
+                        return;
                     }
+                    contact_jobs.spawn(process_contact_event(shared, generation, event, client));
                 }
             })
             .on_event_for(&[EventKind::GroupUpdate], move |event, client| {
                 let shared = Arc::clone(&group_shared);
+                let group_jobs = Arc::clone(&group_jobs);
                 async move {
-                    let Event::GroupUpdate(update) = &*event else {
+                    if !shared.clock.is_current(generation) {
                         return;
-                    };
-                    match client.groups().get_metadata(&update.group_jid).await {
-                        Ok(metadata) => {
-                            let participant_jids = metadata
-                                .participants
-                                .into_iter()
-                                .map(|participant| {
-                                    participant.phone_number.unwrap_or(participant.jid)
-                                })
-                                .collect();
-                            match shared.database.update_group_name(
-                                &update.group_jid.to_non_ad_string(),
-                                &metadata.subject,
-                            ) {
-                                Ok(true) => broadcast_chats(&shared),
-                                Ok(false) => {}
-                                Err(error) => {
-                                    warn!(%error, "could not update WhatsApp group subject");
-                                }
-                            }
-                            let chat_jid = update.group_jid.to_non_ad_string();
-                            let participants = resolve_group_participants(
-                                &shared,
-                                &client,
-                                participant_jids,
-                            )
-                            .await;
-                            let _ = shared.events.send(ServerFrame::event(
-                                ServerEvent::GroupParticipants {
-                                    chat_jid,
-                                    participants,
-                                },
-                            ));
-                        }
-                        Err(error) => warn!(%error, "could not refresh WhatsApp group metadata"),
                     }
+                    group_jobs.spawn(process_group_event(shared, generation, event, client));
                 }
             })
             .on_event_for(APP_EVENT_KINDS, move |event, client| {
-                handle_app_event(Arc::clone(&app_event_shared), event, client)
+                let shared = Arc::clone(&app_event_shared);
+                let app_event_jobs = Arc::clone(&app_event_jobs);
+                async move {
+                    if !shared.clock.is_current(generation) {
+                        return;
+                    }
+                    if let Err(error) = shared
+                        .app_event_reducer
+                        .send(AppEventWork {
+                            generation,
+                            event,
+                            client,
+                            jobs: Arc::clone(&app_event_jobs),
+                        })
+                        .await
+                    {
+                        error!(%error, "ordered app-event reducer stopped");
+                    }
+                }
             })
             .on_message(move |context| {
                 let shared = Arc::clone(&message_shared);
-                async move { shared.receive_message(context).await }
+                async move {
+                    if !shared.clock.is_current(generation) {
+                        return;
+                    }
+                    let key = inbound::InboundKey {
+                        chat_jid: context.info.source.chat.to_string(),
+                        sender_jid: context.info.source.sender.to_string(),
+                        message_id: context.info.id.clone(),
+                    };
+                    if let Err(error) = shared
+                        .message_reducer
+                        .send(MessageWork::Live {
+                            generation,
+                            context: Box::new(context),
+                            key,
+                        })
+                        .await
+                    {
+                        error!(%error, "ordered message reducer stopped");
+                    }
+                }
             })
             .build()
             .await
@@ -3309,9 +3967,20 @@ async fn main() -> Result<()> {
                 bail!("IPC server stopped unexpectedly");
             }
         };
+        shared.clock.retire_generation(generation);
+        generation_jobs.abort_all();
         if !restart {
             break;
         }
+        let (barrier, drained) = oneshot::channel();
+        shared
+            .message_reducer
+            .send(MessageWork::Barrier(barrier))
+            .await
+            .context("ordered message reducer stopped before generation barrier")?;
+        drained
+            .await
+            .context("ordered message reducer dropped the generation barrier")?;
         *shared.client.write().await = None;
         if shared.logout_requested.swap(false, Ordering::SeqCst) {
             clear_local_account_data(&paths, &shared)
@@ -3335,6 +4004,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn serve(listener: UnixListener, shared: Arc<Shared>) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -3347,39 +4017,116 @@ async fn serve(listener: UnixListener, shared: Arc<Shared>) -> Result<()> {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn reconcile_connection_intent(
+    shared: &Shared,
+    before: &leases::LeaseState,
+    after: &leases::LeaseState,
+) {
+    let Some(client) = shared.client.read().await.clone() else {
+        return;
+    };
+    if before.available != after.available {
+        let result = if after.available {
+            if client.push_name().is_empty() {
+                Ok(())
+            } else {
+                client.presence().set_available().await
+            }
+        } else {
+            client.presence().set_unavailable().await
+        };
+        if let Err(error) = result {
+            warn!(%error, available = after.available, "could not reconcile leased WhatsApp presence");
+        }
+    }
+    for raw in before.active_chats.difference(&after.active_chats) {
+        if let Ok(jid) = raw.parse::<Jid>()
+            && !jid.is_group()
+            && let Err(error) = client.presence().unsubscribe(&jid).await
+        {
+            warn!(%error, %jid, "could not unsubscribe expired active-chat presence");
+        }
+    }
+    for raw in after.active_chats.difference(&before.active_chats) {
+        if let Ok(jid) = raw.parse::<Jid>()
+            && !jid.is_group()
+            && let Err(error) = client.presence().subscribe(jid.clone()).await
+        {
+            warn!(%error, %jid, "could not subscribe leased active-chat presence");
+        }
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn maintain_connection_leases(shared: Arc<Shared>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let now = Utc::now().timestamp();
+        let transition = {
+            let mut leases = shared
+                .leases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = leases.state(now);
+            let expired = leases.expire(now);
+            (!expired.is_empty()).then(|| (before, leases.state(now), expired))
+        };
+        if let Some((before, after, expired)) = transition {
+            debug!(?expired, "expired stale IPC connection leases");
+            reconcile_connection_intent(&shared, &before, &after).await;
+        }
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn write_connection_sync(
     write: &mut tokio::net::unix::OwnedWriteHalf,
     shared: &Shared,
 ) -> Result<()> {
     write_frame(
         write,
-        &ServerFrame::event(ServerEvent::Hello {
-            protocol_version: PROTOCOL_VERSION,
-        }),
+        &shared.response(
+            None,
+            ServerEvent::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        ),
     )
     .await?;
-    write_frame(write, &ServerFrame::event(shared.state_event().await)).await?;
+    write_frame(write, &shared.response(None, shared.state_event().await)).await?;
     write_frame(
         write,
-        &ServerFrame::event(shared.chat_state_resync_event().await),
+        &shared.response(None, shared.chat_state_resync_event().await),
     )
     .await
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()> {
+    let connection_id = shared.open_connection_lease();
+    let result = serve_connection_inner(stream, Arc::clone(&shared), connection_id).await;
+    let (before, after) = shared.close_connection_lease(connection_id);
+    reconcile_connection_intent(&shared, &before, &after).await;
+    result
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn serve_connection_inner(
+    stream: UnixStream,
+    shared: Arc<Shared>,
+    connection_id: u64,
+) -> Result<()> {
     let (read, mut write) = stream.into_split();
     // Bound memory even if another process owned by the same user sends a line
     // without a delimiter. Normal commands are only a few kilobytes.
     let mut lines = FramedRead::new(read, LinesCodec::new_with_max_length(128 * 1024));
     let mut events = shared.events.subscribe();
-    let (commands, command_queue) = mpsc::channel::<(Option<u64>, Command)>(32);
     let (responses, mut response_queue) = mpsc::channel::<ServerFrame>(32);
-    let command_shared = Arc::clone(&shared);
-    tokio::spawn(process_command_queue(
-        command_queue,
-        responses,
-        command_shared,
-    ));
+    let permits = Arc::new(Semaphore::new(jobs::MAX_CONNECTION_JOBS));
+    let mut command_jobs = JoinSet::new();
     write_connection_sync(&mut write, &shared).await?;
 
     loop {
@@ -3390,18 +4137,53 @@ async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()>
                 let frame = match serde_json::from_str::<ClientFrame>(&line) {
                     Ok(frame) => frame,
                     Err(error) => {
-                        write_frame(&mut write, &ServerFrame::response(None, ServerEvent::Error {
+                        write_frame(&mut write, &shared.response(None, ServerEvent::Error {
                             message: format!("invalid request: {error}"),
                         })).await?;
                         continue;
                     }
                 };
+                shared.touch_connection_lease(connection_id);
                 let id = frame.id;
-                if commands.try_send((id, frame.command)).is_err() {
-                    write_frame(&mut write, &ServerFrame::response(id, ServerEvent::Error {
-                        message: "too many queued requests".to_owned(),
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    write_frame(&mut write, &shared.response(id, ServerEvent::Error {
+                        message: "too many active requests".to_owned(),
                     })).await?;
-                }
+                    continue;
+                };
+                let timeout = jobs::timeout(&frame.command);
+                let conflict_key = jobs::conflict_key(&frame.command);
+                let command_shared = Arc::clone(&shared);
+                let command_responses = responses.clone();
+                command_jobs.spawn(async move {
+                    let _permit = permit;
+                    let gate = if let Some(key) = conflict_key {
+                        Some(command_shared.command_gate(&key).await)
+                    } else {
+                        None
+                    };
+                    let _gate = if let Some(gate) = &gate {
+                        Some(gate.lock().await)
+                    } else {
+                        None
+                    };
+                    let event = match tokio::time::timeout(
+                        timeout,
+                        handle_command(frame.command, &command_shared, connection_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(event)) => event,
+                        Ok(Err(error)) => ServerEvent::Error {
+                            message: error.to_string(),
+                        },
+                        Err(_) => ServerEvent::Error {
+                            message: "request timed out".to_owned(),
+                        },
+                    };
+                    let response = command_shared.response(id, event);
+                    let _ = command_responses.send(response).await;
+                });
             },
             event = events.recv() => match event {
                 Ok(event) => write_frame(&mut write, &event).await?,
@@ -3417,30 +4199,24 @@ async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()>
                 let Some(response) = response else { return Ok(()); };
                 write_frame(&mut write, &response).await?;
             },
+            completed = command_jobs.join_next(), if !command_jobs.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    debug!(%error, "IPC command job stopped unexpectedly");
+                }
+            },
         }
     }
 }
 
-async fn process_command_queue(
-    mut commands: mpsc::Receiver<(Option<u64>, Command)>,
-    responses: mpsc::Sender<ServerFrame>,
-    shared: Arc<Shared>,
-) {
-    while let Some((id, command)) = commands.recv().await {
-        let event = handle_command(command, &shared)
-            .await
-            .unwrap_or_else(|error| ServerEvent::Error {
-                message: error.to_string(),
-            });
-        let _ = responses.send(ServerFrame::response(id, event)).await;
-    }
-}
-
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn write_frame(
     write: &mut tokio::net::unix::OwnedWriteHalf,
     frame: &ServerFrame,
 ) -> Result<()> {
     let mut json = serde_json::to_vec(frame)?;
+    if json.len() > jobs::MAX_IPC_FRAME_BYTES {
+        bail!("IPC frame exceeds the 16 MiB byte budget");
+    }
     json.push(b'\n');
     write.write_all(&json).await?;
     Ok(())
@@ -3457,6 +4233,7 @@ async fn canonical_requested_jid(shared: &Shared, raw: &str) -> String {
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn media_download_payload(
     shared: &Arc<Shared>,
     client: &Arc<Client>,
@@ -3499,6 +4276,7 @@ async fn media_download_payload(
     bail!("WhatsApp did not return download details for this {media_label}")
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn request_exact_message(
     client: &Arc<Client>,
     cursor: &database::HistoryCursor,
@@ -3545,7 +4323,15 @@ async fn finish_media_recovery_attempt(shared: &Shared, chat_jid: &str, succeede
         .remove(chat_jid)
 }
 
-async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<ServerEvent> {
+// IPC command-to-SDK dispatch is the outbound transport adapter. Command
+// identity, deadlines, serialization, durable state machines, and response
+// convergence are covered in their dedicated modules and IPC tests.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn handle_command(
+    command: Command,
+    shared: &Arc<Shared>,
+    connection_id: u64,
+) -> Result<ServerEvent> {
     match command {
         Command::GetState => Ok(shared.state_event().await),
         Command::ListChats { limit } => Ok(ServerEvent::Chats {
@@ -3593,11 +4379,21 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                     {
                         let recovery_chat_jid = chat_jid.clone();
                         let recovery_shared = Arc::clone(shared);
+                        let generation = shared.clock.generation();
                         tokio::spawn(async move {
                             let exact_result = request_exact_message(&client, &cursor).await;
                             if let Err(error) = &exact_result {
                                 warn!(%error, %jid, message_id = %cursor.message_id,
                                     "could not request exact media recovery");
+                            }
+                            if !recovery_shared.clock.is_current(generation) {
+                                finish_media_recovery_attempt(
+                                    &recovery_shared,
+                                    &recovery_chat_jid,
+                                    false,
+                                )
+                                .await;
+                                return;
                             }
                             let history_result = client
                                 .fetch_message_history(
@@ -3610,6 +4406,15 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                                 .await;
                             if let Err(error) = &history_result {
                                 warn!(%error, %jid, "could not request media history recovery");
+                            }
+                            if !recovery_shared.clock.is_current(generation) {
+                                finish_media_recovery_attempt(
+                                    &recovery_shared,
+                                    &recovery_chat_jid,
+                                    false,
+                                )
+                                .await;
+                                return;
                             }
                             finish_media_recovery_attempt(
                                 &recovery_shared,
@@ -3625,60 +4430,25 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 first_unread_message_id,
             })
         }
-        Command::SendMessage { chat_jid, text } => {
-            let text = text.trim().to_owned();
-            if text.is_empty() {
-                bail!("message cannot be empty");
-            }
-            if text.len() > 65_536 {
-                bail!("message is too large");
-            }
-            let client = shared
-                .client
-                .read()
-                .await
-                .clone()
-                .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+        Command::SendMessage {
+            chat_jid,
+            text,
+            delivery_id,
+        } => {
+            let _outbox_guard = shared.text_outbox_gate.lock().await;
+            let text = text_outbox::validate(&delivery_id, &text)?;
             let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
-            let canonical = canonical_contact_jid(shared, &client, &requested).await;
-            let jid: Jid = canonical.parse().context("invalid canonical chat JID")?;
-            let result = client
-                .send_message(&jid, wa::Message::text(text.clone()))
-                .await?;
-            let message = Message {
-                id: result.message_id,
-                chat_jid: jid.to_non_ad_string(),
-                sender_jid: "me".into(),
-                sender_name: "You".into(),
-                text,
-                timestamp: Utc::now().timestamp(),
-                from_me: true,
-                receipt: 1,
-                delivered_at: None,
-                read_at: None,
-                delivered_to: Vec::new(),
-                read_by: Vec::new(),
-                media: None,
-                reactions: Vec::new(),
-            };
-            let chat_name = shared
-                .database
-                .chat_name(&message.chat_jid)?
-                .or_else(|| {
-                    shared
-                        .database
-                        .contact_name(&message.chat_jid)
-                        .ok()
-                        .flatten()
-                })
-                .unwrap_or_else(|| message.chat_jid.clone());
-            shared
-                .database
-                .insert_message(&message, &chat_name, jid.is_group(), false)?;
-            let _ = shared.events.send(ServerFrame::event(ServerEvent::Sent {
-                message: message.clone(),
-            }));
-            Ok(ServerEvent::Sent { message })
+            let message_id = text_outbox::stable_message_id(&delivery_id);
+            shared.database.enqueue_text_message(
+                &delivery_id,
+                &requested.to_non_ad_string(),
+                &text,
+                &message_id,
+                Utc::now().timestamp(),
+            )?;
+            broadcast_text_outbox(shared);
+            shared.text_outbox_notify.notify_one();
+            Ok(ServerEvent::TextAccepted { delivery_id })
         }
         Command::SendVoiceMessage {
             chat_jid,
@@ -3831,9 +4601,9 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 shared
                     .database
                     .insert_message(&message, &chat_name, jid.is_group(), false)?;
-                let _ = shared.events.send(ServerFrame::event(ServerEvent::Sent {
+                shared.publish(ServerEvent::Sent {
                     message: message.clone(),
-                }));
+                });
                 Ok(message)
             }
             .await;
@@ -3872,6 +4642,29 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
         Command::ListVoiceOutbox => {
             let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
             voice_outbox_event(shared)
+        }
+        Command::ListTextOutbox => {
+            let _outbox_guard = shared.text_outbox_gate.lock().await;
+            Ok(ServerEvent::TextOutbox {
+                entries: shared.database.text_outbox()?,
+            })
+        }
+        Command::RetryTextMessage { delivery_id } => {
+            let _outbox_guard = shared.text_outbox_gate.lock().await;
+            if !shared.database.retry_text_message(&delivery_id)? {
+                bail!("text message is not waiting for retry");
+            }
+            broadcast_text_outbox(shared);
+            shared.text_outbox_notify.notify_one();
+            Ok(ServerEvent::TextAccepted { delivery_id })
+        }
+        Command::DiscardTextMessage { delivery_id } => {
+            let _outbox_guard = shared.text_outbox_gate.lock().await;
+            if !shared.database.discard_text_message(&delivery_id)? {
+                bail!("text message is sending or is not in the outbox");
+            }
+            broadcast_text_outbox(shared);
+            Ok(ServerEvent::Ack)
         }
         Command::CreatePoll {
             chat_jid,
@@ -3970,9 +4763,9 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 &creator_jid.to_non_ad_string(),
                 &message_secret,
             )?;
-            let _ = shared.events.send(ServerFrame::event(ServerEvent::Sent {
+            shared.publish(ServerEvent::Sent {
                 message: message.clone(),
-            }));
+            });
             Ok(ServerEvent::Sent { message })
         }
         Command::VotePoll {
@@ -4408,43 +5201,17 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             Ok(ServerEvent::Ack)
         }
         Command::MarkRead { chat_jid } => {
+            let _outbox_guard = shared.read_outbox_gate.lock().await;
             let chat_jid = canonical_requested_jid(shared, &chat_jid).await;
             let receipts = shared.database.unread_receipts(&chat_jid)?;
+            shared
+                .database
+                .queue_read_receipts(&chat_jid, &receipts, Utc::now().timestamp())?;
             shared.database.mark_read(&chat_jid)?;
-            if let Some(client) = shared.client.read().await.clone() {
-                let chat: Jid = chat_jid.parse().context("invalid chat JID")?;
-                if receipts.first().is_some_and(|receipt| receipt.is_group) {
-                    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
-                    for receipt in receipts {
-                        grouped
-                            .entry(receipt.sender_jid)
-                            .or_default()
-                            .push(receipt.message_id);
-                    }
-                    for (sender, ids) in grouped {
-                        let sender: Jid = sender.parse().context("invalid sender JID")?;
-                        let refs = ids.iter().map(String::as_str).collect::<Vec<_>>();
-                        client.mark_as_read(&chat, Some(&sender), &refs).await?;
-                    }
-                } else {
-                    let ids = receipts
-                        .iter()
-                        .map(|receipt| receipt.message_id.as_str())
-                        .collect::<Vec<_>>();
-                    if !ids.is_empty() {
-                        client.mark_as_read(&chat, None, &ids).await?;
-                    }
-                }
-                client
-                    .chat_actions()
-                    .mark_chat_as_read(&chat, true, None)
-                    .await?;
-            }
+            shared.read_outbox_notify.notify_one();
             let total = shared.database.unread_total()?;
             broadcast_chats(shared);
-            let _ = shared
-                .events
-                .send(ServerFrame::event(ServerEvent::Unread { total }));
+            shared.publish(ServerEvent::Unread { total });
             Ok(ServerEvent::Ack)
         }
         Command::SetChatPinned { chat_jid, pinned } => {
@@ -4462,7 +5229,9 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             } else {
                 client.chat_actions().unpin_chat(&chat).await?;
             }
-            shared.database.apply_pin(&chat_jid, pinned)?;
+            shared
+                .database
+                .apply_pin_at(&chat_jid, pinned, Utc::now().timestamp())?;
             broadcast_chats(shared);
             Ok(ServerEvent::Ack)
         }
@@ -4476,10 +5245,7 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
             let requested: Jid = jid.parse().context("invalid avatar JID")?;
             let canonical = canonical_contact_jid(shared, &client, &requested).await;
             let parsed: Jid = canonical.parse().context("invalid canonical avatar JID")?;
-            let avatar_shared = Arc::clone(shared);
-            tokio::spawn(async move {
-                refresh_avatar(avatar_shared, client, parsed, false).await;
-            });
+            refresh_avatar(Arc::clone(shared), client, parsed, false).await;
             Ok(ServerEvent::Ack)
         }
         Command::ListAvatars => Ok(ServerEvent::Avatars {
@@ -4499,45 +5265,13 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
                 }
                 None => None,
             };
-            let previous = {
-                let mut active_chat = shared.active_chat.write().await;
-                if *active_chat == next {
-                    return Ok(ServerEvent::Ack);
-                }
-                std::mem::replace(&mut *active_chat, next.clone())
-            };
-            if let Some(client) = client {
-                if let Some(previous) = previous
-                    && let Ok(jid) = previous.parse::<Jid>()
-                    && !jid.is_group()
-                    && let Err(error) = client.presence().unsubscribe(&jid).await
-                {
-                    warn!(%error, %jid, "could not unsubscribe from prior chat presence");
-                }
-                if let Some(next) = next
-                    && let Ok(jid) = next.parse::<Jid>()
-                    && !jid.is_group()
-                    && let Err(error) = client.presence().subscribe(jid.clone()).await
-                {
-                    warn!(%error, %jid, "could not subscribe to active chat presence");
-                }
-            }
+            let (before, after) = shared.set_lease_active_chat(connection_id, next)?;
+            reconcile_connection_intent(shared, &before, &after).await;
             Ok(ServerEvent::Ack)
         }
         Command::SetPresence { available } => {
-            shared.presence_available.store(available, Ordering::SeqCst);
-            if let Some(client) = shared.client.read().await.clone() {
-                if client.push_name().is_empty() {
-                    debug!(
-                        available,
-                        "deferring WhatsApp presence until the push name is restored"
-                    );
-                } else if available {
-                    client.presence().set_available().await?;
-                } else {
-                    client.presence().set_unavailable().await?;
-                }
-            }
+            let (before, after) = shared.set_lease_available(connection_id, available)?;
+            reconcile_connection_intent(shared, &before, &after).await;
             Ok(ServerEvent::Ack)
         }
         Command::SetChatState { chat_jid, state } => {
@@ -4609,22 +5343,39 @@ async fn handle_command(command: Command, shared: &Arc<Shared>) -> Result<Server
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(clippy::default_trait_access)] // Generated protobuf fixture types are inferred by MessageField.
 mod tests {
     use super::*;
     use buffa::MessageField;
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
     use tokio::io::AsyncReadExt;
+    use whatsapp_rust::store::SqliteStore;
+    use whatsapp_rust::wacore::types::{
+        events::Receipt, message::MessageSource, presence::ReceiptType,
+    };
 
-    fn test_shared(directory: &tempfile::TempDir) -> Shared {
+    pub(crate) fn test_shared(directory: &tempfile::TempDir) -> Shared {
         let (events, _) = broadcast::channel(8);
+        let (message_reducer, _message_queue) = mpsc::channel(8);
+        let (app_event_reducer, _app_event_queue) = mpsc::channel(8);
+        test_shared_with_reducers(directory, events, message_reducer, app_event_reducer)
+    }
+
+    fn test_shared_with_reducers(
+        directory: &tempfile::TempDir,
+        events: broadcast::Sender<ServerFrame>,
+        message_reducer: mpsc::Sender<MessageWork>,
+        app_event_reducer: mpsc::Sender<AppEventWork>,
+    ) -> Shared {
         Shared {
-            database: Database::open(&directory.path().join("history.db")).unwrap(),
+            database: Arc::new(Database::open(&directory.path().join("history.db")).unwrap()),
             status: RwLock::new(ConnectionStatus::Starting),
             client: RwLock::new(None),
-            active_chat: RwLock::new(None),
-            presence_available: AtomicBool::new(false),
             events,
+            clock: revisions::RevisionClock::default(),
+            leases: StdMutex::new(leases::LeaseBook::default()),
             pairing_qr: directory.path().join("pairing.svg"),
             contact_sync_marker: directory.path().join("contact-names-v2"),
             contact_history_marker: directory.path().join("contact-history-names-v1"),
@@ -4634,6 +5385,7 @@ mod tests {
             voice_outbox_dir: directory.path().join("outbox"),
             avatar_revision: AtomicU64::new(0),
             app_state_failed: AtomicBool::new(false),
+            app_state_activity_ms: AtomicU64::new(0),
             chat_state_resync: RwLock::new((ChatStateResyncStatus::Idle, None)),
             chat_state_resync_requested: AtomicBool::new(false),
             chat_state_resync_notify: Notify::new(),
@@ -4643,7 +5395,450 @@ mod tests {
             media_recovery_requested: RwLock::new(HashSet::new()),
             media_downloads: Mutex::new(HashSet::new()),
             voice_outbox_gate: Mutex::new(()),
+            text_outbox_gate: Mutex::new(()),
+            read_outbox_gate: Mutex::new(()),
+            text_outbox_notify: Notify::new(),
+            read_outbox_notify: Notify::new(),
+            command_gates: Mutex::new(HashMap::new()),
+            message_reducer,
+            app_event_reducer,
         }
+    }
+
+    async fn synthetic_client(directory: &tempfile::TempDir) -> Arc<Client> {
+        let store = SqliteStore::new(
+            directory
+                .path()
+                .join("protocol.db")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+        Bot::builder()
+            .with_backend(store)
+            .build()
+            .await
+            .unwrap()
+            .client()
+    }
+
+    #[tokio::test]
+    async fn generation_jobs_abort_pending_work_and_prune_finished_handles() {
+        let jobs = GenerationJobs::default();
+        let completed = jobs.spawn(async { 7_u8 });
+        assert_eq!(completed.await.unwrap(), 7);
+        let pending = jobs.spawn(std::future::pending::<()>());
+        assert_eq!(jobs.handles.lock().unwrap().len(), 1);
+        jobs.abort_all();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        assert!(jobs.handles.lock().unwrap().is_empty());
+        jobs.abort_all();
+    }
+
+    #[tokio::test]
+    async fn shared_lease_gates_markers_and_state_are_locally_consistent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut shared = test_shared(&directory);
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        let lease = shared.open_connection_lease();
+        shared.touch_connection_lease(lease);
+        assert!(
+            shared
+                .set_lease_active_chat(999, Some("ignored".into()))
+                .is_err()
+        );
+        assert!(shared.set_lease_available(999, true).is_err());
+        let (_, active) = shared
+            .set_lease_active_chat(lease, Some("chat@s.whatsapp.net".into()))
+            .unwrap();
+        assert!(active.active_chats.contains("chat@s.whatsapp.net"));
+        assert!(shared.chat_is_focused("chat@s.whatsapp.net"));
+        let (_, available) = shared.set_lease_available(lease, true).unwrap();
+        assert!(available.available);
+        assert_eq!(shared.lease_state(), available);
+        let (before_close, after_close) = shared.close_connection_lease(lease);
+        assert_ne!(before_close, after_close);
+        let (before_second, after_second) = shared.close_connection_lease(lease);
+        assert_eq!(before_second, after_second);
+
+        let first = shared.command_gate("chat").await;
+        let same = shared.command_gate("chat").await;
+        assert!(Arc::ptr_eq(&first, &same));
+        drop(first);
+        drop(same);
+        let replacement = shared.command_gate("chat").await;
+        assert_eq!(Arc::strong_count(&replacement), 1);
+
+        shared.mark_contact_sync_complete();
+        shared.mark_contact_sync_complete();
+        shared.mark_event_sync_complete();
+        assert!(shared.contact_sync_marker.exists());
+        assert!(!shared.event_sync_marker.exists());
+        assert_eq!(shared.unread_total_or_zero(), 0);
+        shared
+            .set_chat_state_resync(ChatStateResyncStatus::Syncing, Some("working".into()))
+            .await;
+        assert_eq!(
+            shared.chat_state_resync_event().await,
+            ServerEvent::ChatStateResync {
+                status: ChatStateResyncStatus::Syncing,
+                message: Some("working".into()),
+            }
+        );
+        shared.set_status(ConnectionStatus::Connected).await;
+        assert!(matches!(
+            shared.state_event().await,
+            ServerEvent::State {
+                status: ConnectionStatus::Connected,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            canonical_requested_jid(&shared, "not a jid").await,
+            "not a jid"
+        );
+        assert_eq!(
+            canonical_requested_jid(&shared, "1:2@s.whatsapp.net").await,
+            "1@s.whatsapp.net"
+        );
+        assert_eq!(
+            metadata_jid("1:2@s.whatsapp.net", "lid"),
+            "1@s.whatsapp.net"
+        );
+        std::fs::remove_file(&shared.contact_sync_marker).unwrap();
+        let blocked = directory.path().join("blocked-contact-marker");
+        std::fs::write(&blocked, b"file").unwrap();
+        shared.contact_sync_marker = blocked.join("marker");
+        shared.mark_contact_sync_complete();
+        assert!(!shared.contact_sync_marker.exists());
+    }
+
+    #[test]
+    fn broadcast_helpers_publish_only_revisioned_local_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        assets::private_dir(&shared.voice_outbox_dir).unwrap();
+        let mut events = shared.events.subscribe();
+
+        broadcast_chats(&shared);
+        broadcast_messages(&shared, "chat@s.whatsapp.net");
+        broadcast_unread(&shared);
+        broadcast_voice_outbox(&shared);
+        broadcast_text_outbox(&shared);
+        broadcast_snapshot(&shared);
+
+        let frames = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(frames.iter().all(|frame| frame.sequence > 0));
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            ServerEvent::Invalidated {
+                resource: Resource::Chats,
+                ..
+            }
+        )));
+        assert!(frames.iter().any(|frame| matches!(
+            frame.event,
+            ServerEvent::Invalidated { resource: Resource::Messages, ref key }
+                if key.as_deref() == Some("chat@s.whatsapp.net")
+        )));
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame.event, ServerEvent::VoiceOutbox { .. }))
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame.event, ServerEvent::TextOutbox { .. }))
+        );
+    }
+
+    #[test]
+    fn local_snapshot_failures_degrade_without_panicking() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut shared = test_shared(&directory);
+        shared
+            .database
+            .update_address_book_name("4@s.whatsapp.net", "Ada")
+            .unwrap();
+        assert_eq!(
+            display_name(&shared, &"4@s.whatsapp.net".parse().unwrap()),
+            "Ada"
+        );
+        assert_eq!(
+            display_name(&shared, &"5@s.whatsapp.net".parse().unwrap()),
+            "5@s.whatsapp.net"
+        );
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chats; DROP TABLE contacts; DROP TABLE text_outbox;")
+            .unwrap();
+        assert_eq!(shared.unread_total_or_zero(), 0);
+        broadcast_unread(&shared);
+        broadcast_text_outbox(&shared);
+        let contact = whatsapp_rust::types::events::ContactUpdate::builder()
+            .jid("6@s.whatsapp.net".parse().unwrap())
+            .timestamp(Utc::now())
+            .action(Box::new(wa::sync_action_value::ContactAction {
+                full_name: Some("Synthetic".into()),
+                ..Default::default()
+            }))
+            .from_full_sync(false)
+            .build();
+        ingest_contact_name(&shared, &contact);
+
+        let blocked = directory.path().join("blocked-outbox");
+        std::fs::write(&blocked, b"file").unwrap();
+        shared.voice_outbox_dir = blocked;
+        broadcast_voice_outbox(&shared);
+
+        let blocked_parent = directory.path().join("blocked-qr-parent");
+        std::fs::write(&blocked_parent, b"file").unwrap();
+        shared.pairing_qr = blocked_parent.join("pairing.svg");
+        shared.write_pairing_qr(&ConnectionStatus::Pairing {
+            code: "synthetic".into(),
+            expires_at: 1,
+        });
+        assert!(!shared.pairing_qr.exists());
+    }
+
+    #[test]
+    fn contact_ingestion_prefers_names_and_normalizes_all_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let update = whatsapp_rust::types::events::ContactUpdate::builder()
+            .jid("1:2@s.whatsapp.net".parse().unwrap())
+            .timestamp(Utc::now())
+            .action(Box::new(wa::sync_action_value::ContactAction {
+                full_name: Some("  Ada Lovelace  ".into()),
+                pn_jid: Some("31612345678".into()),
+                lid_jid: Some("100000012345678".into()),
+                ..Default::default()
+            }))
+            .from_full_sync(true)
+            .build();
+        ingest_contact_name(&shared, &update);
+        for jid in [
+            "1@s.whatsapp.net",
+            "31612345678@s.whatsapp.net",
+            "100000012345678@lid",
+        ] {
+            assert_eq!(
+                shared.database.contact_name(jid).unwrap().as_deref(),
+                Some("Ada Lovelace")
+            );
+        }
+        assert!(shared.contact_sync_marker.exists());
+
+        let empty = whatsapp_rust::types::events::ContactUpdate::builder()
+            .jid("2@s.whatsapp.net".parse().unwrap())
+            .timestamp(Utc::now())
+            .action(Box::default())
+            .from_full_sync(true)
+            .build();
+        ingest_contact_name(&shared, &empty);
+        assert_eq!(
+            shared.database.contact_name("2@s.whatsapp.net").unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_reducers_honor_stale_work_and_barriers() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = synthetic_client(&directory).await;
+        let (events, _) = broadcast::channel(8);
+        let (message_sender, message_queue) = mpsc::channel(8);
+        let (app_sender, app_queue) = mpsc::channel(8);
+        let shared = Arc::new(test_shared_with_reducers(
+            &directory,
+            events,
+            message_sender.clone(),
+            app_sender.clone(),
+        ));
+        let generation = shared.clock.begin_generation();
+        finish_inbound_reduction(
+            &shared,
+            &inbound::InboundKey {
+                chat_jid: "ignored".into(),
+                sender_jid: "ignored".into(),
+                message_id: "ignored".into(),
+            },
+            false,
+        );
+        *shared.client.write().await = Some(Arc::clone(&client));
+        assert_eq!(
+            canonical_requested_jid(&shared, "1:2@s.whatsapp.net").await,
+            "1@s.whatsapp.net"
+        );
+        let message_task = tokio::spawn(run_message_reducer(Arc::clone(&shared), message_queue));
+        let app_task = tokio::spawn(run_app_event_reducer(Arc::clone(&shared), app_queue));
+
+        message_sender
+            .send(MessageWork::Drain {
+                generation: generation.saturating_add(1),
+                client: Arc::clone(&client),
+            })
+            .await
+            .unwrap();
+        message_sender
+            .send(MessageWork::Drain {
+                generation,
+                client: Arc::clone(&client),
+            })
+            .await
+            .unwrap();
+        let context = MessageContext::from_parts(
+            &wa::Message::text("stale"),
+            &MessageInfo {
+                source: whatsapp_rust::wacore::types::message::MessageSource {
+                    chat: "1@s.whatsapp.net".parse().unwrap(),
+                    sender: "1@s.whatsapp.net".parse().unwrap(),
+                    ..Default::default()
+                },
+                id: "stale".into(),
+                timestamp: Utc::now(),
+                ..Default::default()
+            },
+            Arc::clone(&client),
+        );
+        message_sender
+            .send(MessageWork::Live {
+                generation: generation.saturating_add(1),
+                context: Box::new(context),
+                key: inbound::InboundKey {
+                    chat_jid: "1@s.whatsapp.net".into(),
+                    sender_jid: "1@s.whatsapp.net".into(),
+                    message_id: "stale".into(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let current_context = MessageContext::from_parts(
+            &wa::Message::text("current"),
+            &MessageInfo {
+                source: whatsapp_rust::wacore::types::message::MessageSource {
+                    chat: "2@s.whatsapp.net".parse().unwrap(),
+                    sender: "2@s.whatsapp.net".parse().unwrap(),
+                    ..Default::default()
+                },
+                id: "current".into(),
+                push_name: "Synthetic".into(),
+                timestamp: Utc::now(),
+                ..Default::default()
+            },
+            Arc::clone(&client),
+        );
+        reduce_message(
+            &shared,
+            generation,
+            current_context,
+            &inbound::InboundKey {
+                chat_jid: "2@s.whatsapp.net".into(),
+                sender_jid: "2@s.whatsapp.net".into(),
+                message_id: "current".into(),
+            },
+        )
+        .await;
+        let duplicate_context = MessageContext::from_parts(
+            &wa::Message::text("current"),
+            &MessageInfo {
+                source: whatsapp_rust::wacore::types::message::MessageSource {
+                    chat: "2@s.whatsapp.net".parse().unwrap(),
+                    sender: "2@s.whatsapp.net".parse().unwrap(),
+                    ..Default::default()
+                },
+                id: "current".into(),
+                push_name: "Synthetic".into(),
+                timestamp: Utc::now(),
+                ..Default::default()
+            },
+            Arc::clone(&client),
+        );
+        reduce_message(
+            &shared,
+            generation,
+            duplicate_context,
+            &inbound::InboundKey {
+                chat_jid: "2@s.whatsapp.net".into(),
+                sender_jid: "2@s.whatsapp.net".into(),
+                message_id: "current".into(),
+            },
+        )
+        .await;
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE inbound_inbox")
+            .unwrap();
+        let no_inbox_context = MessageContext::from_parts(
+            &wa::Message::text("still durable locally"),
+            &MessageInfo {
+                source: whatsapp_rust::wacore::types::message::MessageSource {
+                    chat: "2@s.whatsapp.net".parse().unwrap(),
+                    sender: "2@s.whatsapp.net".parse().unwrap(),
+                    ..Default::default()
+                },
+                id: "no-inbox".into(),
+                push_name: "Synthetic".into(),
+                timestamp: Utc::now(),
+                ..Default::default()
+            },
+            Arc::clone(&client),
+        );
+        reduce_message(
+            &shared,
+            generation,
+            no_inbox_context,
+            &inbound::InboundKey {
+                chat_jid: "2@s.whatsapp.net".into(),
+                sender_jid: "2@s.whatsapp.net".into(),
+                message_id: "no-inbox".into(),
+            },
+        )
+        .await;
+        let (barrier, drained) = oneshot::channel();
+        message_sender
+            .send(MessageWork::Barrier(barrier))
+            .await
+            .unwrap();
+        drained.await.unwrap();
+
+        app_sender
+            .send(AppEventWork {
+                generation: generation.saturating_add(1),
+                event: Arc::new(Event::Receipt(
+                    Receipt::builder()
+                        .source(MessageSource {
+                            chat: "1@s.whatsapp.net".parse().unwrap(),
+                            sender: "1@s.whatsapp.net".parse().unwrap(),
+                            ..Default::default()
+                        })
+                        .message_ids(vec!["stale".into()])
+                        .timestamp(Utc::now())
+                        .r#type(ReceiptType::Read)
+                        .offline(false)
+                        .build(),
+                )),
+                client: Arc::clone(&client),
+                jobs: Arc::new(GenerationJobs::default()),
+            })
+            .await
+            .unwrap();
+
+        tokio::task::yield_now().await;
+        message_task.abort();
+        app_task.abort();
+        assert!(message_task.await.unwrap_err().is_cancelled());
+        assert!(app_task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            shared.database.list_chats(1).unwrap()[0].jid,
+            "2@s.whatsapp.net"
+        );
     }
 
     #[test]
@@ -4692,10 +5887,6 @@ mod tests {
 
     #[test]
     fn event_diagnostics_include_full_receipt_payload() {
-        use whatsapp_rust::wacore::types::{
-            events::Receipt, message::MessageSource, presence::ReceiptType,
-        };
-
         let event = Event::Receipt(
             Receipt::builder()
                 .source(MessageSource {
@@ -4714,6 +5905,7 @@ mod tests {
         );
 
         let diagnostic = event_diagnostic(&event);
+        log_whatsapp_event(&event);
         for expected in [
             "Receipt",
             "120363000000000000",
@@ -4728,20 +5920,35 @@ mod tests {
                 "missing {expected:?} from {diagnostic}"
             );
         }
+
+        let encoded = whatsapp_rust::wacore_binary::marshal::marshal(
+            &NodeBuilder::new("synthetic").attr("id", "node-1").build(),
+        )
+        .unwrap();
+        let node = Arc::new(
+            whatsapp_rust::wacore_binary::OwnedNodeRef::new(encoded[1..].to_vec()).unwrap(),
+        );
+        assert!(event_diagnostic(&Event::RawNode(Arc::clone(&node))).contains("RawNode"));
+        assert!(event_diagnostic(&Event::Notification(node)).contains("Notification"));
     }
 
     #[tokio::test]
     async fn offline_presence_and_active_chat_intent_are_retained() {
         let directory = tempfile::tempdir().unwrap();
         let shared = Arc::new(test_shared(&directory));
+        let connection_id = shared.open_connection_lease();
 
         assert_eq!(
-            handle_command(Command::SetPresence { available: true }, &shared)
-                .await
-                .unwrap(),
+            handle_command(
+                Command::SetPresence { available: true },
+                &shared,
+                connection_id,
+            )
+            .await
+            .unwrap(),
             ServerEvent::Ack
         );
-        assert!(shared.presence_available.load(Ordering::SeqCst));
+        assert!(shared.lease_state().available);
 
         assert_eq!(
             handle_command(
@@ -4749,14 +5956,15 @@ mod tests {
                     chat_jid: Some("1@s.whatsapp.net".into()),
                 },
                 &shared,
+                connection_id,
             )
             .await
             .unwrap(),
             ServerEvent::Ack
         );
         assert_eq!(
-            shared.active_chat.read().await.as_deref(),
-            Some("1@s.whatsapp.net")
+            shared.lease_state().active_chats,
+            HashSet::from(["1@s.whatsapp.net".into()])
         );
         assert!(
             handle_command(
@@ -4764,6 +5972,7 @@ mod tests {
                     chat_jid: Some("not a jid".into()),
                 },
                 &shared,
+                connection_id,
             )
             .await
             .is_err()
@@ -4775,7 +5984,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let shared = Arc::new(test_shared(&directory));
         assert!(
-            handle_command(Command::ResyncChatState, &shared)
+            handle_command(Command::ResyncChatState, &shared, 0)
                 .await
                 .is_err()
         );
@@ -4784,7 +5993,7 @@ mod tests {
         write_private_marker(&shared.event_sync_marker).unwrap();
         let mut events = shared.events.subscribe();
         assert_eq!(
-            handle_command(Command::ResyncChatState, &shared)
+            handle_command(Command::ResyncChatState, &shared, 0)
                 .await
                 .unwrap(),
             ServerEvent::Ack
@@ -4805,7 +6014,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            handle_command(Command::ResyncChatState, &shared)
+            handle_command(Command::ResyncChatState, &shared, 0)
                 .await
                 .is_err()
         );
@@ -4833,6 +6042,12 @@ mod tests {
         );
 
         shared.write_pairing_qr(&ConnectionStatus::Connected);
+        assert!(!shared.pairing_qr.exists());
+
+        shared.write_pairing_qr(&ConnectionStatus::Pairing {
+            code: "x".repeat(64 * 1024),
+            expires_at: 1_700_000_000,
+        });
         assert!(!shared.pairing_qr.exists());
     }
 
@@ -4889,29 +6104,31 @@ mod tests {
         shared.event_sync_marker = directory.path().join("event-state-v6");
         shared.mark_event_sync_complete();
         assert!(shared.event_sync_marker.exists());
+        shared.mark_event_sync_complete();
     }
 
     #[tokio::test]
-    async fn command_worker_reports_errors_and_closes_with_its_queue() {
+    async fn command_errors_keep_request_identity_when_stamped() {
         let directory = tempfile::tempdir().unwrap();
         let shared = Arc::new(test_shared(&directory));
-        let (commands, command_queue) = mpsc::channel(1);
-        let (responses, mut response_queue) = mpsc::channel(1);
-        commands
-            .send((
-                Some(4),
-                Command::SendMessage {
-                    chat_jid: "chat@s.whatsapp.net".into(),
-                    text: "  ".into(),
-                },
-            ))
-            .await
-            .unwrap();
-        drop(commands);
-
-        process_command_queue(command_queue, responses, shared).await;
-
-        let response = response_queue.recv().await.unwrap();
+        let _ = shared.clock.begin_generation();
+        let error = handle_command(
+            Command::SendMessage {
+                chat_jid: "chat@s.whatsapp.net".into(),
+                text: "  ".into(),
+                delivery_id: "synthetic".into(),
+            },
+            &shared,
+            0,
+        )
+        .await
+        .unwrap_err();
+        let response = shared.response(
+            Some(4),
+            ServerEvent::Error {
+                message: error.to_string(),
+            },
+        );
         assert_eq!(response.id, Some(4));
         assert_eq!(
             response.event,
@@ -5100,7 +6317,7 @@ mod tests {
         assert_eq!(
             response.event,
             ServerEvent::Error {
-                message: "too many queued requests".into(),
+                message: "too many active requests".into(),
             }
         );
 
@@ -5173,7 +6390,9 @@ mod tests {
         assets::write_private_bytes(&assets::avatar_path(&shared.avatar_dir, jid), b"avatar")
             .unwrap();
 
-        let event = handle_command(Command::ListAvatars, &shared).await.unwrap();
+        let event = handle_command(Command::ListAvatars, &shared, 0)
+            .await
+            .unwrap();
 
         assert_eq!(
             event,
@@ -5292,6 +6511,161 @@ mod tests {
         assert_eq!(reaction.emoji, "👍");
         assert!(!reaction.from_me);
         assert_eq!(reaction.timestamp, 12);
+
+        let own_wire = wa::WebMessageInfo {
+            key: MessageField::some(wa::MessageKey {
+                from_me: Some(true),
+                ..Default::default()
+            }),
+            message: MessageField::some(wa::Message {
+                reaction_message: MessageField::some(wa::message::ReactionMessage {
+                    key: MessageField::some(wa::MessageKey {
+                        id: Some("own-parent".into()),
+                        ..Default::default()
+                    }),
+                    text: Some("❤".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            message_timestamp: Some(u64::MAX),
+            ..Default::default()
+        };
+        let own = history_reaction("chat", &own_wire).unwrap();
+        assert_eq!(own.reactor_jid, "me");
+        assert_eq!(own.timestamp, i64::MAX);
+    }
+
+    #[test]
+    fn history_identity_poll_hash_and_message_fallbacks_are_explicit() {
+        let options = vec!["Soup".to_owned(), "Salad".to_owned()];
+        let soup = whatsapp_rust::wacore::poll::compute_option_hash("Soup").to_vec();
+        assert_eq!(
+            option_names_for_hashes(&options, std::slice::from_ref(&soup)),
+            Some(vec!["Soup".into()])
+        );
+        assert_eq!(option_names_for_hashes(&options, &[vec![0; 32]]), None);
+
+        let key = |from_me, participant: Option<&str>| wa::WebMessageInfo {
+            key: MessageField::some(wa::MessageKey {
+                from_me: Some(from_me),
+                id: Some("message".into()),
+                participant: participant.map(str::to_owned),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            history_poll_creator("chat@g.us", &key(true, Some("1:2@s.whatsapp.net")), None)
+                .as_deref(),
+            Some("1@s.whatsapp.net")
+        );
+        assert_eq!(
+            history_poll_creator("chat@g.us", &key(true, None), Some("me@s.whatsapp.net"))
+                .as_deref(),
+            Some("me@s.whatsapp.net")
+        );
+        assert_eq!(
+            history_poll_creator("chat@g.us", &key(false, Some("2:3@s.whatsapp.net")), None)
+                .as_deref(),
+            Some("2@s.whatsapp.net")
+        );
+        assert_eq!(
+            history_poll_creator("2@s.whatsapp.net", &key(false, None), None).as_deref(),
+            Some("2@s.whatsapp.net")
+        );
+        assert_eq!(
+            history_poll_creator("chat@g.us", &wa::WebMessageInfo::default(), None),
+            None
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            history_message(
+                "chat",
+                "Chat",
+                &wa::WebMessageInfo::default(),
+                directory.path()
+            )
+            .is_none()
+        );
+        let missing_id = wa::WebMessageInfo {
+            key: MessageField::some(wa::MessageKey::default()),
+            ..Default::default()
+        };
+        assert!(history_message("chat", "Chat", &missing_id, directory.path()).is_none());
+
+        let outgoing = wa::WebMessageInfo {
+            key: MessageField::some(wa::MessageKey {
+                from_me: Some(true),
+                id: Some("outgoing".into()),
+                ..Default::default()
+            }),
+            message: MessageField::some(wa::Message::text("hello")),
+            message_timestamp: Some(u64::MAX),
+            ..Default::default()
+        };
+        let outgoing = history_message("chat", "Chat", &outgoing, directory.path()).unwrap();
+        assert_eq!(outgoing.sender_jid, "me");
+        assert_eq!(outgoing.sender_name, "You");
+        assert_eq!(outgoing.timestamp, i64::MAX);
+
+        let incoming = wa::WebMessageInfo {
+            key: MessageField::some(wa::MessageKey {
+                from_me: Some(false),
+                id: Some("incoming".into()),
+                ..Default::default()
+            }),
+            message: MessageField::some(wa::Message::text("hello")),
+            ..Default::default()
+        };
+        let incoming = history_message("chat", "Chat name", &incoming, directory.path()).unwrap();
+        assert_eq!(incoming.sender_jid, "chat");
+        assert_eq!(incoming.sender_name, "Chat name");
+
+        let participant_fallback = wa::WebMessageInfo {
+            key: MessageField::some(wa::MessageKey {
+                from_me: Some(false),
+                id: Some("participant".into()),
+                participant: Some("3:4@s.whatsapp.net".into()),
+                ..Default::default()
+            }),
+            message: MessageField::some(wa::Message::text("hello")),
+            ..Default::default()
+        };
+        let participant =
+            history_message("chat@g.us", "Chat", &participant_fallback, directory.path()).unwrap();
+        assert_eq!(participant.sender_jid, "3@s.whatsapp.net");
+        assert_eq!(participant.sender_name, "3@s.whatsapp.net");
+
+        let final_location = wa::WebMessageInfo {
+            key: MessageField::some(wa::MessageKey {
+                from_me: Some(false),
+                id: Some("location".into()),
+                ..Default::default()
+            }),
+            message: MessageField::some(wa::Message::text("location")),
+            message_timestamp: Some(100),
+            duration: Some(60),
+            final_live_location: MessageField::some(wa::message::LiveLocationMessage {
+                degrees_latitude: Some(1.0),
+                degrees_longitude: Some(2.0),
+                time_offset: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            history_message("chat", "Chat", &final_location, directory.path())
+                .unwrap()
+                .media,
+            Some(MessageMedia::Location {
+                live: false,
+                updated_at: 105,
+                duration_seconds: 60,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -5349,6 +6723,44 @@ mod tests {
         assert!(quiz);
         assert_eq!(correct_option_index, Some(0));
         assert_eq!(end_timestamp, 1_700_000_000);
+        assert!(matches!(
+            message_media(
+                &message,
+                tempfile::tempdir().unwrap().path(),
+                "chat",
+                "poll",
+                1,
+                0,
+            ),
+            Some(MessageMedia::Poll { .. })
+        ));
+    }
+
+    #[test]
+    fn message_secret_prefers_the_base_envelope_and_falls_back_to_outer() {
+        let outer = wa::Message {
+            message_context_info: MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![1, 2, 3]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let base = wa::Message {
+            message_context_info: MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![4, 5, 6]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(message_secret(&outer, &base), Some([4, 5, 6].as_slice()));
+        assert_eq!(
+            message_secret(&outer, &wa::Message::default()),
+            Some([1, 2, 3].as_slice())
+        );
+        assert_eq!(
+            message_secret(&wa::Message::default(), &wa::Message::default()),
+            None
+        );
     }
 
     #[test]
@@ -5359,6 +6771,137 @@ mod tests {
         };
         assert_eq!(media_text(&control, ""), None);
         assert_eq!(media_placeholder("unknown"), None);
+        assert!(find_reaction_message_at_depth(&wa::Message::default(), 16).is_none());
+    }
+
+    #[test]
+    fn media_fallback_matrix_and_invalid_poll_are_explicit() {
+        let location = |name: Option<&str>, address: Option<&str>, live| wa::Message {
+            location_message: MessageField::some(wa::message::LocationMessage {
+                name: name.map(str::to_owned),
+                address: address.map(str::to_owned),
+                is_live: Some(live),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            media_text(&location(Some("Place"), None, false), ""),
+            Some("Place".into())
+        );
+        assert_eq!(
+            media_text(&location(None, Some("Street"), false), ""),
+            Some("Street".into())
+        );
+        assert_eq!(
+            media_text(&location(None, None, false), ""),
+            Some("[Location]".into())
+        );
+        assert_eq!(
+            media_text(&location(None, None, true), ""),
+            Some("[Live location]".into())
+        );
+        assert_eq!(
+            media_text(
+                &wa::Message {
+                    live_location_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                ""
+            ),
+            Some("[Live location]".into())
+        );
+
+        let cases = [
+            (
+                wa::Message {
+                    image_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Image]",
+            ),
+            (
+                wa::Message {
+                    video_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Video]",
+            ),
+            (
+                wa::Message {
+                    document_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Document]",
+            ),
+            (
+                wa::Message {
+                    contact_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Contact]",
+            ),
+            (
+                wa::Message {
+                    event_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Event]",
+            ),
+            (
+                wa::Message {
+                    group_invite_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Group invite]",
+            ),
+            (
+                wa::Message {
+                    product_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Product]",
+            ),
+            (
+                wa::Message {
+                    call_log_messsage: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Call]",
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(media_text(&message, ""), Some(expected.into()));
+        }
+        for kind in [
+            "image",
+            "video",
+            "ptv",
+            "audio",
+            "ptt",
+            "document",
+            "sticker",
+            "contact",
+            "location",
+            "live_location",
+            "poll",
+        ] {
+            assert!(media_placeholder(kind).is_some());
+        }
+
+        let invalid_poll = wa::Message {
+            poll_creation_message: MessageField::some(wa::message::PollCreationMessage {
+                options: vec![wa::message::poll_creation_message::Option {
+                    option_name: Some("Only".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(poll_media(&invalid_poll), None);
+        assert_eq!(media_text(&invalid_poll, "poll"), Some("[Poll]".into()));
+        assert_eq!(coordinate_e7(Some(f64::NAN)), 0);
     }
 
     #[test]
@@ -5410,7 +6953,10 @@ mod tests {
         let lottie_message = wa::Message {
             lottie_sticker_message: MessageField::some(wa::message::FutureProofMessage {
                 message: MessageField::some(wa::Message {
-                    sticker_message: MessageField::some(sticker),
+                    sticker_message: MessageField::some(wa::message::StickerMessage {
+                        mimetype: None,
+                        ..sticker
+                    }),
                     ..Default::default()
                 }),
             }),
@@ -5420,6 +6966,7 @@ mod tests {
             downloaded,
             animated,
             lottie,
+            mime_type,
             ..
         } = message_media(
             &lottie_message,
@@ -5436,6 +6983,7 @@ mod tests {
         assert!(!downloaded);
         assert!(animated);
         assert!(lottie);
+        assert_eq!(mime_type, "application/json");
         assert_eq!(
             media_text(&lottie_message, "sticker"),
             Some("[Sticker]".into())
@@ -5660,6 +7208,161 @@ mod tests {
     }
 
     #[test]
+    fn existing_media_files_and_cache_failures_are_reflected_in_models() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_dir = directory.path().join("media");
+        assets::private_dir(&media_dir).unwrap();
+        let chat = "1@s.whatsapp.net";
+
+        std::fs::write(
+            assets::message_image_path(&media_dir, chat, "image"),
+            b"image",
+        )
+        .unwrap();
+        let image = wa::Message {
+            image_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&image, &media_dir, chat, "image", 1, 0),
+            Some(MessageMedia::Image { downloaded: true, ref mime_type, .. })
+                if mime_type == "image/jpeg"
+        ));
+
+        std::fs::write(
+            assets::message_video_path(&media_dir, chat, "video", None),
+            b"video",
+        )
+        .unwrap();
+        let video = wa::Message {
+            ptv_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&video, &media_dir, chat, "video", 1, 0),
+            Some(MessageMedia::Video { downloaded: true, ref mime_type, .. })
+                if mime_type == "video/mp4"
+        ));
+
+        std::fs::write(
+            assets::message_audio_path(&media_dir, chat, "audio", None),
+            b"audio",
+        )
+        .unwrap();
+        let audio = wa::Message {
+            audio_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&audio, &media_dir, chat, "audio", 1, 0),
+            Some(MessageMedia::Audio { downloaded: true, ref mime_type, .. })
+                if mime_type == "audio/ogg; codecs=opus"
+        ));
+
+        std::fs::write(
+            assets::message_sticker_path(&media_dir, chat, "sticker"),
+            b"sticker",
+        )
+        .unwrap();
+        let sticker = wa::Message {
+            sticker_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&sticker, &media_dir, chat, "sticker", 1, 0),
+            Some(MessageMedia::Sticker { downloaded: true, ref mime_type, .. })
+                if mime_type == "image/webp"
+        ));
+
+        let document = wa::Message {
+            document_message: MessageField::some(wa::message::DocumentMessage {
+                title: Some("Title fallback".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&document, &media_dir, chat, "document", 1, 0),
+            Some(MessageMedia::Document { ref file_name, ref mime_type, .. })
+                if file_name == "Title fallback" && mime_type == "application/octet-stream"
+        ));
+
+        let location = wa::Message {
+            location_message: MessageField::some(wa::message::LocationMessage {
+                degrees_latitude: Some(f64::INFINITY),
+                degrees_longitude: Some(-181.0),
+                is_live: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&location, &media_dir, chat, "location", 2, 0),
+            Some(MessageMedia::Location {
+                latitude_e7: 0,
+                longitude_e7: -1_800_000_000,
+                live: false,
+                ..
+            })
+        ));
+
+        let missing_dir = directory.path().join("missing");
+        let with_thumbnail = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                jpeg_thumbnail: Some(b"\xff\xd8\xffpreview".to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(message_media(&with_thumbnail, &missing_dir, chat, "error", 1, 0).is_some());
+        let sticker_with_thumbnail = wa::Message {
+            sticker_message: MessageField::some(wa::message::StickerMessage {
+                png_thumbnail: Some(b"\x89PNG\r\n\x1a\npreview".to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            message_media(
+                &sticker_with_thumbnail,
+                &missing_dir,
+                chat,
+                "sticker-error",
+                1,
+                0,
+            )
+            .is_some()
+        );
+        let video_with_thumbnail = wa::Message {
+            video_message: MessageField::some(wa::message::VideoMessage {
+                jpeg_thumbnail: Some(b"\xff\xd8\xffpreview".to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            message_media(
+                &video_with_thumbnail,
+                &missing_dir,
+                chat,
+                "video-error",
+                1,
+                0,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            cache_location_thumbnail(
+                &missing_dir,
+                chat,
+                "location-error",
+                Some(&b"\xff\xd8\xffpreview".to_vec()),
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn contact_resync_only_resets_the_contact_collection_once() {
         let directory = tempfile::tempdir().unwrap();
         let protocol_db = directory.path().join("session.db");
@@ -5742,6 +7445,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let protocol_db = directory.path().join("session.db");
         let marker = directory.path().join("event-state-v6");
+        prepare_event_state_resync(&directory.path().join("missing.db"), &marker).unwrap();
         let connection = rusqlite::Connection::open(&protocol_db).unwrap();
         connection
             .execute_batch(

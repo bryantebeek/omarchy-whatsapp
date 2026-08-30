@@ -39,6 +39,7 @@ buffa = "0.9.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

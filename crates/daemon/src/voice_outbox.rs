@@ -444,6 +444,7 @@ fn ogg_opus_duration_ms(bytes: &[u8]) -> Result<u64> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;

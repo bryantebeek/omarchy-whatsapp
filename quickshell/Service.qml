@@ -29,7 +29,7 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
-  readonly property int protocolVersion: 24
+  readonly property int protocolVersion: 25
 
   property bool connected: false
   property bool protocolCompatible: false
@@ -44,6 +44,13 @@ Item {
   property var mediaOverrideRevisions: ({})
   property var mediaDownloadRequests: ({})
   property var mediaDownloadRequestIds: ({})
+  property int daemonGeneration: 0
+  property var resourceSequences: ({})
+  property var requestCommands: ({})
+  property var requestDeadlines: ({})
+  property int nextDeliverySerial: 0
+  property var textMessageRequests: ({})
+  property var textOutboxEntries: []
   property var chats: []
   property var groupParticipants: []
   property string groupParticipantsChatJid: ""
@@ -81,6 +88,7 @@ Item {
   property int reconnectAttempt: 0
   property bool launcherSyncPending: false
   property string lastError: ""
+  property string lastErrorRequestId: ""
   property string chatStateResyncStatus: "idle"
   property string chatStateResyncMessage: ""
   property int chatStateResyncRequestId: 0
@@ -93,6 +101,7 @@ Item {
   property int uiPreferencesSavingRevision: 0
 
   signal messagesWillChange(bool preservePosition)
+  signal textMessageAccepted(string deliveryId, string chatJid, string text)
 
   readonly property string qrImageUrl: pairingExpiresAt > 0
     ? "file://" + qrPath + "?v=" + pairingExpiresAt : ""
@@ -805,7 +814,134 @@ Item {
     for (var key in fields) payload[key] = fields[key]
     socket.write(JSON.stringify(payload) + "\n")
     socket.flush()
+    var commands = Object.assign({}, requestCommands)
+    var deadlines = Object.assign({}, requestDeadlines)
+    commands[String(payload.id)] = payload.command
+    deadlines[String(payload.id)] = Date.now() + commandTimeoutMs(payload.command)
+    requestCommands = commands
+    requestDeadlines = deadlines
     return payload.id
+  }
+
+  function commandTimeoutMs(command) {
+    var value = String(command || "")
+    if (["download_image", "download_sticker", "download_video",
+         "download_audio", "send_voice_message"].indexOf(value) >= 0)
+      return 120000
+    if (["resync_chat_state", "logout"].indexOf(value) >= 0) return 60000
+    return 30000
+  }
+
+  function finishRequest(frame) {
+    if (!frame || frame.id === undefined || frame.id === null) return ""
+    var id = String(frame.id)
+    var command = String(requestCommands[id] || "")
+    if (!command) return ""
+    var commands = Object.assign({}, requestCommands)
+    var deadlines = Object.assign({}, requestDeadlines)
+    delete commands[id]
+    delete deadlines[id]
+    requestCommands = commands
+    requestDeadlines = deadlines
+    if (frame.event !== "error" && lastErrorRequestId === id) {
+      lastError = ""
+      lastErrorRequestId = ""
+    }
+    return command
+  }
+
+  function resetRequestState(reason) {
+    var detail = String(reason || "Connection lost; retry is safe")
+    for (var requestId in textMessageRequests) {
+      if (requestCommands[requestId] === "send_message") {
+        lastError = detail
+        lastErrorRequestId = String(requestId)
+        break
+      }
+    }
+    requestCommands = ({})
+    requestDeadlines = ({})
+    textMessageRequests = ({})
+    groupParticipantRequestJids = ({})
+    messagesRequestIds = ({})
+    messagesRequestJids = ({})
+    messagesQueuedRequests = ({})
+    mediaDownloadRequests = ({})
+    mediaDownloadRequestIds = ({})
+    pollVoteRequests = ({})
+    pollCreateRequestId = 0
+    chatStateResyncRequestId = 0
+  }
+
+  function expireRequests(nowMs) {
+    var now = Number(nowMs || Date.now())
+    var expired = []
+    for (var requestId in requestDeadlines)
+      if (Number(requestDeadlines[requestId] || 0) <= now) expired.push(requestId)
+    for (var i = 0; i < expired.length; i++) {
+      var id = expired[i]
+      var command = String(requestCommands[id] || "request")
+      finishGroupParticipantsRequest({ id: Number(id), event: "error" })
+      finishPollRequest({ id: Number(id), event: "error" })
+      finishMediaDownloadRequest({ id: Number(id), event: "error" })
+      finishVoiceMessageRequest({
+        id: Number(id), event: "error", message: "WhatsApp request timed out"
+      })
+      finishChatStateResyncRequest({
+        id: Number(id), event: "error", message: "WhatsApp request timed out"
+      })
+      finishMessagesRequest({ id: Number(id), event: "error" })
+      finishTextMessageRequest({ id: Number(id), event: "error" })
+      finishRequest({ id: Number(id), event: "error" })
+      lastError = "WhatsApp " + command.replace(/_/g, " ") + " timed out"
+      lastErrorRequestId = id
+    }
+    return expired.length
+  }
+
+  function resourceKey(frame) {
+    if (!frame) return ""
+    var event = String(frame.event || "")
+    if (event === "state") return "state"
+    if (event === "chats") return "chats"
+    if (event === "messages" || event === "group_participants")
+      return event + ":" + String(frame.chat_jid || "")
+    if (event === "message" || event === "sent")
+      return "messages:" + String((frame.message || {}).chat_jid || "")
+    if (event === "unread") return "unread"
+    if (event === "avatars") return "avatars"
+    if (event === "text_outbox") return "text_outbox"
+    if (event === "voice_outbox") return "voice_outbox"
+    if (event === "text_delivery")
+      return "text_delivery:" + String(frame.delivery_id || "")
+    if (event === "invalidated")
+      return String(frame.resource || "")
+        + (frame.key ? ":" + String(frame.key) : "")
+    if (event === "presence") return "presence:" + String(frame.jid || "")
+    if (event === "chat_state") return "chat_state:"
+      + String(frame.chat_jid || "") + ":" + String(frame.sender_jid || "")
+    if (frame.id !== undefined && frame.id !== null)
+      return "response:" + String(frame.id)
+    return ""
+  }
+
+  function acceptFrame(frame) {
+    var generation = Math.floor(Number(frame ? frame.generation || 0 : 0))
+    if (generation > 0 && daemonGeneration > 0 && generation < daemonGeneration)
+      return false
+    if (generation > daemonGeneration) {
+      daemonGeneration = generation
+      resourceSequences = ({})
+      resetRequestState("WhatsApp reconnected; retry is safe")
+    }
+    var sequence = Math.floor(Number(frame ? frame.sequence || 0 : 0))
+    var key = resourceKey(frame)
+    if (sequence <= 0 || !key) return true
+    if (sequence <= Number(resourceSequences[key] || 0)) return false
+    var sequences = Object.assign({}, resourceSequences)
+    sequences[key] = sequence
+    resourceSequences = sequences
+    return true
   }
 
   function requestMessages(jid, queueIfPending) {
@@ -945,6 +1081,7 @@ Item {
     send("get_state")
     send("list_chats", { limit: 500 })
     send("list_avatars")
+    send("list_text_outbox")
     send("list_voice_outbox")
   }
 
@@ -972,7 +1109,8 @@ Item {
     }
     if (changed || messagesChatJid !== value) requestMessages(value)
     if (changed) refreshSelectedGroupParticipants()
-    send("mark_read", { chat_jid: value })
+    if (panelVisible && panelFocused)
+      send("mark_read", { chat_jid: value })
     requestAvatar(value)
     updateActiveChat()
   }
@@ -980,9 +1118,93 @@ Item {
   function sendMessage(text) {
     var body = String(text || "")
     if (!selectedChatJid || !body.trim()) return false
-    send("send_message", { chat_jid: selectedChatJid, text: body })
+    nextDeliverySerial++
+    var deliveryId = "qml-" + String(Date.now()) + "-" + String(nextDeliverySerial)
+    var requestId = send("send_message", {
+      chat_jid: selectedChatJid,
+      text: body,
+      delivery_id: deliveryId
+    })
+    if (!requestId) return false
+    var requests = Object.assign({}, textMessageRequests)
+    requests[String(requestId)] = {
+      delivery_id: deliveryId,
+      chat_jid: selectedChatJid,
+      text: body
+    }
+    textMessageRequests = requests
+    lastError = ""
+    lastErrorRequestId = ""
     pauseComposing()
     return true
+  }
+
+  function finishTextMessageRequest(frame) {
+    if (!frame || frame.id === undefined || frame.id === null) return false
+    var id = String(frame.id)
+    var pending = textMessageRequests[id]
+    if (!pending) return false
+    var requests = Object.assign({}, textMessageRequests)
+    delete requests[id]
+    textMessageRequests = requests
+    if (frame.event === "text_accepted"
+        && String(frame.delivery_id || "") === String(pending.delivery_id || "")) {
+      textMessageAccepted(
+        String(pending.delivery_id), String(pending.chat_jid), String(pending.text))
+      return true
+    }
+    return false
+  }
+
+  function applyTextOutbox(frame) {
+    textOutboxEntries = copyArray(frame ? frame.entries : [])
+    return textOutboxEntries.length
+  }
+
+  function textOutboxForChat(chatJid) {
+    var value = String(chatJid || "")
+    for (var i = textOutboxEntries.length - 1; i >= 0; i--)
+      if (String(textOutboxEntries[i].chat_jid || "") === value)
+        if (String(textOutboxEntries[i].status || "") === "failed")
+          return textOutboxEntries[i]
+    return null
+  }
+
+  function retryTextMessage(entry) {
+    var deliveryId = String(entry ? entry.delivery_id || "" : "")
+    if (!deliveryId || String(entry.status || "") !== "failed") return false
+    if (!send("retry_text_message", { delivery_id: deliveryId })) return false
+    var entries = textOutboxEntries.slice()
+    for (var i = 0; i < entries.length; i++) {
+      if (String(entries[i].delivery_id || "") !== deliveryId) continue
+      entries[i] = Object.assign({}, entries[i], { status: "queued", error: "" })
+    }
+    textOutboxEntries = entries
+    return true
+  }
+
+  function discardTextMessage(entry) {
+    var deliveryId = String(entry ? entry.delivery_id || "" : "")
+    var status = String(entry ? entry.status || "" : "")
+    if (!deliveryId || (status !== "queued" && status !== "failed")) return false
+    if (!send("discard_text_message", { delivery_id: deliveryId })) return false
+    textOutboxEntries = textOutboxEntries.filter(function(value) {
+      return String(value.delivery_id || "") !== deliveryId
+    })
+    return true
+  }
+
+  function handleInvalidation(frame) {
+    var resource = String(frame ? frame.resource || "" : "")
+    var key = String(frame ? frame.key || "" : "")
+    if (resource === "chats") return send("list_chats", { limit: 500 }) > 0
+    if (resource === "messages")
+      return key === selectedChatJid && requestMessages(key, true) > 0
+    if (resource === "unread") return send("get_state") > 0
+    if (resource === "avatars") return send("list_avatars") > 0
+    if (resource === "text_outbox") return send("list_text_outbox") > 0
+    if (resource === "voice_outbox") return send("list_voice_outbox") > 0
+    return false
   }
 
   function setChatPinned(jid, pinned) {
@@ -1090,14 +1312,13 @@ Item {
 
   function reactToMessage(message, emoji) {
     if (!message || !selectedChatJid || !message.id) return false
-    send("react", {
+    return send("react", {
       chat_jid: selectedChatJid,
       message_id: String(message.id),
       sender_jid: String(message.sender_jid || ""),
       target_from_me: message.from_me === true,
       emoji: String(emoji || "")
-    })
-    return true
+    }) > 0
   }
 
   function updateActiveChat() {
@@ -1173,10 +1394,12 @@ Item {
     catch (error) { return }
     if (!frame || !frame.event) return
     if (frame.event === "hello") {
+      if (!acceptFrame(frame)) return
       handleHello(frame)
       return
     }
     if (!protocolCompatible) return
+    if (!acceptFrame(frame)) return
     var frameId = frame.id === undefined || frame.id === null
       ? "" : String(frame.id)
     var requestedMessagesJid = frameId
@@ -1187,7 +1410,7 @@ Item {
     finishVoiceMessageRequest(frame)
     finishChatStateResyncRequest(frame)
     var queuedMessagesJid = finishMessagesRequest(frame)
-    lastError = ""
+    finishTextMessageRequest(frame)
     if (frame.event === "state") {
       handleState(frame)
     } else if (frame.event === "chats") {
@@ -1216,6 +1439,16 @@ Item {
       applyChatStateResync(frame)
     } else if (frame.event === "voice_outbox") {
       applyVoiceOutbox(frame)
+    } else if (frame.event === "text_outbox") {
+      applyTextOutbox(frame)
+    } else if (frame.event === "text_delivery") {
+      if (String(frame.status || "") === "failed") {
+        lastError = String(frame.error || "WhatsApp could not deliver the message")
+        lastErrorRequestId = ""
+      }
+      send("list_text_outbox")
+    } else if (frame.event === "invalidated") {
+      handleInvalidation(frame)
     } else if (frame.event === "messages") {
       if (String(frame.chat_jid || "") === selectedChatJid) {
         var preserveMessagePosition = messagesChatJid === selectedChatJid
@@ -1241,7 +1474,6 @@ Item {
       }
     } else if (frame.event === "message" || frame.event === "sent") {
       var message = frame.message || {}
-      send("list_chats", { limit: 500 })
       if (String(message.chat_jid || "") === selectedChatJid) {
         if (frame.event === "sent") messageSentSerial++
         else {
@@ -1267,24 +1499,36 @@ Item {
       avatarRevisions = revisions
     } else if (frame.event === "error") {
       lastError = String(frame.message || "WhatsApp command failed")
+      lastErrorRequestId = frameId
+      if (requestCommands[frameId] === "retry_text_message"
+          || requestCommands[frameId] === "discard_text_message")
+        send("list_text_outbox")
       if (requestedGroupParticipantsJid === selectedChatJid) {
         groupParticipants = []
         groupParticipantsChatJid = selectedChatJid
         groupParticipantsError = lastError
       }
     }
+    finishRequest(frame)
     if (queuedMessagesJid && queuedMessagesJid === selectedChatJid)
       requestMessages(queuedMessagesJid)
+  }
+
+  function markSelectedRead() {
+    if (!panelVisible || !panelFocused || !selectedChatJid) return false
+    return send("mark_read", { chat_jid: selectedChatJid }) > 0
   }
 
   onPanelVisibleChanged: {
     updateActiveChat()
     sendPresence()
+    if (panelVisible && panelFocused) markSelectedRead()
   }
   onPanelFocusedChanged: {
     if (!panelFocused) pauseComposing()
     updateActiveChat()
     sendPresence()
+    if (panelFocused && panelVisible) markSelectedRead()
   }
   onSelectedChatJidChanged: {
     pauseComposing()
@@ -1304,17 +1548,12 @@ Item {
         root.connected = connected
         if (connected) {
           root.protocolCompatible = false
-          root.groupParticipantRequestJids = ({})
-          root.messagesRequestIds = ({})
-          root.messagesRequestJids = ({})
-          root.messagesQueuedRequests = ({})
-          root.pollVoteRequests = ({})
-          root.pollCreateRequestId = 0
+          root.resetRequestState("")
           root.reconnectAttempt = 0
-          root.lastError = ""
           root.sentPresenceState = -1
         } else {
           root.protocolCompatible = false
+          root.resetRequestState("Connection lost; retry is safe")
           root.clearPresenceState()
           root.sentPresenceState = -1
         }
@@ -1323,6 +1562,7 @@ Item {
         root.connected = false
         root.protocolCompatible = false
         root.connectionState = "starting"
+        root.resetRequestState("Connection lost; retry is safe")
         root.clearPresenceState()
         root.sentPresenceState = -1
       }
@@ -1386,6 +1626,13 @@ Item {
     repeat: true
     running: root.connected
     onTriggered: root.send("ping")
+  }
+
+  Timer {
+    interval: 1000
+    repeat: true
+    running: Object.keys(root.requestDeadlines).length > 0
+    onTriggered: root.expireRequests(Date.now())
   }
 
   Timer {

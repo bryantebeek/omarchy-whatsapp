@@ -2,8 +2,11 @@
 set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-coverage_boundary='crates/(ctl/src/main|daemon/src/(assets|database|live_location|main|notification))\.rs$'
-overall_line_floor=54.8
+# async_trait expands the live encrypted-stanza adapter into synthetic source
+# locations that cannot be driven without a connected upstream client. It is
+# isolated in one exact file; all deterministic crypto/state logic remains in
+# live_location.rs and in the measured source-line denominator.
+coverage_adapter='daemon/src/live_location/transport\.rs$'
 lcov_report="$repo_dir/target/llvm-cov/lcov.info"
 
 if command -v mise >/dev/null 2>&1; then
@@ -13,14 +16,36 @@ else
 fi
 
 cd "$repo_dir"
-"${cargo_command[@]}" llvm-cov --workspace --all-features --locked \
-  --fail-under-lines "$overall_line_floor"
-"${cargo_command[@]}" llvm-cov report \
-  --ignore-filename-regex "$coverage_boundary" \
-  --fail-under-lines 100 \
-  --fail-uncovered-lines 0
+"${cargo_command[@]}" llvm-cov --workspace --all-features --locked --no-report
 mkdir -p -- "$(dirname -- "$lcov_report")"
-"${cargo_command[@]}" llvm-cov report --lcov --output-path "$lcov_report"
+"${cargo_command[@]}" llvm-cov report \
+  --ignore-filename-regex "$coverage_adapter" \
+  --lcov \
+  --output-path "$lcov_report"
+
+# LLVM's aggregate LF/LH counters include synthetic lines for macros, generic
+# monomorphizations, and `?` continuations that have no DA source mapping. The
+# LCOV DA records are the executable Rust source lines developers can inspect.
+# Requiring every one of those records to execute is a stable, literal 100%
+# source-line gate and fails with exact file:line diagnostics.
+awk -F '[:,]' '
+  /^SF:/ { source = substr($0, 4) }
+  /^DA:/ {
+    total += 1
+    if ($3 == 0) {
+      printf "uncovered Rust source line: %s:%s\n", source, $2 > "/dev/stderr"
+      missed += 1
+    }
+  }
+  END {
+    if (total == 0) {
+      print "coverage report contained no Rust source lines" > "/dev/stderr"
+      exit 1
+    }
+    printf "Rust source line coverage: %d/%d (%.2f%%)\n", total - missed, total, 100 * (total - missed) / total
+    if (missed > 0) exit 1
+  }
+' "$lcov_report"
 
 if [[ -n ${COVERAGE_BASE_REF:-} ]]; then
   "$repo_dir/scripts/check-diff-coverage.sh" "$lcov_report" "$COVERAGE_BASE_REF"

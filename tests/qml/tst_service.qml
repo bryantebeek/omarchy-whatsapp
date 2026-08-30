@@ -12,12 +12,20 @@ TestCase {
   property var service: null
   property int messagesWillChangeCount: 0
   property bool lastPreservePosition: false
+  property int textAcceptedCount: 0
+  property string acceptedDeliveryId: ""
+  property string acceptedText: ""
 
   Connections {
     target: testCase.service
     function onMessagesWillChange(preservePosition) {
       testCase.messagesWillChangeCount++
       testCase.lastPreservePosition = preservePosition
+    }
+    function onTextMessageAccepted(deliveryId, _chatJid, text) {
+      testCase.textAcceptedCount++
+      testCase.acceptedDeliveryId = deliveryId
+      testCase.acceptedText = text
     }
   }
 
@@ -42,6 +50,9 @@ TestCase {
     TestIo.processStarts = []
     messagesWillChangeCount = 0
     lastPreservePosition = false
+    textAcceptedCount = 0
+    acceptedDeliveryId = ""
+    acceptedText = ""
   }
 
   function cleanup() {
@@ -96,9 +107,10 @@ TestCase {
 
     service.refreshMetadata()
     var frames = sentFrames()
-    compare(frames[frames.length - 4].command, "get_state")
-    compare(frames[frames.length - 3].command, "list_chats")
-    compare(frames[frames.length - 2].command, "list_avatars")
+    compare(frames[frames.length - 5].command, "get_state")
+    compare(frames[frames.length - 4].command, "list_chats")
+    compare(frames[frames.length - 3].command, "list_avatars")
+    compare(frames[frames.length - 2].command, "list_text_outbox")
     compare(frames[frames.length - 1].command, "list_voice_outbox")
   }
 
@@ -473,6 +485,9 @@ TestCase {
       { jid: "direct", name: "Direct", is_group: false },
       { jid: "group@g.us", name: "Group", is_group: true }
     ]
+    service.panelVisible = true
+    service.panelFocused = true
+    TestIo.socketWrites = []
     service.selectChat("group@g.us")
     compare(service.selectedChatJid, "group@g.us")
     compare(service.selectedChat.name, "Group")
@@ -485,7 +500,10 @@ TestCase {
 
     compare(service.sendMessage("  "), false)
     compare(service.sendMessage("hello"), true)
-    compare(lastFrame().command, "send_message")
+    var sendFrame = lastFrame()
+    compare(sendFrame.command, "send_message")
+    compare(sendFrame.text, "hello")
+    verify(/^qml-[0-9]+-[0-9]+$/.test(sendFrame.delivery_id))
     compare(service.reactToMessage(null, "👍"), false)
     compare(service.reactToMessage({ id: "m1", sender_jid: "sender", from_me: false }, "👍"), true)
     var reaction = lastFrame()
@@ -845,6 +863,174 @@ TestCase {
       event: "hello", protocol_version: service.protocolVersion
     }))
     verify(sentFrames().length > 0)
+  }
+
+  function test_text_message_is_only_complete_after_durable_acceptance() {
+    service.selectedChatJid = "chat"
+    compare(service.sendMessage("keep this draft"), true)
+    var request = lastFrame()
+    compare(request.command, "send_message")
+    verify(String(request.delivery_id).length > 0)
+    compare(textAcceptedCount, 0)
+    verify(service.textMessageRequests[String(request.id)] !== undefined)
+
+    service.handleLine(JSON.stringify({ event: "pong" }))
+    compare(textAcceptedCount, 0)
+    service.handleLine(JSON.stringify({
+      id: request.id,
+      event: "text_accepted",
+      delivery_id: request.delivery_id
+    }))
+    compare(textAcceptedCount, 1)
+    compare(acceptedDeliveryId, request.delivery_id)
+    compare(acceptedText, "keep this draft")
+    compare(service.textMessageRequests[String(request.id)], undefined)
+
+    service.handleLine(JSON.stringify({
+      event: "text_outbox",
+      entries: [{
+        delivery_id: request.delivery_id,
+        chat_jid: "chat",
+        text: "keep this draft",
+        status: "failed",
+        error: "offline"
+      }]
+    }))
+    compare(service.textOutboxEntries.length, 1)
+    var failed = service.textOutboxForChat("chat")
+    compare(failed.delivery_id, request.delivery_id)
+    compare(service.retryTextMessage(null), false)
+    compare(service.retryTextMessage(failed), true)
+    compare(lastFrame().command, "retry_text_message")
+    compare(service.textOutboxEntries[0].status, "queued")
+    compare(service.textOutboxForChat("chat"), null)
+    service.textOutboxEntries = [failed]
+    compare(service.discardTextMessage({ delivery_id: "", status: "failed" }), false)
+    compare(service.discardTextMessage({ delivery_id: "sending", status: "sending" }), false)
+    compare(service.discardTextMessage(failed), true)
+    compare(lastFrame().command, "discard_text_message")
+    compare(service.textOutboxEntries.length, 0)
+    service.handleLine(JSON.stringify({
+      event: "text_delivery",
+      delivery_id: request.delivery_id,
+      status: "failed",
+      error: "synthetic delivery failure"
+    }))
+    compare(service.lastError, "synthetic delivery failure")
+    compare(lastFrame().command, "list_text_outbox")
+  }
+
+  function test_generation_and_resource_sequences_prevent_regression() {
+    service.handleLine(JSON.stringify({
+      event: "chats", generation: 4, sequence: 10,
+      chats: [{ jid: "new", is_group: false }]
+    }))
+    compare(service.daemonGeneration, 4)
+    compare(service.chats[0].jid, "new")
+    service.handleLine(JSON.stringify({
+      event: "chats", generation: 4, sequence: 9,
+      chats: [{ jid: "stale", is_group: false }]
+    }))
+    compare(service.chats[0].jid, "new")
+    service.handleLine(JSON.stringify({
+      event: "chats", generation: 3, sequence: 99,
+      chats: [{ jid: "old-generation", is_group: false }]
+    }))
+    compare(service.chats[0].jid, "new")
+    service.handleLine(JSON.stringify({
+      event: "chats", generation: 5, sequence: 1,
+      chats: [{ jid: "next-generation", is_group: false }]
+    }))
+    compare(service.daemonGeneration, 5)
+    compare(service.chats[0].jid, "next-generation")
+  }
+
+  function test_invalidations_refresh_only_the_affected_resource() {
+    service.selectedChatJid = "chat"
+    TestIo.socketWrites = []
+    service.handleLine(JSON.stringify({
+      event: "invalidated", resource: "chats", generation: 1, sequence: 1
+    }))
+    compare(lastFrame().command, "list_chats")
+    service.handleLine(JSON.stringify({
+      event: "invalidated", resource: "messages", key: "other",
+      generation: 1, sequence: 2
+    }))
+    compare(lastFrame().command, "list_chats")
+    service.handleLine(JSON.stringify({
+      event: "invalidated", resource: "messages", key: "chat",
+      generation: 1, sequence: 3
+    }))
+    compare(lastFrame().command, "get_messages")
+    service.handleLine(JSON.stringify({
+      event: "invalidated", resource: "unread", generation: 1, sequence: 4
+    }))
+    compare(lastFrame().command, "get_state")
+    service.handleLine(JSON.stringify({
+      event: "invalidated", resource: "avatars", generation: 1, sequence: 5
+    }))
+    compare(lastFrame().command, "list_avatars")
+    service.handleLine(JSON.stringify({
+      event: "invalidated", resource: "text_outbox", generation: 1, sequence: 6
+    }))
+    compare(lastFrame().command, "list_text_outbox")
+    service.handleLine(JSON.stringify({
+      event: "invalidated", resource: "voice_outbox", generation: 1, sequence: 7
+    }))
+    compare(lastFrame().command, "list_voice_outbox")
+    compare(service.handleInvalidation({ resource: "unknown" }), false)
+  }
+
+  function test_read_intent_requires_visible_focus() {
+    service.chats = [{ jid: "one", is_group: false }, { jid: "two", is_group: false }]
+    TestIo.socketWrites = []
+    service.selectChat("one")
+    verify(!sentFrames().some(function(frame) { return frame.command === "mark_read" }))
+    compare(service.markSelectedRead(), false)
+    service.panelVisible = true
+    verify(!sentFrames().some(function(frame) { return frame.command === "mark_read" }))
+    service.selectChat("two")
+    verify(!sentFrames().some(function(frame) { return frame.command === "mark_read" }))
+    service.panelFocused = true
+    verify(sentFrames().some(function(frame) {
+      return frame.command === "mark_read" && frame.chat_jid === "two"
+    }))
+    TestIo.socketWrites = []
+    service.selectChat("one")
+    verify(sentFrames().some(function(frame) {
+      return frame.command === "mark_read" && frame.chat_jid === "one"
+    }))
+  }
+
+  function test_request_timeout_and_reconnect_clear_all_transient_maps() {
+    service.selectedChatJid = "chat"
+    compare(service.sendMessage("retry me"), true)
+    var request = lastFrame()
+    service.requestDeadlines[String(request.id)] = 1
+    compare(service.expireRequests(2), 1)
+    compare(service.textMessageRequests[String(request.id)], undefined)
+    verify(service.lastError.indexOf("send message timed out") >= 0)
+
+    service.mediaDownloadRequests = ({ "chat\nm1": true })
+    service.mediaDownloadRequestIds = ({ "999": "chat\nm1" })
+    service.messagesRequestIds = ({ chat: 998 })
+    service.messagesRequestJids = ({ "998": "chat" })
+    var socket = TestIo.sockets[TestIo.sockets.length - 1]
+    socket.connected = false
+    compare(Object.keys(service.mediaDownloadRequests).length, 0)
+    compare(Object.keys(service.mediaDownloadRequestIds).length, 0)
+    compare(Object.keys(service.messagesRequestIds).length, 0)
+    compare(Object.keys(service.messagesRequestJids).length, 0)
+  }
+
+  function test_unrelated_frames_do_not_clear_action_error() {
+    service.handleLine(JSON.stringify({ id: 4242, event: "error", message: "keep me" }))
+    compare(service.lastError, "keep me")
+    service.handleLine(JSON.stringify({ event: "unread", total: 3 }))
+    compare(service.lastError, "keep me")
+    service.selectedChatJid = "chat"
+    compare(service.sendMessage("new action"), true)
+    compare(service.lastError, "")
   }
 
   function test_reconnect_sequence() {

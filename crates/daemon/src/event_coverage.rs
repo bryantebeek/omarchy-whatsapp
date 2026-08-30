@@ -284,6 +284,7 @@ pub fn counts() -> (usize, usize, usize) {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -1,8 +1,10 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 24;
+pub const PROTOCOL_VERSION: u16 = 25;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -142,6 +144,37 @@ pub struct VoiceOutboxEntry {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextOutboxStatus {
+    Queued,
+    Sending,
+    Failed,
+    Sent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TextOutboxEntry {
+    pub delivery_id: String,
+    pub chat_jid: String,
+    pub text: String,
+    pub status: TextOutboxStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Resource {
+    Chats,
+    Messages,
+    Unread,
+    Avatars,
+    TextOutbox,
+    VoiceOutbox,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageMedia {
@@ -241,6 +274,8 @@ pub enum Command {
     SendMessage {
         chat_jid: String,
         text: String,
+        /// Stable client-generated identity used for durable, idempotent delivery.
+        delivery_id: String,
     },
     SendVoiceMessage {
         chat_jid: String,
@@ -250,6 +285,13 @@ pub enum Command {
         recording_id: String,
     },
     ListVoiceOutbox,
+    ListTextOutbox,
+    RetryTextMessage {
+        delivery_id: String,
+    },
+    DiscardTextMessage {
+        delivery_id: String,
+    },
     CreatePoll {
         chat_jid: String,
         question: String,
@@ -361,6 +403,23 @@ pub enum ServerEvent {
     Sent {
         message: Message,
     },
+    TextAccepted {
+        delivery_id: String,
+    },
+    TextOutbox {
+        entries: Vec<TextOutboxEntry>,
+    },
+    TextDelivery {
+        delivery_id: String,
+        status: TextOutboxStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    Invalidated {
+        resource: Resource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
     Receipts {
         message_ids: Vec<String>,
         receipt: u8,
@@ -411,19 +470,44 @@ pub enum ServerEvent {
 pub struct ServerFrame {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
+    /// `WhatsApp` client generation that produced this frame. A newer generation
+    /// invalidates delayed callbacks and responses from an older connection.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u64,
+    /// Monotonic daemon-local publication revision. Clients track it per
+    /// resource so delayed snapshots cannot regress newer state.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sequence: u64,
     #[serde(flatten)]
     pub event: ServerEvent,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip predicates receive references.
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl ServerFrame {
     #[must_use]
     pub fn response(id: Option<u64>, event: ServerEvent) -> Self {
-        Self { id, event }
+        Self {
+            id,
+            generation: 0,
+            sequence: 0,
+            event,
+        }
     }
 
     #[must_use]
     pub fn event(event: ServerEvent) -> Self {
-        Self { id: None, event }
+        Self::response(None, event)
+    }
+
+    #[must_use]
+    pub const fn with_metadata(mut self, generation: u64, sequence: u64) -> Self {
+        self.generation = generation;
+        self.sequence = sequence;
+        self
     }
 }
 
@@ -472,6 +556,7 @@ fn state_base(xdg_state_home: Option<OsString>, platform_state_dir: Option<PathB
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -482,6 +567,7 @@ mod tests {
             Command::SendMessage {
                 chat_jid: "31612345678@s.whatsapp.net".into(),
                 text: "hello".into(),
+                delivery_id: "synthetic-7".into(),
             },
         );
         let json = serde_json::to_string(&frame).unwrap();

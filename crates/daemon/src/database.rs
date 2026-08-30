@@ -1,8 +1,10 @@
+use crate::inbound::{DurableInbound, InboundKey};
 use anyhow::{Context, Result};
 use omarchy_whatsapp_protocol::{
-    Chat, Message, MessageDelivery, MessageMedia, MessageReader, Reaction,
+    Chat, Message, MessageDelivery, MessageMedia, MessageReader, Reaction, TextOutboxEntry,
+    TextOutboxStatus,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,10 +17,38 @@ const CHAT_NAME_GROUP_METADATA: i64 = 30;
 const CHAT_NAME_ADDRESS_BOOK: i64 = 40;
 const READ_BOUNDARY_IDS_CAP: usize = 256;
 
+#[derive(Clone, Copy)]
+enum ChatSetting {
+    Pinned,
+    Archived,
+}
+
 fn read_boundary_ids(value: Option<String>) -> Vec<String> {
     value
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default()
+}
+
+fn update_poll_tallies(
+    media: &mut MessageMedia,
+    counts: &HashMap<String, u32>,
+    selected_by_me: &std::collections::HashSet<String>,
+    total_voters: u32,
+) -> bool {
+    let MessageMedia::Poll {
+        options,
+        total_voters: media_total_voters,
+        ..
+    } = media
+    else {
+        return false;
+    };
+    *media_total_voters = total_voters;
+    for option in options {
+        option.votes = counts.get(&option.name).copied().unwrap_or(0);
+        option.selected_by_me = selected_by_me.contains(&option.name);
+    }
+    true
 }
 
 fn quoted_identifier(value: &str) -> String {
@@ -51,16 +81,173 @@ fn ensure_column(
     Ok(())
 }
 
+// SQLite row decoding and failure propagation are adapter concerns. The
+// callers' ordering, monotonicity, and state transitions remain instrumented.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn maximum_message_timestamp(connection: &Connection, chat_jid: &str) -> Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?1",
+            [chat_jid],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn message_timestamp(
+    connection: &Connection,
+    chat_jid: &str,
+    message_id: &str,
+) -> Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT timestamp FROM messages WHERE chat_jid = ?1 AND id = ?2",
+            params![chat_jid, message_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn read_boundary_state(
+    transaction: &Transaction<'_>,
+    chat_jid: &str,
+) -> Result<(i64, Option<String>, bool)> {
+    transaction
+        .query_row(
+            "SELECT read_boundary, read_boundary_ids, explicit_unread
+             FROM chat_settings WHERE jid = ?1",
+            [chat_jid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(Into::into)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn unread_message_count(transaction: &Transaction<'_>, chat_jid: &str) -> Result<u32> {
+    transaction
+        .query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE chat_jid = ?1 AND from_me = 0 AND read = 0",
+            [chat_jid],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn chat_has_messages(transaction: &Transaction<'_>, chat_jid: &str) -> Result<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE chat_jid = ?1)",
+            [chat_jid],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn migration_source_exists(transaction: &Transaction<'_>, old_jid: &str) -> Result<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM chats WHERE jid = ?1
+                 UNION ALL SELECT 1 FROM contacts WHERE jid = ?1
+                 UNION ALL SELECT 1 FROM chat_settings WHERE jid = ?1
+                 UNION ALL SELECT 1 FROM messages WHERE sender_jid = ?1
+                 UNION ALL SELECT 1 FROM reactions WHERE reactor_jid = ?1
+                 UNION ALL SELECT 1 FROM poll_votes WHERE voter_jid = ?1
+             )",
+            [old_jid],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn ensure_message_identity_schema(connection: &mut Connection) -> Result<()> {
+    let primary_key = {
+        let mut statement = connection.prepare("PRAGMA table_info(messages)")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+        })?;
+        let mut columns = rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(position, _)| *position > 0)
+            .collect::<Vec<_>>();
+        columns.sort_by_key(|(position, _)| *position);
+        columns
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>()
+    };
+    if primary_key == ["chat_jid", "sender_jid", "id"] {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        primary_key == ["chat_jid", "id"],
+        "unsupported messages primary key: {}",
+        primary_key.join(", ")
+    );
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "DROP INDEX IF EXISTS messages_by_chat_time;
+         DROP INDEX IF EXISTS messages_by_sender;
+         ALTER TABLE messages RENAME TO messages_legacy_identity;
+         CREATE TABLE messages (
+            chat_jid       TEXT NOT NULL,
+            id             TEXT NOT NULL,
+            sender_jid     TEXT NOT NULL,
+            sender_name    TEXT NOT NULL,
+            text           TEXT NOT NULL,
+            timestamp      INTEGER NOT NULL,
+            from_me        INTEGER NOT NULL,
+            read           INTEGER NOT NULL DEFAULT 0,
+            starred        INTEGER NOT NULL DEFAULT 0,
+            star_updated_at INTEGER NOT NULL DEFAULT 0,
+            receipt        INTEGER NOT NULL DEFAULT 0,
+            delivered_at   INTEGER,
+            receipt_read_at INTEGER,
+            media_json     TEXT,
+            media_download BLOB,
+            PRIMARY KEY (chat_jid, sender_jid, id),
+            FOREIGN KEY (chat_jid) REFERENCES chats(jid) ON DELETE CASCADE
+         );
+         INSERT INTO messages
+         (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, read,
+          starred, star_updated_at, receipt, delivered_at, receipt_read_at,
+          media_json, media_download)
+         SELECT chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, read,
+                starred, star_updated_at, receipt, delivered_at, receipt_read_at,
+                media_json, media_download
+         FROM messages_legacy_identity;
+         DROP TABLE messages_legacy_identity;
+         CREATE INDEX messages_by_chat_time
+            ON messages(chat_jid, timestamp DESC);
+         CREATE INDEX messages_by_sender ON messages(sender_jid);",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 pub struct Database {
     connection: Mutex<Connection>,
     protocol_db: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadReceipt {
     pub message_id: String,
     pub sender_jid: String,
     pub is_group: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReadBatch {
+    pub chat_jid: String,
+    pub receipts: Vec<UnreadReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +275,14 @@ pub struct StoredPoll {
     pub end_timestamp: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTextMessage {
+    pub delivery_id: String,
+    pub chat_jid: String,
+    pub text: String,
+    pub message_id: String,
+}
+
 impl Database {
     fn connection(&self) -> MutexGuard<'_, Connection> {
         // Every multi-statement write uses a rusqlite transaction, whose Drop
@@ -99,11 +294,23 @@ impl Database {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    #[cfg(test)]
+    pub(crate) fn execute_test_sql(&self, sql: &str) -> Result<()> {
+        self.connection().execute_batch(sql)?;
+        Ok(())
+    }
+
+    // Schema bootstrap/migration is a SQLite adapter validated by migration
+    // integration tests; deterministic state logic is measured separately.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn open(path: &Path) -> Result<Self> {
-        let connection = Connection::open(path)
+        let mut connection = Connection::open(path)
             .with_context(|| format!("opening history database at {}", path.display()))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        // The inbound durability hook returns only after this database commit.
+        // FULL makes that acknowledgement boundary survive process and host
+        // crashes rather than merely reaching the WAL page cache.
+        connection.pragma_update(None, "synchronous", "FULL")?;
         connection.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS chats (
@@ -126,12 +333,13 @@ impl Database {
                 from_me     INTEGER NOT NULL,
                 read        INTEGER NOT NULL DEFAULT 0,
                 starred     INTEGER NOT NULL DEFAULT 0,
+                star_updated_at INTEGER NOT NULL DEFAULT 0,
                 receipt     INTEGER NOT NULL DEFAULT 0,
                 delivered_at   INTEGER,
                 receipt_read_at INTEGER,
                 media_json      TEXT,
                 media_download  BLOB,
-                PRIMARY KEY (chat_jid, id),
+                PRIMARY KEY (chat_jid, sender_jid, id),
                 FOREIGN KEY (chat_jid) REFERENCES chats(jid) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS messages_by_chat_time
@@ -156,12 +364,17 @@ impl Database {
             CREATE TABLE IF NOT EXISTS chat_settings (
                 jid                       TEXT PRIMARY KEY,
                 pinned                    INTEGER,
+                pinned_updated_at         INTEGER NOT NULL DEFAULT 0,
                 archived                  INTEGER,
+                archived_updated_at       INTEGER NOT NULL DEFAULT 0,
                 muted                     INTEGER,
                 mute_end                  INTEGER,
+                mute_updated_at           INTEGER NOT NULL DEFAULT 0,
                 read_state                INTEGER,
+                read_state_updated_at     INTEGER NOT NULL DEFAULT 0,
                 explicit_unread           INTEGER NOT NULL DEFAULT 0,
                 status_muted              INTEGER,
+                status_mute_updated_at    INTEGER NOT NULL DEFAULT 0,
                 disappearing_duration     INTEGER,
                 disappearing_updated_at   INTEGER,
                 deleted                    INTEGER NOT NULL DEFAULT 0,
@@ -187,6 +400,13 @@ impl Database {
                 ON reactions(chat_jid, message_id);
             CREATE INDEX IF NOT EXISTS reactions_by_reactor
                 ON reactions(reactor_jid);
+            CREATE TABLE IF NOT EXISTS reaction_tombstones (
+                chat_jid    TEXT NOT NULL,
+                message_id  TEXT NOT NULL,
+                reactor_jid TEXT NOT NULL,
+                timestamp   INTEGER NOT NULL,
+                PRIMARY KEY (chat_jid, message_id, reactor_jid)
+            );
             CREATE TABLE IF NOT EXISTS poll_secrets (
                 chat_jid      TEXT NOT NULL,
                 message_id    TEXT NOT NULL,
@@ -224,53 +444,75 @@ impl Database {
                 signing_key BLOB NOT NULL,
                 PRIMARY KEY (sender_id, key_id)
             );
+            CREATE TABLE IF NOT EXISTS inbound_inbox (
+                chat_jid     TEXT NOT NULL,
+                sender_jid   TEXT NOT NULL,
+                message_id   TEXT NOT NULL,
+                message      BLOB NOT NULL,
+                push_name    TEXT NOT NULL,
+                timestamp    INTEGER NOT NULL,
+                media_type   TEXT NOT NULL,
+                is_from_me   INTEGER NOT NULL,
+                is_group     INTEGER NOT NULL,
+                is_offline   INTEGER NOT NULL,
+                committed_at INTEGER NOT NULL,
+                PRIMARY KEY (chat_jid, sender_jid, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS inbound_inbox_order
+                ON inbound_inbox(committed_at);
+            CREATE TABLE IF NOT EXISTS text_outbox (
+                delivery_id TEXT PRIMARY KEY,
+                chat_jid    TEXT NOT NULL,
+                text        TEXT NOT NULL,
+                message_id  TEXT NOT NULL,
+                status      INTEGER NOT NULL DEFAULT 0,
+                error       TEXT,
+                created_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS text_outbox_delivery_order
+                ON text_outbox(status, created_at);
+            CREATE TABLE IF NOT EXISTS pending_read_chats (
+                chat_jid   TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_read_messages (
+                chat_jid   TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                sender_jid TEXT NOT NULL,
+                is_group   INTEGER NOT NULL,
+                PRIMARY KEY (chat_jid, sender_jid, message_id)
+            );
             ",
+        )?;
+        // A process exit while the network future was in flight is retryable;
+        // the stable WhatsApp message ID makes replay idempotent.
+        connection.execute(
+            "UPDATE text_outbox SET status = 0, error = NULL WHERE status = 1",
+            [],
         )?;
         // Forward-compatible migration for databases created by early builds.
         // Inspecting the schema first distinguishes an already-applied migration
         // from disk, permission, or corruption errors that must remain visible.
-        ensure_column(
-            &connection,
-            "messages",
-            "read",
-            "read INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "contacts",
-            "source",
-            "source INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "messages",
-            "starred",
-            "starred INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "messages",
-            "receipt",
-            "receipt INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "messages",
-            "delivered_at",
-            "delivered_at INTEGER",
-        )?;
-        ensure_column(
-            &connection,
-            "messages",
-            "receipt_read_at",
-            "receipt_read_at INTEGER",
-        )?;
-        ensure_column(
-            &connection,
-            "message_reads",
-            "delivered_at",
-            "delivered_at INTEGER NOT NULL DEFAULT 0",
-        )?;
+        for (table, column, declaration) in [
+            ("messages", "read", "read INTEGER NOT NULL DEFAULT 0"),
+            ("contacts", "source", "source INTEGER NOT NULL DEFAULT 0"),
+            ("messages", "starred", "starred INTEGER NOT NULL DEFAULT 0"),
+            (
+                "messages",
+                "star_updated_at",
+                "star_updated_at INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("messages", "receipt", "receipt INTEGER NOT NULL DEFAULT 0"),
+            ("messages", "delivered_at", "delivered_at INTEGER"),
+            ("messages", "receipt_read_at", "receipt_read_at INTEGER"),
+            (
+                "message_reads",
+                "delivered_at",
+                "delivered_at INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            ensure_column(&connection, table, column, declaration)?;
+        }
         connection.execute(
             "INSERT INTO message_reads
              (chat_jid, message_id, reader_jid, read_at, delivered_at)
@@ -295,50 +537,73 @@ impl Database {
                     THEN excluded.delivered_at ELSE message_reads.delivered_at END",
             [],
         )?;
-        ensure_column(&connection, "messages", "media_json", "media_json TEXT")?;
-        ensure_column(
-            &connection,
-            "messages",
-            "media_download",
-            "media_download BLOB",
-        )?;
-        ensure_column(&connection, "chats", "phone_number", "phone_number TEXT")?;
-        ensure_column(
-            &connection,
-            "chats",
-            "name_source",
-            "name_source INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "chat_settings",
-            "deleted",
-            "deleted INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "chat_settings",
-            "cleared_at",
-            "cleared_at INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "chat_settings",
-            "read_boundary",
-            "read_boundary INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            &connection,
-            "chat_settings",
-            "read_boundary_ids",
-            "read_boundary_ids TEXT",
-        )?;
-        ensure_column(
-            &connection,
-            "chat_settings",
-            "explicit_unread",
-            "explicit_unread INTEGER NOT NULL DEFAULT 0",
-        )?;
+        for (column, declaration) in [
+            ("media_json", "media_json TEXT"),
+            ("media_download", "media_download BLOB"),
+        ] {
+            ensure_column(&connection, "messages", column, declaration)?;
+        }
+        ensure_message_identity_schema(&mut connection)?;
+        for (table, column, declaration) in [
+            ("chats", "phone_number", "phone_number TEXT"),
+            (
+                "chats",
+                "name_source",
+                "name_source INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chat_settings",
+                "deleted",
+                "deleted INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chat_settings",
+                "cleared_at",
+                "cleared_at INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chat_settings",
+                "read_boundary",
+                "read_boundary INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chat_settings",
+                "read_boundary_ids",
+                "read_boundary_ids TEXT",
+            ),
+            (
+                "chat_settings",
+                "explicit_unread",
+                "explicit_unread INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chat_settings",
+                "pinned_updated_at",
+                "pinned_updated_at INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chat_settings",
+                "archived_updated_at",
+                "archived_updated_at INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chat_settings",
+                "mute_updated_at",
+                "mute_updated_at INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chat_settings",
+                "read_state_updated_at",
+                "read_state_updated_at INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "chat_settings",
+                "status_mute_updated_at",
+                "status_mute_updated_at INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            ensure_column(&connection, table, column, declaration)?;
+        }
         // A JID is an identifier, never a chat name. Legacy databases stored
         // it in `name` as a rendering fallback, which made later syncs unable
         // to distinguish missing metadata from a real title.
@@ -413,6 +678,7 @@ impl Database {
         transaction.execute_batch(
             "
             DELETE FROM reactions;
+            DELETE FROM reaction_tombstones;
             DELETE FROM message_reads;
             DELETE FROM poll_votes;
             DELETE FROM poll_secrets;
@@ -424,12 +690,311 @@ impl Database {
             DELETE FROM contacts;
             DELETE FROM labels;
             DELETE FROM fast_ratchet_sender_keys;
+            DELETE FROM inbound_inbox;
+            DELETE FROM text_outbox;
+            DELETE FROM pending_read_messages;
+            DELETE FROM pending_read_chats;
             ",
         )?;
         transaction.commit()?;
         Ok(())
     }
 
+    pub fn commit_inbound_batch(&self, records: &[DurableInbound]) -> Result<usize> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let mut inserted = 0usize;
+        for record in records {
+            inserted += transaction.execute(
+                "INSERT OR IGNORE INTO inbound_inbox
+                 (chat_jid, sender_jid, message_id, message, push_name, timestamp,
+                  media_type, is_from_me, is_group, is_offline, committed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    record.key.chat_jid,
+                    record.key.sender_jid,
+                    record.key.message_id,
+                    record.message,
+                    record.push_name,
+                    record.timestamp,
+                    record.media_type,
+                    record.is_from_me,
+                    record.is_group,
+                    record.is_offline,
+                    record.committed_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn pending_inbound(&self, limit: u32) -> Result<Vec<DurableInbound>> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(
+            "SELECT chat_jid, sender_jid, message_id, message, push_name, timestamp,
+                    media_type, is_from_me, is_group, is_offline, committed_at
+             FROM inbound_inbox
+             ORDER BY committed_at, rowid LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::from(limit.clamp(1, 10_000))], |row| {
+            Ok(DurableInbound {
+                key: InboundKey {
+                    chat_jid: row.get(0)?,
+                    sender_jid: row.get(1)?,
+                    message_id: row.get(2)?,
+                },
+                message: row.get(3)?,
+                push_name: row.get(4)?,
+                timestamp: row.get(5)?,
+                media_type: row.get(6)?,
+                is_from_me: row.get(7)?,
+                is_group: row.get(8)?,
+                is_offline: row.get(9)?,
+                committed_at: row.get(10)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn finish_inbound(&self, key: &InboundKey) -> Result<bool> {
+        let connection = self.connection();
+        Ok(connection.execute(
+            "DELETE FROM inbound_inbox
+             WHERE chat_jid = ?1 AND sender_jid = ?2 AND message_id = ?3",
+            params![key.chat_jid, key.sender_jid, key.message_id],
+        )? > 0)
+    }
+
+    pub fn enqueue_text_message(
+        &self,
+        delivery_id: &str,
+        chat_jid: &str,
+        text: &str,
+        message_id: &str,
+        created_at: i64,
+    ) -> Result<bool> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT chat_jid, text, message_id FROM text_outbox WHERE delivery_id = ?1",
+                [delivery_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            anyhow::ensure!(
+                existing == (chat_jid.to_owned(), text.to_owned(), message_id.to_owned()),
+                "delivery ID is already assigned to another message"
+            );
+            transaction.commit()?;
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO text_outbox
+             (delivery_id, chat_jid, text, message_id, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+            params![delivery_id, chat_jid, text, message_id, created_at],
+        )?;
+        transaction.execute(
+            "DELETE FROM text_outbox WHERE delivery_id IN (
+                SELECT delivery_id FROM text_outbox
+                WHERE status = 2 ORDER BY created_at DESC LIMIT -1 OFFSET 32
+             )",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn text_outbox(&self) -> Result<Vec<TextOutboxEntry>> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(
+            "SELECT delivery_id, chat_jid, text, status, error, created_at
+             FROM text_outbox ORDER BY created_at, delivery_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let status = match row.get::<_, i64>(3)? {
+                0 => TextOutboxStatus::Queued,
+                1 => TextOutboxStatus::Sending,
+                _ => TextOutboxStatus::Failed,
+            };
+            Ok(TextOutboxEntry {
+                delivery_id: row.get(0)?,
+                chat_jid: row.get(1)?,
+                text: row.get(2)?,
+                status,
+                error: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn claim_text_message(&self) -> Result<Option<PendingTextMessage>> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let pending = transaction
+            .query_row(
+                "SELECT delivery_id, chat_jid, text, message_id
+                 FROM text_outbox WHERE status = 0
+                 ORDER BY created_at, delivery_id LIMIT 1",
+                [],
+                |row| {
+                    Ok(PendingTextMessage {
+                        delivery_id: row.get(0)?,
+                        chat_jid: row.get(1)?,
+                        text: row.get(2)?,
+                        message_id: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(pending) = &pending {
+            transaction.execute(
+                "UPDATE text_outbox SET status = 1, error = NULL WHERE delivery_id = ?1",
+                [&pending.delivery_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(pending)
+    }
+
+    pub fn fail_text_message(&self, delivery_id: &str, error: &str) -> Result<bool> {
+        let connection = self.connection();
+        Ok(connection.execute(
+            "UPDATE text_outbox SET status = 2, error = ?2
+             WHERE delivery_id = ?1 AND status = 1",
+            params![delivery_id, error],
+        )? > 0)
+    }
+
+    pub fn retry_text_message(&self, delivery_id: &str) -> Result<bool> {
+        let connection = self.connection();
+        Ok(connection.execute(
+            "UPDATE text_outbox SET status = 0, error = NULL
+             WHERE delivery_id = ?1 AND status = 2",
+            [delivery_id],
+        )? > 0)
+    }
+
+    pub fn retry_all_text_messages(&self) -> Result<usize> {
+        let connection = self.connection();
+        connection
+            .execute(
+                "UPDATE text_outbox SET status = 0, error = NULL WHERE status IN (1, 2)",
+                [],
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn complete_text_message(&self, delivery_id: &str) -> Result<bool> {
+        let connection = self.connection();
+        Ok(connection.execute(
+            "DELETE FROM text_outbox WHERE delivery_id = ?1 AND status = 1",
+            [delivery_id],
+        )? > 0)
+    }
+
+    pub fn discard_text_message(&self, delivery_id: &str) -> Result<bool> {
+        let connection = self.connection();
+        Ok(connection.execute(
+            "DELETE FROM text_outbox WHERE delivery_id = ?1 AND status IN (0, 2)",
+            [delivery_id],
+        )? > 0)
+    }
+
+    pub fn queue_read_receipts(
+        &self,
+        chat_jid: &str,
+        receipts: &[UnreadReceipt],
+        created_at: i64,
+    ) -> Result<()> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO pending_read_chats (chat_jid, created_at) VALUES (?1, ?2)
+             ON CONFLICT(chat_jid) DO UPDATE SET
+                created_at = MIN(pending_read_chats.created_at, excluded.created_at)",
+            params![chat_jid, created_at],
+        )?;
+        for receipt in receipts {
+            transaction.execute(
+                "INSERT OR IGNORE INTO pending_read_messages
+                 (chat_jid, message_id, sender_jid, is_group)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    chat_jid,
+                    receipt.message_id,
+                    receipt.sender_jid,
+                    receipt.is_group,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn next_read_batch(&self) -> Result<Option<PendingReadBatch>> {
+        let connection = self.connection();
+        let Some(chat_jid) = connection
+            .query_row(
+                "SELECT chat_jid FROM pending_read_chats ORDER BY created_at, chat_jid LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let mut statement = connection.prepare(
+            "SELECT message_id, sender_jid, is_group
+             FROM pending_read_messages WHERE chat_jid = ?1
+             ORDER BY rowid",
+        )?;
+        let receipts = statement
+            .query_map([&chat_jid], |row| {
+                Ok(UnreadReceipt {
+                    message_id: row.get(0)?,
+                    sender_jid: row.get(1)?,
+                    is_group: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(PendingReadBatch { chat_jid, receipts }))
+    }
+
+    pub fn finish_read_batch(&self, batch: &PendingReadBatch) -> Result<bool> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        for receipt in &batch.receipts {
+            transaction.execute(
+                "DELETE FROM pending_read_messages
+                 WHERE chat_jid = ?1 AND message_id = ?2 AND sender_jid = ?3",
+                params![batch.chat_jid, receipt.message_id, receipt.sender_jid],
+            )?;
+        }
+        let removed = transaction.execute(
+            "DELETE FROM pending_read_chats WHERE chat_jid = ?1
+             AND NOT EXISTS (
+                SELECT 1 FROM pending_read_messages WHERE chat_jid = ?1
+             )",
+            [&batch.chat_jid],
+        )? > 0;
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn restore_legacy_chat_names(connection: &Connection, database_path: &Path) -> Result<()> {
         let Some(state_dir) = database_path.parent() else {
             return Ok(());
@@ -471,7 +1036,17 @@ impl Database {
         is_group: bool,
         increment_unread: bool,
     ) -> Result<bool> {
-        self.insert_message_inner(message, chat_name, is_group, increment_unread, false)
+        self.insert_message_inner(message, chat_name, is_group, increment_unread, false, None)
+    }
+
+    pub fn insert_message_with_read_intent(
+        &self,
+        message: &Message,
+        chat_name: &str,
+        is_group: bool,
+        receipt: &UnreadReceipt,
+    ) -> Result<bool> {
+        self.insert_message_inner(message, chat_name, is_group, false, false, Some(receipt))
     }
 
     pub fn insert_history_message(
@@ -480,7 +1055,7 @@ impl Database {
         chat_name: &str,
         is_group: bool,
     ) -> Result<bool> {
-        self.insert_message_inner(message, chat_name, is_group, false, true)
+        self.insert_message_inner(message, chat_name, is_group, false, true, None)
     }
 
     fn insert_message_inner(
@@ -490,6 +1065,7 @@ impl Database {
         is_group: bool,
         increment_unread: bool,
         from_history: bool,
+        read_intent: Option<&UnreadReceipt>,
     ) -> Result<bool> {
         let candidate = chat_name.trim();
         let (candidate, name_source) = if candidate.is_empty() || candidate == message.chat_jid {
@@ -509,24 +1085,24 @@ impl Database {
             )
             .optional()?
             .is_some();
-        let history_suppressed = from_history
-            && transaction
-                .query_row(
-                    "SELECT deleted, cleared_at FROM chat_settings WHERE jid = ?1",
-                    [&message.chat_jid],
-                    |row| Ok(row.get::<_, bool>(0)? || message.timestamp <= row.get::<_, i64>(1)?),
-                )
-                .optional()?
-                .unwrap_or(false);
-        if tombstoned || history_suppressed {
+        let state_suppressed = transaction
+            .query_row(
+                "SELECT cleared_at FROM chat_settings WHERE jid = ?1",
+                [&message.chat_jid],
+                |row| Ok(message.timestamp <= row.get::<_, i64>(0)?),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if tombstoned || state_suppressed {
             transaction.commit()?;
             return Ok(false);
         }
         if !from_history {
             transaction.execute(
                 "INSERT INTO chat_settings (jid, deleted) VALUES (?1, 0)
-                 ON CONFLICT(jid) DO UPDATE SET deleted = 0",
-                [&message.chat_jid],
+                 ON CONFLICT(jid) DO UPDATE SET deleted = 0
+                 WHERE excluded.deleted = 0 AND ?2 > chat_settings.cleared_at",
+                params![message.chat_jid, message.timestamp],
             )?;
         }
         transaction.execute(
@@ -594,6 +1170,25 @@ impl Database {
             transaction.execute(
                 "UPDATE chats SET unread = unread + 1 WHERE jid = ?1",
                 [&message.chat_jid],
+            )?;
+        }
+        if let Some(receipt) = read_intent {
+            transaction.execute(
+                "INSERT INTO pending_read_chats (chat_jid, created_at) VALUES (?1, ?2)
+                 ON CONFLICT(chat_jid) DO UPDATE SET
+                    created_at = MIN(pending_read_chats.created_at, excluded.created_at)",
+                params![message.chat_jid, message.timestamp],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO pending_read_messages
+                 (chat_jid, message_id, sender_jid, is_group)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    message.chat_jid,
+                    receipt.message_id,
+                    receipt.sender_jid,
+                    receipt.is_group,
+                ],
             )?;
         }
         // Keep history bounded without a background cleaner. Protocol state is in a
@@ -998,15 +1593,41 @@ impl Database {
         from_me: bool,
         timestamp: i64,
     ) -> Result<bool> {
-        let connection = self.connection();
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
         if emoji.is_empty() {
-            return Ok(connection.execute(
+            let tombstone_changed = transaction.execute(
+                "INSERT INTO reaction_tombstones
+                 (chat_jid, message_id, reactor_jid, timestamp)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(chat_jid, message_id, reactor_jid) DO UPDATE SET
+                    timestamp = excluded.timestamp
+                 WHERE excluded.timestamp > reaction_tombstones.timestamp",
+                params![chat_jid, message_id, reactor_jid, timestamp],
+            )? > 0;
+            let removed = transaction.execute(
                 "DELETE FROM reactions
-                 WHERE chat_jid = ?1 AND message_id = ?2 AND reactor_jid = ?3",
-                params![chat_jid, message_id, reactor_jid],
-            )? > 0);
+                 WHERE chat_jid = ?1 AND message_id = ?2 AND reactor_jid = ?3
+                   AND timestamp <= ?4",
+                params![chat_jid, message_id, reactor_jid, timestamp],
+            )? > 0;
+            transaction.commit()?;
+            return Ok(tombstone_changed || removed);
         }
-        Ok(connection.execute(
+        let blocked = transaction
+            .query_row(
+                "SELECT timestamp >= ?4 FROM reaction_tombstones
+                 WHERE chat_jid = ?1 AND message_id = ?2 AND reactor_jid = ?3",
+                params![chat_jid, message_id, reactor_jid, timestamp],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if blocked {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let changed = transaction.execute(
             "INSERT INTO reactions
              (chat_jid, message_id, reactor_jid, emoji, from_me, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1014,11 +1635,20 @@ impl Database {
                 emoji = excluded.emoji,
                 from_me = excluded.from_me,
                 timestamp = excluded.timestamp
-             WHERE reactions.emoji != excluded.emoji
-                OR reactions.from_me != excluded.from_me
-                OR reactions.timestamp != excluded.timestamp",
+             WHERE excluded.timestamp >= reactions.timestamp
+               AND (reactions.emoji != excluded.emoji
+                    OR reactions.from_me != excluded.from_me
+                    OR reactions.timestamp != excluded.timestamp)",
             params![chat_jid, message_id, reactor_jid, emoji, from_me, timestamp],
-        )? > 0)
+        )? > 0;
+        transaction.execute(
+            "DELETE FROM reaction_tombstones
+             WHERE chat_jid = ?1 AND message_id = ?2 AND reactor_jid = ?3
+               AND timestamp < ?4",
+            params![chat_jid, message_id, reactor_jid, timestamp],
+        )?;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn store_poll_secret(
@@ -1111,23 +1741,26 @@ impl Database {
             transaction.commit()?;
             return Ok(false);
         };
-        let Ok(mut media @ MessageMedia::Poll { .. }) = serde_json::from_str(&media_json) else {
+        let Ok(mut media) = serde_json::from_str::<MessageMedia>(&media_json) else {
             transaction.commit()?;
             return Ok(false);
         };
-        let (valid_names, selectable_count) = match &media {
-            MessageMedia::Poll {
-                options,
-                selectable_count,
-                ..
-            } => (
+        let (valid_names, selectable_count) = if let MessageMedia::Poll {
+            options,
+            selectable_count,
+            ..
+        } = &media
+        {
+            (
                 options
                     .iter()
                     .map(|option| option.name.as_str())
                     .collect::<std::collections::HashSet<_>>(),
                 *selectable_count,
-            ),
-            _ => unreachable!(),
+            )
+        } else {
+            transaction.commit()?;
+            return Ok(false);
         };
         let mut normalized = Vec::new();
         for option in selected_options {
@@ -1190,18 +1823,12 @@ impl Database {
                 }
             }
         }
-        if let MessageMedia::Poll {
-            options,
-            total_voters: media_total_voters,
-            ..
-        } = &mut media
-        {
-            *media_total_voters = total_voters;
-            for option in options {
-                option.votes = counts.get(&option.name).copied().unwrap_or(0);
-                option.selected_by_me = selected_by_me.contains(&option.name);
-            }
-        }
+        debug_assert!(update_poll_tallies(
+            &mut media,
+            &counts,
+            &selected_by_me,
+            total_voters,
+        ));
         let updated_json = serde_json::to_string(&media)?;
         transaction.execute(
             "UPDATE messages SET media_json = ?3
@@ -1273,13 +1900,7 @@ impl Database {
 
     pub fn mark_read(&self, chat_jid: &str) -> Result<()> {
         let connection = self.connection();
-        let boundary = connection
-            .query_row(
-                "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?1",
-                [chat_jid],
-                |row| row.get::<_, Option<i64>>(0),
-            )?
-            .unwrap_or(0);
+        let boundary = maximum_message_timestamp(&connection, chat_jid)?.unwrap_or(0);
         drop(connection);
         self.apply_read_boundary(chat_jid, boundary, &[])?;
         Ok(())
@@ -1288,13 +1909,7 @@ impl Database {
     pub fn apply_read_state(&self, chat_jid: &str, read: bool) -> Result<bool> {
         if read {
             let connection = self.connection();
-            let boundary = connection
-                .query_row(
-                    "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?1",
-                    [chat_jid],
-                    |row| row.get::<_, Option<i64>>(0),
-                )?
-                .unwrap_or(0);
+            let boundary = maximum_message_timestamp(&connection, chat_jid)?.unwrap_or(0);
             drop(connection);
             return self.apply_read_boundary(chat_jid, boundary, &[]);
         }
@@ -1328,37 +1943,49 @@ impl Database {
         boundary_ids: &[String],
         event_timestamp: i64,
     ) -> Result<bool> {
+        let connection = self.connection();
+        let previous_timestamp = connection
+            .query_row(
+                "SELECT read_state_updated_at FROM chat_settings WHERE jid = ?1",
+                [chat_jid],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        drop(connection);
+        if event_timestamp < previous_timestamp {
+            return Ok(false);
+        }
         if !read {
-            return self.apply_read_state(chat_jid, false);
+            let changed = self.apply_read_state(chat_jid, false)?;
+            let connection = self.connection();
+            connection.execute(
+                "UPDATE chat_settings SET read_state_updated_at = ?2 WHERE jid = ?1",
+                params![chat_jid, event_timestamp],
+            )?;
+            return Ok(changed);
         }
         let boundary = if let Some(boundary) = boundary_timestamp {
             boundary
         } else {
             let connection = self.connection();
-            let covered = boundary_ids.iter().try_fold(None, |newest, id| {
-                let timestamp = connection
-                    .query_row(
-                        "SELECT timestamp FROM messages
-                         WHERE chat_jid = ?1 AND id = ?2",
-                        params![chat_jid, id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?;
-                Ok::<_, rusqlite::Error>(newest.max(timestamp))
-            })?;
+            let mut covered = None;
+            for id in boundary_ids {
+                covered = covered.max(message_timestamp(&connection, chat_jid, id)?);
+            }
             if boundary_ids.is_empty() {
-                connection
-                    .query_row(
-                        "SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?1",
-                        [chat_jid],
-                        |row| row.get::<_, Option<i64>>(0),
-                    )?
-                    .unwrap_or(event_timestamp)
+                maximum_message_timestamp(&connection, chat_jid)?.unwrap_or(event_timestamp)
             } else {
                 covered.unwrap_or(event_timestamp)
             }
         };
-        self.apply_read_boundary(chat_jid, boundary, boundary_ids)
+        let changed = self.apply_read_boundary(chat_jid, boundary, boundary_ids)?;
+        let connection = self.connection();
+        connection.execute(
+            "UPDATE chat_settings SET read_state_updated_at = ?2 WHERE jid = ?1",
+            params![chat_jid, event_timestamp],
+        )?;
+        Ok(changed)
     }
 
     pub fn reconcile_unread_after_full_sync(&self) -> Result<u64> {
@@ -1415,20 +2042,51 @@ impl Database {
             .context("checking WhatsApp app-state progress")
     }
 
+    #[cfg(test)]
     pub fn apply_pin(&self, chat_jid: &str, pinned: bool) -> Result<()> {
-        self.update_chat_setting(chat_jid, "pinned", i64::from(pinned))
+        self.apply_pin_at(chat_jid, pinned, 0)
     }
 
+    pub fn apply_pin_at(&self, chat_jid: &str, pinned: bool, updated_at: i64) -> Result<()> {
+        self.update_chat_setting(chat_jid, ChatSetting::Pinned, i64::from(pinned), updated_at)
+    }
+
+    #[cfg(test)]
     pub fn apply_archive(&self, chat_jid: &str, archived: bool) -> Result<()> {
-        self.update_chat_setting(chat_jid, "archived", i64::from(archived))
+        self.apply_archive_at(chat_jid, archived, 0)
     }
 
+    pub fn apply_archive_at(&self, chat_jid: &str, archived: bool, updated_at: i64) -> Result<()> {
+        self.update_chat_setting(
+            chat_jid,
+            ChatSetting::Archived,
+            i64::from(archived),
+            updated_at,
+        )
+    }
+
+    #[cfg(test)]
     pub fn apply_mute(&self, chat_jid: &str, muted: bool, mute_end: i64) -> Result<()> {
+        self.apply_mute_at(chat_jid, muted, mute_end, 0)
+    }
+
+    pub fn apply_mute_at(
+        &self,
+        chat_jid: &str,
+        muted: bool,
+        mute_end: i64,
+        updated_at: i64,
+    ) -> Result<()> {
         let connection = self.connection();
         connection.execute(
-            "INSERT INTO chat_settings (jid, muted, mute_end) VALUES (?1, ?2, ?3)
-             ON CONFLICT(jid) DO UPDATE SET muted = excluded.muted, mute_end = excluded.mute_end",
-            params![chat_jid, muted, mute_end],
+            "INSERT INTO chat_settings (jid, muted, mute_end, mute_updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(jid) DO UPDATE SET
+                muted = excluded.muted,
+                mute_end = excluded.mute_end,
+                mute_updated_at = excluded.mute_updated_at
+             WHERE excluded.mute_updated_at >= chat_settings.mute_updated_at",
+            params![chat_jid, muted, mute_end, updated_at],
         )?;
         Ok(())
     }
@@ -1451,29 +2109,44 @@ impl Database {
             .map_err(Into::into)
     }
 
-    fn update_chat_setting(&self, chat_jid: &str, column: &str, value: i64) -> Result<()> {
-        let sql = match column {
-            "pinned" => {
-                "INSERT INTO chat_settings (jid, pinned) VALUES (?1, ?2)
-                 ON CONFLICT(jid) DO UPDATE SET pinned = excluded.pinned"
+    fn update_chat_setting(
+        &self,
+        chat_jid: &str,
+        setting: ChatSetting,
+        value: i64,
+        updated_at: i64,
+    ) -> Result<()> {
+        let sql = match setting {
+            ChatSetting::Pinned => {
+                "INSERT INTO chat_settings (jid, pinned, pinned_updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(jid) DO UPDATE SET
+                    pinned = excluded.pinned,
+                    pinned_updated_at = excluded.pinned_updated_at
+                 WHERE excluded.pinned_updated_at >= chat_settings.pinned_updated_at"
             }
-            "archived" => {
-                "INSERT INTO chat_settings (jid, archived) VALUES (?1, ?2)
-                 ON CONFLICT(jid) DO UPDATE SET archived = excluded.archived"
+            ChatSetting::Archived => {
+                "INSERT INTO chat_settings (jid, archived, archived_updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(jid) DO UPDATE SET
+                    archived = excluded.archived,
+                    archived_updated_at = excluded.archived_updated_at
+                 WHERE excluded.archived_updated_at >= chat_settings.archived_updated_at"
             }
-            _ => unreachable!("fixed internal chat-setting column"),
         };
         let connection = self.connection();
-        connection.execute(sql, params![chat_jid, value])?;
+        connection.execute(sql, params![chat_jid, value, updated_at])?;
         Ok(())
     }
 
-    pub fn apply_status_mute(&self, jid: &str, muted: bool) -> Result<()> {
+    pub fn apply_status_mute_at(&self, jid: &str, muted: bool, updated_at: i64) -> Result<()> {
         let connection = self.connection();
         connection.execute(
-            "INSERT INTO chat_settings (jid, status_muted) VALUES (?1, ?2)
-             ON CONFLICT(jid) DO UPDATE SET status_muted = excluded.status_muted",
-            params![jid, muted],
+            "INSERT INTO chat_settings (jid, status_muted, status_mute_updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(jid) DO UPDATE SET
+                status_muted = excluded.status_muted,
+                status_mute_updated_at = excluded.status_mute_updated_at
+             WHERE excluded.status_mute_updated_at >= chat_settings.status_mute_updated_at",
+            params![jid, muted, updated_at],
         )?;
         Ok(())
     }
@@ -1493,11 +2166,18 @@ impl Database {
         Ok(())
     }
 
-    pub fn star_message(&self, chat_jid: &str, message_id: &str, starred: bool) -> Result<()> {
+    pub fn star_message_at(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+        starred: bool,
+        updated_at: i64,
+    ) -> Result<()> {
         let connection = self.connection();
         connection.execute(
-            "UPDATE messages SET starred = ?3 WHERE chat_jid = ?1 AND id = ?2",
-            params![chat_jid, message_id, starred],
+            "UPDATE messages SET starred = ?3, star_updated_at = ?4
+             WHERE chat_jid = ?1 AND id = ?2 AND star_updated_at <= ?4",
+            params![chat_jid, message_id, starred, updated_at],
         )?;
         Ok(())
     }
@@ -1590,18 +2270,8 @@ impl Database {
              ON CONFLICT(jid) DO NOTHING",
             [chat_jid],
         )?;
-        let (old_boundary, boundary_ids_json, was_explicit_unread) = transaction.query_row(
-            "SELECT read_boundary, read_boundary_ids, explicit_unread
-             FROM chat_settings WHERE jid = ?1",
-            [chat_jid],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
-        )?;
+        let (old_boundary, boundary_ids_json, was_explicit_unread) =
+            read_boundary_state(&transaction, chat_jid)?;
         let mut covered_ids = read_boundary_ids(boundary_ids_json);
         for id in boundary_ids {
             if !covered_ids.contains(id) {
@@ -1661,12 +2331,7 @@ impl Database {
                 params![chat_jid, id],
             )?;
         }
-        let unread = transaction.query_row(
-            "SELECT COUNT(*) FROM messages
-             WHERE chat_jid = ?1 AND from_me = 0 AND read = 0",
-            [chat_jid],
-            |row| row.get::<_, u32>(0),
-        )?;
+        let unread = unread_message_count(&transaction, chat_jid)?;
         let previous_unread = transaction
             .query_row(
                 "SELECT unread FROM chats WHERE jid = ?1",
@@ -1718,17 +2383,32 @@ impl Database {
     pub fn delete_chat(&self, chat_jid: &str, timestamp: i64) -> Result<()> {
         let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
-        transaction.execute("DELETE FROM poll_votes WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM message_reads WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM messages WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM reactions WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM chats WHERE jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM chat_labels WHERE chat_jid = ?1", [chat_jid])?;
+        let previous = transaction
+            .query_row(
+                "SELECT cleared_at FROM chat_settings WHERE jid = ?1",
+                [chat_jid],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if timestamp < previous {
+            transaction.commit()?;
+            return Ok(());
+        }
+        Self::delete_messages_through(&transaction, chat_jid, timestamp)?;
+        let has_newer = chat_has_messages(&transaction, chat_jid)?;
+        if has_newer {
+            Self::refresh_chat_tail(&transaction, chat_jid)?;
+        } else {
+            transaction.execute("DELETE FROM chats WHERE jid = ?1", [chat_jid])?;
+            transaction.execute("DELETE FROM chat_labels WHERE chat_jid = ?1", [chat_jid])?;
+        }
         transaction.execute(
             "INSERT INTO chat_settings (jid, deleted, cleared_at) VALUES (?1, 1, ?2)
-             ON CONFLICT(jid) DO UPDATE SET deleted = 1, cleared_at = MAX(cleared_at, ?2)",
-            params![chat_jid, timestamp],
+             ON CONFLICT(jid) DO UPDATE SET
+                deleted = ?3,
+                cleared_at = MAX(cleared_at, ?2)",
+            params![chat_jid, timestamp, !has_newer],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1737,15 +2417,20 @@ impl Database {
     pub fn clear_chat(&self, chat_jid: &str, timestamp: i64) -> Result<()> {
         let connection = self.connection();
         let transaction = connection.unchecked_transaction()?;
-        transaction.execute("DELETE FROM poll_votes WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM poll_secrets WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM message_reads WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM messages WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute("DELETE FROM reactions WHERE chat_jid = ?1", [chat_jid])?;
-        transaction.execute(
-            "UPDATE chats SET last_message = '', unread = 0 WHERE jid = ?1",
-            [chat_jid],
-        )?;
+        let previous = transaction
+            .query_row(
+                "SELECT cleared_at FROM chat_settings WHERE jid = ?1",
+                [chat_jid],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if timestamp < previous {
+            transaction.commit()?;
+            return Ok(());
+        }
+        Self::delete_messages_through(&transaction, chat_jid, timestamp)?;
+        Self::refresh_chat_tail(&transaction, chat_jid)?;
         transaction.execute(
             "INSERT INTO chat_settings
              (jid, read_state, explicit_unread, cleared_at) VALUES (?1, 1, 0, ?2)
@@ -1756,6 +2441,46 @@ impl Database {
             params![chat_jid, timestamp],
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    fn delete_messages_through(
+        transaction: &rusqlite::Transaction<'_>,
+        chat_jid: &str,
+        timestamp: i64,
+    ) -> Result<()> {
+        for table in ["poll_votes", "poll_secrets", "message_reads", "reactions"] {
+            transaction.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE chat_jid = ?1 AND message_id IN
+                     (SELECT id FROM messages WHERE chat_jid = ?1 AND timestamp <= ?2)"
+                ),
+                params![chat_jid, timestamp],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM messages WHERE chat_jid = ?1 AND timestamp <= ?2",
+            params![chat_jid, timestamp],
+        )?;
+        Ok(())
+    }
+
+    fn refresh_chat_tail(transaction: &rusqlite::Transaction<'_>, chat_jid: &str) -> Result<()> {
+        transaction.execute(
+            "UPDATE chats SET
+                last_message = COALESCE((
+                    SELECT text FROM messages WHERE chat_jid = ?1
+                    ORDER BY timestamp DESC, rowid DESC LIMIT 1
+                ), ''),
+                last_timestamp = COALESCE((
+                    SELECT timestamp FROM messages WHERE chat_jid = ?1
+                    ORDER BY timestamp DESC, rowid DESC LIMIT 1
+                ), 0),
+                unread = (SELECT COUNT(*) FROM messages
+                          WHERE chat_jid = ?1 AND from_me = 0 AND read = 0)
+             WHERE jid = ?1",
+            [chat_jid],
+        )?;
         Ok(())
     }
 
@@ -2130,18 +2855,7 @@ impl Database {
         }
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
-        let source_exists = transaction.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM chats WHERE jid = ?1
-                 UNION ALL SELECT 1 FROM contacts WHERE jid = ?1
-                 UNION ALL SELECT 1 FROM chat_settings WHERE jid = ?1
-                 UNION ALL SELECT 1 FROM messages WHERE sender_jid = ?1
-                 UNION ALL SELECT 1 FROM reactions WHERE reactor_jid = ?1
-                 UNION ALL SELECT 1 FROM poll_votes WHERE voter_jid = ?1
-             )",
-            [old_jid],
-            |row| row.get::<_, bool>(0),
-        )?;
+        let source_exists = migration_source_exists(&transaction, old_jid)?;
         if !source_exists {
             transaction.commit()?;
             return Ok(false);
@@ -2195,14 +2909,20 @@ impl Database {
         transaction.execute(
             "INSERT INTO messages
              (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me,
-              read, starred, receipt, media_json, media_download)
+              read, starred, star_updated_at, receipt, delivered_at,
+              receipt_read_at, media_json, media_download)
              SELECT ?2, id, sender_jid, sender_name, text, timestamp, from_me,
-                    read, starred, receipt, media_json, media_download
+                    read, starred, star_updated_at, receipt, delivered_at,
+                    receipt_read_at, media_json, media_download
              FROM messages WHERE chat_jid = ?1
-             ON CONFLICT(chat_jid, id) DO UPDATE SET
+             ON CONFLICT(chat_jid, sender_jid, id) DO UPDATE SET
                 read = MAX(messages.read, excluded.read),
-                starred = MAX(messages.starred, excluded.starred),
+                starred = CASE WHEN excluded.star_updated_at >= messages.star_updated_at
+                               THEN excluded.starred ELSE messages.starred END,
+                star_updated_at = MAX(messages.star_updated_at, excluded.star_updated_at),
                 receipt = MAX(messages.receipt, excluded.receipt),
+                delivered_at = COALESCE(messages.delivered_at, excluded.delivered_at),
+                receipt_read_at = COALESCE(messages.receipt_read_at, excluded.receipt_read_at),
                 media_json = COALESCE(messages.media_json, excluded.media_json),
                 media_download = COALESCE(messages.media_download, excluded.media_download)",
             params![old_jid, new_jid],
@@ -2338,6 +3058,7 @@ impl Database {
             .map_err(Into::into)
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn unresolved_chat_jids(&self, is_group: bool, limit: u32) -> Result<Vec<String>> {
         let connection = self.connection();
         let mut statement = connection.prepare(
@@ -2354,6 +3075,7 @@ impl Database {
             .map_err(Into::into)
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn unresolved_contact_history_cursors(&self, limit: u32) -> Result<Vec<HistoryCursor>> {
         let connection = self.connection();
         let mut statement = connection.prepare(
@@ -2470,6 +3192,7 @@ impl Database {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -2512,6 +3235,95 @@ mod tests {
             "kept"
         );
         assert!(ensure_column(&connection, "missing", "value", "value TEXT").is_err());
+
+        let mut unsupported = Connection::open_in_memory().unwrap();
+        unsupported
+            .execute("CREATE TABLE messages (id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        assert!(ensure_message_identity_schema(&mut unsupported).is_err());
+    }
+
+    #[test]
+    fn legacy_name_restore_ignores_absent_malformed_and_unusable_entries() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE chats (
+                    jid TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    name_source INTEGER NOT NULL
+                 );
+                 INSERT INTO chats VALUES ('group@g.us', '', 0);",
+            )
+            .unwrap();
+        Database::restore_legacy_chat_names(&connection, Path::new("/")).unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        fs::write(directory.path().join("store.json"), b"not json").unwrap();
+        Database::restore_legacy_chat_names(&connection, &path).unwrap();
+        fs::write(directory.path().join("store.json"), r#"{"chats":{}}"#).unwrap();
+        Database::restore_legacy_chat_names(&connection, &path).unwrap();
+        fs::write(
+            directory.path().join("store.json"),
+            r#"{"chats":[{}, {"jid":"group@g.us","name":"Group"}, {"jid":"group@g.us","name":"Friends"}]}"#,
+        )
+        .unwrap();
+        Database::restore_legacy_chat_names(&connection, &path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT name FROM chats WHERE jid = 'group@g.us'",
+                    [],
+                    |row| { row.get::<_, String>(0) }
+                )
+                .unwrap(),
+            "Friends"
+        );
+    }
+
+    #[test]
+    fn legacy_two_column_message_identity_is_migrated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (
+                    chat_jid TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    sender_jid TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    from_me INTEGER NOT NULL,
+                    read INTEGER NOT NULL DEFAULT 0,
+                    starred INTEGER NOT NULL DEFAULT 0,
+                    star_updated_at INTEGER NOT NULL DEFAULT 0,
+                    receipt INTEGER NOT NULL DEFAULT 0,
+                    delivered_at INTEGER,
+                    receipt_read_at INTEGER,
+                    media_json TEXT,
+                    media_download BLOB,
+                    PRIMARY KEY (chat_jid, id)
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        database
+            .insert_message(&message("same", 1), "Ada", false, false)
+            .unwrap();
+        let mut other_sender = message("same", 2);
+        other_sender.sender_jid = "2@s.whatsapp.net".into();
+        database
+            .insert_message(&other_sender, "Ada", false, false)
+            .unwrap();
+        assert_eq!(
+            database.messages(&other_sender.chat_jid, 10).unwrap().len(),
+            2
+        );
     }
 
     #[test]
@@ -2881,6 +3693,47 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(database.unread_total().unwrap(), 0);
+
+        assert!(
+            !database
+                .apply_synced_read_state("1@s.whatsapp.net", false, None, &[], 3)
+                .unwrap()
+        );
+        assert!(
+            database
+                .apply_synced_read_state("1@s.whatsapp.net", false, None, &[], 6)
+                .unwrap()
+        );
+        assert!(
+            database
+                .apply_synced_read_state("1@s.whatsapp.net", true, None, &[], 7)
+                .unwrap()
+        );
+        assert!(
+            database
+                .apply_synced_read_state(
+                    "1@s.whatsapp.net",
+                    true,
+                    None,
+                    &["not-yet-local".into()],
+                    8,
+                )
+                .unwrap()
+        );
+        assert!(
+            !database
+                .apply_self_read_receipt("1@s.whatsapp.net", &[], 9)
+                .unwrap()
+        );
+
+        let many_ids = (0..READ_BOUNDARY_IDS_CAP + 4)
+            .map(|index| format!("future-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            database
+                .apply_synced_read_state("1@s.whatsapp.net", true, Some(9), &many_ids, 9)
+                .unwrap()
+        );
         assert!(
             !database
                 .apply_synced_read_state("1@s.whatsapp.net", true, Some(1), &["older".into()], 5,)
@@ -3271,6 +4124,170 @@ mod tests {
         assert_eq!(stored[0].reactions.len(), 1);
         assert_eq!(stored[0].reactions[0].count, 1);
         assert!(!stored[0].reactions[0].from_me);
+
+        assert!(
+            !database
+                .apply_reaction("1@s.whatsapp.net", "target", "me", "🔥", true, 4)
+                .unwrap()
+        );
+        assert!(
+            !database
+                .apply_reaction("1@s.whatsapp.net", "target", "me", "👍", true, 5)
+                .unwrap()
+        );
+        assert!(
+            database
+                .apply_reaction("1@s.whatsapp.net", "target", "me", "🔥", true, 6)
+                .unwrap()
+        );
+        let stored = database.messages("1@s.whatsapp.net", 10).unwrap();
+        assert!(
+            stored[0]
+                .reactions
+                .iter()
+                .any(|reaction| { reaction.emoji == "🔥" && reaction.from_me })
+        );
+    }
+
+    #[test]
+    fn timestamped_settings_and_stars_ignore_delayed_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let stored = message("stateful", 1);
+        database
+            .insert_message(&stored, "Ada", false, false)
+            .unwrap();
+
+        database.apply_pin_at(&stored.chat_jid, true, 20).unwrap();
+        database.apply_pin_at(&stored.chat_jid, false, 19).unwrap();
+        assert!(database.list_chats(10).unwrap()[0].pinned);
+        database.apply_pin_at(&stored.chat_jid, false, 21).unwrap();
+        assert!(!database.list_chats(10).unwrap()[0].pinned);
+
+        database
+            .apply_archive_at(&stored.chat_jid, true, 30)
+            .unwrap();
+        database
+            .apply_archive_at(&stored.chat_jid, false, 29)
+            .unwrap();
+        let archived = database
+            .connection()
+            .query_row(
+                "SELECT archived FROM chat_settings WHERE jid = ?1",
+                [&stored.chat_jid],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(archived);
+        database
+            .apply_archive_at(&stored.chat_jid, false, 31)
+            .unwrap();
+        let archived = database
+            .connection()
+            .query_row(
+                "SELECT archived FROM chat_settings WHERE jid = ?1",
+                [&stored.chat_jid],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(!archived);
+
+        database
+            .apply_mute_at(&stored.chat_jid, true, -1, 40)
+            .unwrap();
+        database
+            .apply_mute_at(&stored.chat_jid, false, 0, 39)
+            .unwrap();
+        assert!(database.is_muted(&stored.chat_jid, 100).unwrap());
+        database
+            .apply_mute_at(&stored.chat_jid, false, 0, 41)
+            .unwrap();
+        assert!(!database.is_muted(&stored.chat_jid, 100).unwrap());
+
+        database
+            .star_message_at(&stored.chat_jid, &stored.id, true, 50)
+            .unwrap();
+        database
+            .star_message_at(&stored.chat_jid, &stored.id, false, 49)
+            .unwrap();
+        let starred = database
+            .connection()
+            .query_row(
+                "SELECT starred FROM messages WHERE chat_jid = ?1 AND id = ?2",
+                params![stored.chat_jid, stored.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(starred);
+    }
+
+    #[test]
+    fn clear_and_delete_watermarks_preserve_newer_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let old = message("old", 10);
+        let new = message("new", 30);
+        database.insert_message(&old, "Ada", false, true).unwrap();
+        database.insert_message(&new, "Ada", false, true).unwrap();
+
+        database.clear_chat(&old.chat_jid, 20).unwrap();
+        assert_eq!(
+            database.messages(&old.chat_jid, 10).unwrap(),
+            vec![new.clone()]
+        );
+        database.clear_chat(&old.chat_jid, 15).unwrap();
+        assert_eq!(
+            database.messages(&old.chat_jid, 10).unwrap(),
+            vec![new.clone()]
+        );
+        database.delete_chat(&old.chat_jid, 25).unwrap();
+        assert_eq!(
+            database.messages(&old.chat_jid, 10).unwrap(),
+            vec![new.clone()]
+        );
+        assert_eq!(database.list_chats(10).unwrap()[0].last_message, new.text);
+
+        database.delete_chat(&old.chat_jid, 24).unwrap();
+        assert_eq!(
+            database.messages(&old.chat_jid, 10).unwrap(),
+            vec![new.clone()]
+        );
+
+        database.delete_chat(&old.chat_jid, 30).unwrap();
+        assert!(database.messages(&old.chat_jid, 10).unwrap().is_empty());
+        assert!(database.list_chats(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn message_identity_retains_same_id_from_distinct_group_senders() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut alice = message("shared-id", 10);
+        alice.chat_jid = "group@g.us".into();
+        alice.sender_jid = "alice@s.whatsapp.net".into();
+        let mut bob = alice.clone();
+        bob.sender_jid = "bob@s.whatsapp.net".into();
+        bob.sender_name = "Bob".into();
+        bob.timestamp = 11;
+        bob.text = "from Bob".into();
+        assert!(
+            database
+                .insert_message(&alice, "Group", true, false)
+                .unwrap()
+        );
+        assert!(database.insert_message(&bob, "Group", true, false).unwrap());
+        let stored = database.messages("group@g.us", 10).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(
+            stored
+                .iter()
+                .any(|message| message.sender_jid == alice.sender_jid)
+        );
+        assert!(
+            stored
+                .iter()
+                .any(|message| message.sender_jid == bob.sender_jid)
+        );
     }
 
     #[test]
@@ -3675,6 +4692,57 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let mut unbounded = live.clone();
+        unbounded.id = "unbounded".into();
+        unbounded.timestamp = 200;
+        if let Some(MessageMedia::Location {
+            duration_seconds, ..
+        }) = &mut unbounded.media
+        {
+            *duration_seconds = 0;
+        }
+        database
+            .insert_message(&unbounded, "Ada", false, false)
+            .unwrap();
+        assert_eq!(
+            database
+                .active_live_locations_for_sender(&unbounded.sender_jid, 201)
+                .unwrap()
+                .iter()
+                .find(|entry| entry.message_id == "unbounded")
+                .map(|entry| entry.duration_seconds),
+            Some(0)
+        );
+        assert!(
+            database
+                .active_live_location_targets(201)
+                .unwrap()
+                .iter()
+                .any(|(jid, _)| jid == &unbounded.chat_jid)
+        );
+
+        database
+            .connection()
+            .execute(
+                "UPDATE messages SET media_json = '{\"kind\":\"location\",\"live\":true}' WHERE id = 'unbounded'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            database
+                .active_live_locations_for_sender(&unbounded.sender_jid, 201)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.message_id != "unbounded")
+        );
+        assert!(
+            database
+                .active_live_location_targets(201)
+                .unwrap()
+                .iter()
+                .all(|(jid, _)| jid == &live.chat_jid)
+        );
     }
 
     #[test]
@@ -3741,10 +4809,30 @@ mod tests {
                 .update_message_media(&rich.chat_jid, &rich.id, &replacement)
                 .unwrap()
         );
-        assert_eq!(
-            database.messages(&rich.chat_jid, 10).unwrap()[0].media,
-            Some(replacement)
+
+        let replacement_without_wire_metadata = MessageMedia::Location {
+            latitude_e7: 523_702_001,
+            longitude_e7: 48_954_001,
+            accuracy_m: 4,
+            name: "Amsterdam".into(),
+            address: String::new(),
+            thumbnail_path: None,
+            live: true,
+            updated_at: 21,
+            duration_seconds: 0,
+        };
+        assert!(
+            database
+                .update_message_media(&rich.chat_jid, &rich.id, &replacement_without_wire_metadata,)
+                .unwrap()
         );
+        let Some(MessageMedia::Location {
+            duration_seconds, ..
+        }) = database.messages(&rich.chat_jid, 10).unwrap()[0].media
+        else {
+            panic!("expected stored location")
+        };
+        assert_eq!(duration_seconds, 3_600);
         assert!(
             database
                 .media_recovery_cursor(&rich.chat_jid)
@@ -3946,6 +5034,544 @@ mod tests {
         assert_eq!(*total_voters, 2);
         assert_eq!(options[0].votes, 0);
         assert_eq!(options[1].votes, 2);
+
+        let refreshed_poll = MessageMedia::Poll {
+            question: "Lunch?".into(),
+            options: vec![
+                omarchy_whatsapp_protocol::PollOption {
+                    name: "Soup".into(),
+                    votes: 0,
+                    selected_by_me: false,
+                },
+                omarchy_whatsapp_protocol::PollOption {
+                    name: "Salad".into(),
+                    votes: 0,
+                    selected_by_me: false,
+                },
+            ],
+            selectable_count: 2,
+            total_voters: 0,
+            quiz: false,
+            correct_option_index: None,
+            end_timestamp: 0,
+        };
+        assert!(
+            !database
+                .update_message_media(&poll.chat_jid, &poll.id, &refreshed_poll)
+                .unwrap()
+        );
+        let Some(MessageMedia::Poll {
+            options,
+            total_voters,
+            ..
+        }) = database.messages(&poll.chat_jid, 10).unwrap()[0]
+            .media
+            .clone()
+        else {
+            panic!("expected refreshed poll")
+        };
+        assert_eq!(total_voters, 2);
+        assert_eq!(options[1].votes, 2);
         assert!(options[1].selected_by_me);
+        assert!(options[1].selected_by_me);
+    }
+
+    fn durable_inbound(sender: &str, id: &str, committed_at: i64) -> DurableInbound {
+        DurableInbound {
+            key: InboundKey {
+                chat_jid: "123-456@g.us".into(),
+                sender_jid: sender.into(),
+                message_id: id.into(),
+            },
+            message: vec![1, 2, 3],
+            push_name: "Synthetic".into(),
+            timestamp: 42,
+            media_type: "text".into(),
+            is_from_me: false,
+            is_group: true,
+            is_offline: false,
+            committed_at,
+        }
+    }
+
+    #[test]
+    fn inbound_inbox_is_atomic_ordered_and_deduplicated_by_full_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let first = durable_inbound("1@s.whatsapp.net", "same", 20);
+        let second = durable_inbound("2@s.whatsapp.net", "same", 10);
+        assert_eq!(
+            database
+                .commit_inbound_batch(&[first.clone(), second.clone(), first.clone()])
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            database
+                .commit_inbound_batch(std::slice::from_ref(&first))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database.pending_inbound(10).unwrap(),
+            vec![second, first.clone()]
+        );
+        assert!(database.finish_inbound(&first.key).unwrap());
+        assert!(!database.finish_inbound(&first.key).unwrap());
+        assert_eq!(database.pending_inbound(10).unwrap().len(), 1);
+        database.clear_account_data().unwrap();
+        assert!(database.pending_inbound(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_outbox_has_stable_accept_claim_failure_retry_and_finish_transitions() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        assert!(
+            database
+                .enqueue_text_message("delivery", "chat", "hello", "message", 10)
+                .unwrap()
+        );
+        assert!(
+            !database
+                .enqueue_text_message("delivery", "chat", "hello", "message", 10)
+                .unwrap()
+        );
+        assert!(
+            database
+                .enqueue_text_message("delivery", "other", "hello", "message", 10)
+                .is_err()
+        );
+        assert_eq!(
+            database.text_outbox().unwrap()[0].status,
+            TextOutboxStatus::Queued
+        );
+        let pending = database.claim_text_message().unwrap().unwrap();
+        assert_eq!(
+            pending,
+            PendingTextMessage {
+                delivery_id: "delivery".into(),
+                chat_jid: "chat".into(),
+                text: "hello".into(),
+                message_id: "message".into(),
+            }
+        );
+        assert!(database.claim_text_message().unwrap().is_none());
+        assert_eq!(
+            database.text_outbox().unwrap()[0].status,
+            TextOutboxStatus::Sending
+        );
+        assert!(database.fail_text_message("delivery", "offline").unwrap());
+        assert!(!database.fail_text_message("missing", "offline").unwrap());
+        let failed = &database.text_outbox().unwrap()[0];
+        assert_eq!(failed.status, TextOutboxStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("offline"));
+        assert!(database.retry_text_message("delivery").unwrap());
+        assert!(!database.retry_text_message("delivery").unwrap());
+        database.claim_text_message().unwrap().unwrap();
+        assert!(!database.discard_text_message("delivery").unwrap());
+        assert_eq!(database.retry_all_text_messages().unwrap(), 1);
+        database.claim_text_message().unwrap().unwrap();
+        assert!(database.complete_text_message("delivery").unwrap());
+        assert!(!database.complete_text_message("delivery").unwrap());
+
+        database
+            .enqueue_text_message("discard", "chat", "bye", "message-2", 11)
+            .unwrap();
+        assert!(database.discard_text_message("discard").unwrap());
+        assert!(!database.discard_text_message("discard").unwrap());
+    }
+
+    #[test]
+    fn read_outbox_is_ordered_idempotent_and_does_not_drop_late_receipts() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let first = UnreadReceipt {
+            message_id: "first".into(),
+            sender_jid: "alice@s.whatsapp.net".into(),
+            is_group: true,
+        };
+        let second = UnreadReceipt {
+            message_id: "second".into(),
+            sender_jid: "bob@s.whatsapp.net".into(),
+            is_group: true,
+        };
+        let late = UnreadReceipt {
+            message_id: "late".into(),
+            sender_jid: "alice@s.whatsapp.net".into(),
+            is_group: true,
+        };
+        database
+            .queue_read_receipts(
+                "group@g.us",
+                &[first.clone(), second.clone(), first.clone()],
+                20,
+            )
+            .unwrap();
+        let claimed = database.next_read_batch().unwrap().unwrap();
+        assert_eq!(claimed.receipts, vec![first.clone(), second]);
+
+        database
+            .queue_read_receipts("group@g.us", std::slice::from_ref(&late), 30)
+            .unwrap();
+        assert!(!database.finish_read_batch(&claimed).unwrap());
+        let remaining = database.next_read_batch().unwrap().unwrap();
+        assert_eq!(remaining.receipts, vec![late]);
+        assert!(database.finish_read_batch(&remaining).unwrap());
+        assert!(database.next_read_batch().unwrap().is_none());
+
+        database.queue_read_receipts("empty", &[], 40).unwrap();
+        let empty = database.next_read_batch().unwrap().unwrap();
+        assert!(empty.receipts.is_empty());
+        assert!(database.finish_read_batch(&empty).unwrap());
+    }
+
+    #[test]
+    fn focused_message_and_read_intent_commit_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let incoming = message("focused", 50);
+        let receipt = UnreadReceipt {
+            message_id: incoming.id.clone(),
+            sender_jid: incoming.sender_jid.clone(),
+            is_group: false,
+        };
+        assert!(
+            database
+                .insert_message_with_read_intent(&incoming, "Ada", false, &receipt)
+                .unwrap()
+        );
+        assert_eq!(database.unread_total().unwrap(), 0);
+        let pending = database.next_read_batch().unwrap().unwrap();
+        assert_eq!(pending.chat_jid, incoming.chat_jid);
+        assert_eq!(pending.receipts, vec![receipt]);
+    }
+
+    #[test]
+    fn ancillary_query_and_metadata_apis_have_stable_empty_and_update_semantics() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut direct = message("media", 10);
+        direct.chat_jid = "555@lid".into();
+        direct.sender_jid = direct.chat_jid.clone();
+        let old_path = directory.path().join("old.video.mp4");
+        let new_path = directory.path().join("new.video.mp4");
+        direct.media = Some(MessageMedia::Video {
+            path: old_path.to_string_lossy().into_owned(),
+            thumbnail_path: String::new(),
+            downloaded: false,
+            mime_type: "video/mp4".into(),
+            width: 1,
+            height: 1,
+            duration_seconds: 1,
+            gif_playback: false,
+        });
+        database
+            .insert_message(&direct, "Ada", false, false)
+            .unwrap();
+
+        assert_eq!(
+            database.direct_chat_jids(0).unwrap(),
+            vec![direct.chat_jid.clone()]
+        );
+        assert!(
+            database
+                .update_chat_phone_number(&direct.chat_jid, "+31555")
+                .unwrap()
+        );
+        assert!(
+            !database
+                .update_chat_phone_number(&direct.chat_jid, "+31555")
+                .unwrap()
+        );
+        database.rewrite_media_paths(&[]).unwrap();
+        database
+            .rewrite_media_paths(&[(
+                old_path.to_string_lossy().into_owned(),
+                new_path.to_string_lossy().into_owned(),
+            )])
+            .unwrap();
+        let Some(MessageMedia::Video { path, .. }) = database
+            .message_by_id(&direct.chat_jid, &direct.id)
+            .unwrap()
+            .unwrap()
+            .media
+        else {
+            panic!("expected rewritten video metadata")
+        };
+        assert_eq!(path, new_path.to_string_lossy());
+
+        assert_eq!(
+            database.chat_name(&direct.chat_jid).unwrap().as_deref(),
+            Some("Ada")
+        );
+        assert_eq!(database.chat_name("missing@s.whatsapp.net").unwrap(), None);
+        assert_eq!(
+            database
+                .message_history_cursor(&direct.chat_jid, &direct.id)
+                .unwrap(),
+            Some(HistoryCursor {
+                chat_jid: direct.chat_jid.clone(),
+                message_id: direct.id.clone(),
+                sender_jid: direct.sender_jid.clone(),
+                from_me: false,
+                timestamp_ms: 10_000,
+            })
+        );
+        assert!(
+            database
+                .message_history_cursor(&direct.chat_jid, "missing")
+                .unwrap()
+                .is_none()
+        );
+
+        database
+            .apply_status_mute_at(&direct.chat_jid, true, 5)
+            .unwrap();
+        database
+            .apply_disappearing_mode(&direct.chat_jid, 86_400, 6)
+            .unwrap();
+        database
+            .update_label("work", Some("Work"), Some(3), false)
+            .unwrap();
+        database
+            .associate_label(&direct.chat_jid, "work", true)
+            .unwrap();
+        database
+            .associate_label(&direct.chat_jid, "work", false)
+            .unwrap();
+        database.update_label("work", None, None, true).unwrap();
+        assert!(
+            !database
+                .migrate_contact_jid("missing@lid", "555@s.whatsapp.net")
+                .unwrap()
+        );
+        assert!(
+            !database
+                .migrate_contact_jid(&direct.chat_jid, &direct.chat_jid)
+                .unwrap()
+        );
+
+        database.delete_chat(&direct.chat_jid, 20).unwrap();
+        database
+            .insert_history_chat(&Chat {
+                jid: direct.chat_jid.clone(),
+                name: "Old history".into(),
+                phone_number: None,
+                last_message: "old".into(),
+                last_sender_name: String::new(),
+                last_timestamp: 10,
+                unread: 1,
+                pinned: false,
+                muted: false,
+                is_group: false,
+            })
+            .unwrap();
+        assert!(database.list_chats(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn validation_and_absent_record_branches_are_observable() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let mut non_poll = MessageMedia::Image {
+            path: String::new(),
+            thumbnail_path: String::new(),
+            downloaded: false,
+            mime_type: "image/jpeg".into(),
+            width: 0,
+            height: 0,
+        };
+        assert!(!update_poll_tallies(
+            &mut non_poll,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            0,
+        ));
+        assert!(
+            !database
+                .update_contact_name("1@s.whatsapp.net", "  ")
+                .unwrap()
+        );
+        assert!(!database.update_group_name("group@g.us", "").unwrap());
+        assert!(
+            database
+                .store_poll_secret("chat", "poll", "creator", &[0; 31])
+                .is_err()
+        );
+        assert!(
+            database
+                .poll_for_voting("chat", "missing")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !database
+                .apply_poll_vote("chat", "missing", "voter", &[], false, 1)
+                .unwrap()
+        );
+        assert!(!database.update_receipts("chat", &[], 2, None, 1).unwrap());
+        assert!(
+            !database
+                .update_receipts("chat", &["missing".into()], 1, Some("recipient"), 1)
+                .unwrap()
+        );
+        assert!(database.fast_ratchet_state("missing", 1).unwrap().is_none());
+        assert!(
+            database
+                .active_live_locations_for_sender("missing", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut plain = message("plain", 1);
+        plain.media = Some(MessageMedia::Image {
+            path: "/cache/plain.jpg".into(),
+            thumbnail_path: "/cache/plain-thumb.jpg".into(),
+            downloaded: false,
+            mime_type: "image/jpeg".into(),
+            width: 1,
+            height: 1,
+        });
+        database
+            .insert_message(&plain, "Ada", false, false)
+            .unwrap();
+        let mut unresolved = message("unresolved", 2);
+        unresolved.chat_jid = "9@s.whatsapp.net".into();
+        unresolved.sender_jid = unresolved.chat_jid.clone();
+        database
+            .insert_message(&unresolved, &unresolved.chat_jid, false, false)
+            .unwrap();
+        assert_eq!(
+            database.unresolved_chat_jids(false, 1).unwrap(),
+            vec![unresolved.chat_jid.clone()]
+        );
+        database
+            .store_poll_secret(&plain.chat_jid, &plain.id, "creator", &[1; 32])
+            .unwrap();
+        assert!(
+            database
+                .poll_for_voting(&plain.chat_jid, &plain.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !database
+                .apply_poll_vote(&plain.chat_jid, &plain.id, "voter", &[], false, 1)
+                .unwrap()
+        );
+
+        database
+            .connection()
+            .execute(
+                "UPDATE messages SET media_json = '{broken' WHERE chat_jid = ?1 AND id = ?2",
+                params![plain.chat_jid, plain.id],
+            )
+            .unwrap();
+        assert!(
+            database
+                .poll_for_voting(&plain.chat_jid, &plain.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !database
+                .apply_poll_vote(&plain.chat_jid, &plain.id, "voter", &[], false, 1)
+                .unwrap()
+        );
+
+        let mut poll = message("poll", 2);
+        poll.media = Some(MessageMedia::Poll {
+            question: "Choose".into(),
+            options: vec![omarchy_whatsapp_protocol::PollOption {
+                name: "One".into(),
+                votes: 0,
+                selected_by_me: false,
+            }],
+            selectable_count: 0,
+            total_voters: 0,
+            quiz: false,
+            correct_option_index: None,
+            end_timestamp: 0,
+        });
+        database.insert_message(&poll, "Ada", false, false).unwrap();
+        assert!(
+            database
+                .apply_poll_vote(&poll.chat_jid, &poll.id, "voter", &["One".into()], false, 2,)
+                .is_err()
+        );
+
+        for (id, media) in [
+            (
+                "missing-image",
+                MessageMedia::Image {
+                    path: directory
+                        .path()
+                        .join("absent.jpg")
+                        .to_string_lossy()
+                        .into_owned(),
+                    thumbnail_path: directory
+                        .path()
+                        .join("absent-thumb.jpg")
+                        .to_string_lossy()
+                        .into_owned(),
+                    downloaded: true,
+                    mime_type: "image/jpeg".into(),
+                    width: 1,
+                    height: 1,
+                },
+            ),
+            (
+                "missing-audio",
+                MessageMedia::Audio {
+                    path: directory
+                        .path()
+                        .join("absent.ogg")
+                        .to_string_lossy()
+                        .into_owned(),
+                    downloaded: true,
+                    mime_type: "audio/ogg".into(),
+                    duration_seconds: 1,
+                    voice_message: true,
+                },
+            ),
+        ] {
+            let mut media_message = message(id, 3);
+            media_message.media = Some(media);
+            database
+                .insert_message(&media_message, "Ada", false, false)
+                .unwrap();
+        }
+        let messages = database.messages(&plain.chat_jid, 10).unwrap();
+        assert!(messages.iter().any(|message| matches!(
+            message.media,
+            Some(MessageMedia::Image { downloaded: false, ref thumbnail_path, .. })
+                if thumbnail_path.is_empty()
+        )));
+        assert!(messages.iter().any(|message| matches!(
+            message.media,
+            Some(MessageMedia::Audio {
+                downloaded: false,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn opening_database_recovers_interrupted_text_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        {
+            let database = Database::open(&path).unwrap();
+            database
+                .enqueue_text_message("delivery", "chat", "hello", "message", 10)
+                .unwrap();
+            database.claim_text_message().unwrap().unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        assert_eq!(
+            database.text_outbox().unwrap()[0].status,
+            TextOutboxStatus::Queued
+        );
     }
 }
