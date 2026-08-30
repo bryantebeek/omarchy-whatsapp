@@ -2273,6 +2273,24 @@ fn read_action_boundary(
     (timestamp, ids)
 }
 
+fn event_diagnostic(event: &Event) -> String {
+    match event {
+        Event::RawNode(node) => format!("RawNode({node:?})"),
+        Event::Notification(node) => format!("Notification({node:?})"),
+        _ => serde_json::to_string(event).unwrap_or_else(|error| {
+            format!(
+                "{{\"event_kind\":\"{:?}\",\"serialization_error\":{}}}",
+                event.kind(),
+                serde_json::to_string(&error.to_string()).unwrap_or_else(|_| "null".to_owned())
+            )
+        }),
+    }
+}
+
+fn log_whatsapp_event(event: &Event) {
+    info!(event = %event_diagnostic(event), "received WhatsApp event");
+}
+
 async fn handle_app_event(shared: Arc<Shared>, event: Arc<Event>, client: Arc<Client>) {
     match &*event {
         Event::Receipt(receipt) => {
@@ -2997,6 +3015,9 @@ async fn main() -> Result<()> {
                 "frskmsg",
                 live_location::FastRatchetHandler::new(fast_ratchet_shared),
             )
+            .on_event(|event, _client| async move {
+                log_whatsapp_event(&event);
+            })
             .on_qr_code(move |code, timeout| {
                 let shared = Arc::clone(&qr_shared);
                 async move {
@@ -4667,6 +4688,46 @@ mod tests {
             read_action_boundary(&action),
             (Some(1_700_000_000), vec!["covered".to_owned()])
         );
+    }
+
+    #[test]
+    fn event_diagnostics_include_full_receipt_payload() {
+        use whatsapp_rust::wacore::types::{
+            events::Receipt, message::MessageSource, presence::ReceiptType,
+        };
+
+        let event = Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: "120363000000000000@g.us".parse().unwrap(),
+                    sender: "31600000000@s.whatsapp.net".parse().unwrap(),
+                    ..Default::default()
+                })
+                .message_ids(vec![
+                    "private-message-one".into(),
+                    "private-message-two".into(),
+                ])
+                .timestamp(Utc::now())
+                .r#type(ReceiptType::ReadSelf)
+                .offline(true)
+                .build(),
+        );
+
+        let diagnostic = event_diagnostic(&event);
+        for expected in [
+            "Receipt",
+            "120363000000000000",
+            "31600000000",
+            "private-message-one",
+            "private-message-two",
+            "ReadSelf",
+            "\"offline\":true",
+        ] {
+            assert!(
+                diagnostic.contains(expected),
+                "missing {expected:?} from {diagnostic}"
+            );
+        }
     }
 
     #[tokio::test]

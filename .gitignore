@@ -64,6 +64,13 @@ id_ed25519
 
 # Logs, crash dumps, and temporary files
 *.log
+*.jsonl
+*.ndjson
+*.trace
+*.journal
+/logs/
+/event-logs/
+/captures/
 *.tmp
 *.bak
 *.orig
