@@ -46,6 +46,8 @@ Item {
   property string licenseLoadError: ""
   property alias appMenu: headerMenu
   property alias appMenuFirstAction: headerLicenseAction
+  property alias chatStateResyncAction: headerResyncAction
+  property alias chatStateResyncConfirmation: resyncConfirmation
   readonly property bool unreadOnly: service && service.unreadOnly === true
   readonly property bool voiceRecordingTestMode: service
     && service.voiceRecordingTestMode === true
@@ -1176,6 +1178,10 @@ Item {
       }
 
       Keys.onPressed: function(event) {
+        if (resyncConfirmation.handleKey(event)) {
+          event.accepted = true
+          return
+        }
         if (logoutConfirmation.handleKey(event)) {
           event.accepted = true
           return
@@ -1208,6 +1214,26 @@ Item {
 
       Keys.onReleased: function(event) {
         if (root.endControlHold(event)) event.accepted = true
+      }
+
+      ConfirmDialog {
+        id: resyncConfirmation
+
+        anchors.fill: parent
+        z: 1000
+        message: "Resync chat state from WhatsApp?\n\nThis replays unread, "
+          + "pinned, archived, and muted state from WhatsApp. Your linked account, "
+          + "messages, media, and local history stay intact."
+        confirmText: "Resync"
+        background: Color.popups.background
+        foreground: Color.popups.text
+        selectedText: root.accent
+
+        onOpenedChanged: if (opened) selectedIndex = 0
+        onCanceled: opened = false
+        onConfirmed: {
+          if (root.service && root.service.requestChatStateResync()) opened = false
+        }
       }
 
       ConfirmDialog {
@@ -1752,6 +1778,50 @@ Item {
                       headerMenu.close()
                       Qt.callLater(function() { licensesPopup.open() })
                     }
+                  }
+
+                  CrispMenuButton {
+                    id: headerResyncAction
+
+                    objectName: "headerResyncAction"
+                    width: parent.width
+                    visible: root.paired
+                    enabled: root.service
+                      && root.service.chatStateResyncBusy !== true
+                    menuIconText: "󰑐"
+                    menuText: root.service
+                      && root.service.chatStateResyncBusy === true
+                      ? "Resyncing chat state…" : "Resync chat state"
+                    foreground: Color.popups.text
+                    accent: root.accent
+                    focusable: true
+                    onClicked: {
+                      headerMenu.close()
+                      Qt.callLater(function() {
+                        resyncConfirmation.opened = true
+                      })
+                    }
+                  }
+
+                  Text {
+                    objectName: "headerResyncStatus"
+                    width: parent.width
+                    visible: root.service
+                      && root.service.chatStateResyncStatus !== "idle"
+                    text: root.service
+                      ? String(root.service.chatStateResyncMessage || "") : ""
+                    color: root.service
+                      && root.service.chatStateResyncStatus === "failed"
+                      ? Color.urgent : (root.service
+                        && root.service.chatStateResyncStatus === "succeeded"
+                        ? root.accent : root.muted)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.Wrap
+                    leftPadding: Style.space(8)
+                    rightPadding: Style.space(8)
+                    topPadding: Style.space(2)
+                    bottomPadding: Style.space(4)
                   }
 
                   CrispMenuButton {

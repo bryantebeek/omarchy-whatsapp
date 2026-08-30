@@ -232,6 +232,43 @@ TestCase {
     aliceRow.contextMenu.close()
   }
 
+  function test_resync_chat_state_recovery() {
+    panel.open("{}")
+    control("headerMoreButton").click()
+    tryCompare(panel.appMenu, "opened", true)
+    var action = control("headerResyncAction")
+    compare(action.visible, true)
+    compare(action.enabled, true)
+    compare(action.menuText, "Resync chat state")
+    action.click()
+    tryCompare(panel.chatStateResyncConfirmation, "opened", true)
+    verify(panel.chatStateResyncConfirmation.message.indexOf(
+      "messages, media, and local history stay intact") >= 0)
+    panel.chatStateResyncConfirmation.confirmed()
+    compare(panel.chatStateResyncConfirmation.opened, false)
+    verify(callRecorded("requestChatStateResync"))
+    compare(service.chatStateResyncStatus, "requested")
+
+    control("headerMoreButton").click()
+    tryCompare(panel.appMenu, "opened", true)
+    compare(action.enabled, false)
+    compare(action.menuText, "Resyncing chat state…")
+    var status = control("headerResyncStatus")
+    compare(status.visible, true)
+    compare(status.text, "Chat-state resync requested")
+
+    service.chatStateResyncStatus = "succeeded"
+    service.chatStateResyncMessage = "WhatsApp chat state is up to date"
+    compare(action.enabled, true)
+    compare(action.menuText, "Resync chat state")
+    compare(status.text, "WhatsApp chat state is up to date")
+
+    service.chatStateResyncStatus = "failed"
+    service.chatStateResyncMessage = "WhatsApp could not complete the replay"
+    compare(action.enabled, true)
+    compare(status.text, "WhatsApp could not complete the replay")
+  }
+
   function test_pin_and_unpin_conversation() {
     panel.open("{}")
     var aliceRow = control("chatRow-alice@s.whatsapp.net")

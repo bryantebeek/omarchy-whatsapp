@@ -148,6 +148,7 @@ MUTATIONS = [
     mutation("panel-voice-send-minimum", P, TP, "enabled: root.voiceRecordingDurationMs >= 250", "enabled: root.voiceRecordingDurationMs >= 9999"),
     mutation("panel-voice-failure-label", P, TP, ': "Voice message failed  " + duration', ': "Voice message sent  " + duration'),
     mutation("panel-app-menu-auto-focus", P, TP, 'objectName: "headerMenu"\n                readonly property var popupBorderSpec:', 'objectName: "headerMenu"\n                onOpened: Qt.callLater(function() { headerLicenseAction.forceActiveFocus() })\n                readonly property var popupBorderSpec:'),
+    mutation("panel-resync-busy-state", P, TP, 'root.service.chatStateResyncBusy !== true', 'root.service.chatStateResyncBusy === true'),
     mutation("panel-chat-menu-auto-focus", P, TP, 'objectName: "chatContextMenu-"\n                          + String(modelData.jid || "")\n                        readonly property var popupBorderSpec:', 'objectName: "chatContextMenu-"\n                          + String(modelData.jid || "")\n                        onOpened: Qt.callLater(function() { chatPinAction.forceActiveFocus() })\n                        readonly property var popupBorderSpec:'),
     mutation("panel-chat-pin-toggle", P, TP, "modelData.pinned !== true)", "modelData.pinned === true)"),
     mutation("panel-image-preview-url", P, TP, "imagePreviewUrl = service.fileUrl(path, revision)", "imagePreviewUrl = String(path || \"\")"),

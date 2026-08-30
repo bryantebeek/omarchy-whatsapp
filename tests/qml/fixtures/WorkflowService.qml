@@ -8,6 +8,10 @@ QtObject {
   property string qrImageUrl: ""
   property int unreadTotal: 0
   property string lastError: ""
+  property string chatStateResyncStatus: "idle"
+  property string chatStateResyncMessage: ""
+  readonly property bool chatStateResyncBusy:
+    chatStateResyncStatus === "requested" || chatStateResyncStatus === "syncing"
   property bool unreadOnly: false
   property var chats: []
   property var messages: []
@@ -54,6 +58,14 @@ QtObject {
   }
 
   function refreshMetadata() { record("refreshMetadata", null) }
+
+  function requestChatStateResync() {
+    if (connectionState !== "connected" || chatStateResyncBusy) return false
+    chatStateResyncStatus = "requested"
+    chatStateResyncMessage = "Chat-state resync requested"
+    record("requestChatStateResync", null)
+    return true
+  }
 
   function selectChat(jid) {
     selectedChatJid = String(jid || "")

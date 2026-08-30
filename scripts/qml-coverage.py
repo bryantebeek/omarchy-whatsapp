@@ -57,6 +57,7 @@ def main() -> int:
         "record_and_send_voice_message",
         "presence_and_typing",
         "menus_open_without_auto_focus",
+        "resync_chat_state_recovery",
         "pin_and_unpin_conversation",
         "load_history_and_receive_updates",
         "conversation_date_dividers",
