@@ -160,6 +160,31 @@ Item {
     borderSpec: root.devicePixelBorderSpec(_borderSpec)
   }
 
+  component SquareControlButton: CrispButton {
+    id: squareControlButton
+
+    property real controlHeight: implicitHeight
+    property string centeredIconText: ""
+    property alias centeredIconItem: centeredIcon
+
+    width: root.snapToDevicePixel(controlHeight)
+    height: width
+    iconText: ""
+
+    Text {
+      id: centeredIcon
+      objectName: squareControlButton.objectName + "Icon"
+      anchors.fill: parent
+      horizontalAlignment: Text.AlignHCenter
+      verticalAlignment: Text.AlignVCenter
+      text: squareControlButton.centeredIconText
+      color: squareControlButton.selected
+        ? squareControlButton._selectedColor : squareControlButton.foreground
+      font.family: squareControlButton.fontFamily
+      font.pixelSize: squareControlButton.iconSize
+    }
+  }
+
   component CrispMenuButton: CrispButton {
     id: menuButton
 
@@ -1895,22 +1920,28 @@ Item {
                     padding: root.snapToDevicePixel(Style.space(10))
 
                     Row {
+                      id: sidebarFilterRow
+
+                      readonly property real controlHeight:
+                        root.snapToDevicePixel(chatSearch.implicitHeight)
+
                       width: parent.width - parent.padding * 2
                       spacing: root.snapToDevicePixel(Style.space(6))
                       CrispTextField {
                         id: chatSearch
                         objectName: "chatSearch"
+                        height: sidebarFilterRow.controlHeight
                         width: parent.width - unreadFilterButton.width
                           - newChatButton.width - parent.spacing * 2
                         placeholderText: "Search conversations"
                         onAccepted: if (root.filteredChats.length)
                           root.chooseChat(root.filteredChats[0].jid)
                       }
-                      CrispButton {
+                      SquareControlButton {
                         id: unreadFilterButton
-                        width: root.snapToDevicePixel(implicitWidth)
-                        height: root.snapToDevicePixel(implicitHeight)
-                        iconText: "󰈲"
+                        objectName: "unreadFilterButton"
+                        controlHeight: sidebarFilterRow.controlHeight
+                        centeredIconText: "󰈲"
                         bordered: true
                         selected: root.unreadOnly
                         foreground: root.foreground
@@ -1922,12 +1953,11 @@ Item {
                           Qt.callLater(root.revealSelectedChat)
                         }
                       }
-                      CrispButton {
+                      SquareControlButton {
                         id: newChatButton
                         objectName: "newChatButton"
-                        width: root.snapToDevicePixel(implicitWidth)
-                        height: root.snapToDevicePixel(implicitHeight)
-                        iconText: root.newChatVisible ? "󰅖" : "󰐕"
+                        controlHeight: sidebarFilterRow.controlHeight
+                        centeredIconText: root.newChatVisible ? "󰅖" : "󰐕"
                         bordered: true
                         foreground: root.foreground
                         tooltipText: root.newChatVisible ? "Cancel" : "New conversation"
@@ -2600,10 +2630,14 @@ Item {
                         readonly property real lineWidth: Math.max(0,
                           width - dateDividerLabelBackground.width
                             - Style.space(48)) / 2
+                        readonly property real contentHeight: Style.space(34)
+                        readonly property real bottomSpacing: Style.space(12)
+                        readonly property real contentCenterOffset:
+                          -bottomSpacing / 2
                         visible: messageDelegate.showDateDivider
                         width: parent.width
                         height: messageDelegate.showDateDivider
-                          ? Style.space(34) : 0
+                          ? contentHeight + bottomSpacing : 0
 
                         Rectangle {
                           objectName: "dateDividerLeftLine-"
@@ -2611,6 +2645,8 @@ Item {
                           anchors.left: parent.left
                           anchors.leftMargin: Style.space(16)
                           anchors.verticalCenter: parent.verticalCenter
+                          anchors.verticalCenterOffset:
+                            dateDivider.contentCenterOffset
                           width: dateDivider.lineWidth
                           height: Math.max(1, Style.normalBorderWidth)
                           color: Qt.rgba(root.foreground.r, root.foreground.g,
@@ -2623,6 +2659,8 @@ Item {
                           anchors.right: parent.right
                           anchors.rightMargin: Style.space(16)
                           anchors.verticalCenter: parent.verticalCenter
+                          anchors.verticalCenterOffset:
+                            dateDivider.contentCenterOffset
                           width: dateDivider.lineWidth
                           height: Math.max(1, Style.normalBorderWidth)
                           color: Qt.rgba(root.foreground.r, root.foreground.g,
@@ -2632,6 +2670,8 @@ Item {
                         Rectangle {
                           id: dateDividerLabelBackground
                           anchors.centerIn: parent
+                          anchors.verticalCenterOffset:
+                            dateDivider.contentCenterOffset
                           width: dateDividerLabel.implicitWidth + Style.space(12)
                           height: dateDividerLabel.implicitHeight + Style.space(4)
                           color: root.background
@@ -2645,7 +2685,7 @@ Item {
                               Qt.locale())
                             color: root.timestamp
                             font.family: root.fontFamily
-                            font.pixelSize: root.messageMetaFontSize
+                            font.pixelSize: root.messageMetaFontSize + 2
                             font.bold: true
                           }
                         }
@@ -2732,8 +2772,7 @@ Item {
                           messageDelegate.isSticker
                         readonly property bool borderOnlyMedia:
                           messageDelegate.mediaData
-                          && (messageDelegate.mediaData.kind === "image"
-                            || messageDelegate.mediaData.kind === "video"
+                          && (messageDelegate.mediaData.kind === "video"
                             || messageDelegate.mediaData.kind === "location")
                         readonly property color mediaBorderColor: {
                           var base = Style.normalBorderFor(
@@ -2807,13 +2846,14 @@ Item {
                           : (modelData.from_me
                             ? Style.selectedFillFor(root.foreground, root.accent)
                             : Style.normalFillFor(root.foreground, root.accent))
-        sourceBorderSpec: borderOnlyMedia
-            ? Border.flat(mediaBorderColor,
-                          1)
-            : Border.none()
+                        sourceBorderSpec: borderOnlyMedia
+                          ? Border.flat(mediaBorderColor, 1)
+                          : Border.none()
 
                         Column {
                           id: messageColumn
+                          objectName: "messageColumn-"
+                            + String(modelData.id || "")
                           anchors.left: parent.left
                           anchors.right: parent.right
                           anchors.leftMargin: bubble.borderOnlyMedia
@@ -3098,11 +3138,17 @@ Item {
                           }
                           Item {
                             id: mediaPreviewCard
+                            objectName: "mediaPreviewCard-"
+                              + String(modelData.id || "")
+                            readonly property bool isImage:
+                              messageDelegate.mediaData
+                              && messageDelegate.mediaData.kind === "image"
                             property alias videoSurface: inlineVideoOutput
                             readonly property bool isVideo: messageDelegate.mediaData
                               && messageDelegate.mediaData.kind === "video"
                             readonly property bool isGif: isVideo
                               && messageDelegate.mediaData.gif_playback === true
+                            readonly property real topMargin: Style.space(8)
                             readonly property bool downloaded: messageDelegate.mediaData
                               ? messageDelegate.mediaData.downloaded === true : false
                             readonly property string mediaPath: messageDelegate.mediaData
@@ -3121,14 +3167,28 @@ Item {
                                 || messageDelegate.mediaData.kind === "video")
                             width: parent.width
                             height: visible && messageDelegate.mediaData
-                              ? width / (isVideo
-                                ? bubble.mediaAspectRatio
-                                : bubble.imageAspectRatio)
+                              ? topMargin + width / (isVideo
+                                  ? bubble.mediaAspectRatio
+                                  : bubble.imageAspectRatio)
                               : 0
+
+                            Rectangle {
+                              id: mediaPreviewMask
+                              objectName: "mediaPreviewMask-"
+                                + String(modelData.id || "")
+                              anchors.fill: parent
+                              anchors.topMargin: mediaPreviewCard.topMargin
+                              radius: bubble.radius
+                              visible: false
+                              layer.enabled: true
+                            }
 
                             Image {
                               id: mediaPreviewImage
+                              objectName: "mediaPreviewImage-"
+                                + String(modelData.id || "")
                               anchors.fill: parent
+                              anchors.topMargin: mediaPreviewCard.topMargin
                               visible: !mediaPreviewCard.inlineActive
                               source: mediaPreviewCard.visible && root.service
                                 ? root.service.fileUrl(
@@ -3137,6 +3197,14 @@ Item {
                               asynchronous: true
                               cache: false
                               fillMode: Image.PreserveAspectFit
+                              layer.enabled: mediaPreviewCard.isImage
+                              layer.smooth: true
+                              layer.effect: MultiEffect {
+                                maskEnabled: true
+                                maskSource: mediaPreviewMask
+                                maskThresholdMin: 0.5
+                                maskSpreadAtMin: 1.0
+                              }
                               onStatusChanged: {
                                 if (status === Image.Ready)
                                   root.scheduleMediaDownloadAnchorRestore(
@@ -3147,6 +3215,7 @@ Item {
                             VideoOutput {
                               id: inlineVideoOutput
                               anchors.fill: parent
+                              anchors.topMargin: mediaPreviewCard.topMargin
                               visible: mediaPreviewCard.inlineActive
                               fillMode: VideoOutput.PreserveAspectFit
                               endOfStreamPolicy: VideoOutput.KeepLastFrame
@@ -3158,6 +3227,7 @@ Item {
 
                             MouseArea {
                               anchors.fill: parent
+                              anchors.topMargin: mediaPreviewCard.topMargin
                               enabled: mediaPreviewCard.downloaded
                               cursorShape: enabled
                                 ? Qt.PointingHandCursor : Qt.ArrowCursor
@@ -3173,6 +3243,8 @@ Item {
 
                             Text {
                               anchors.centerIn: parent
+                              anchors.verticalCenterOffset:
+                                mediaPreviewCard.topMargin / 2
                               visible: mediaPreviewCard.isVideo
                                 && !mediaPreviewCard.inlineActive
                                 && mediaPreviewImage.status !== Image.Ready
@@ -3183,11 +3255,15 @@ Item {
                             }
 
                             CrispButton {
+                              objectName: "mediaDownloadButton-"
+                                + String(modelData.id || "")
                               readonly property bool downloading: visible
                                 && root.service
                                 && root.service.mediaDownloading(modelData)
 
                               anchors.centerIn: parent
+                              anchors.verticalCenterOffset:
+                                mediaPreviewCard.topMargin / 2
                               visible: messageDelegate.mediaData
                                 && mediaPreviewCard.visible
                                 && (mediaPreviewCard.isVideo
@@ -4103,6 +4179,11 @@ Item {
                       color: Style.normalBorderFor(root.foreground, root.accent)
                     }
                     Row {
+                      id: messageComposerControls
+
+                      readonly property real controlHeight:
+                        root.snapToDevicePixel(composer.implicitHeight)
+
                       anchors.left: parent.left
                       anchors.right: parent.right
                       anchors.leftMargin: Style.space(14)
@@ -4113,6 +4194,7 @@ Item {
                       CrispTextField {
                         id: composer
                         objectName: "composer"
+                        height: messageComposerControls.controlHeight
                         width: parent.width - pollButton.width
                           - voiceRecordButton.width - sendButton.width
                           - parent.spacing * 3
@@ -4123,20 +4205,22 @@ Item {
                           root.service.noteComposerActivity(text)
                         onAccepted: root.submitMessage()
                       }
-                      CrispButton {
+                      SquareControlButton {
                         id: pollButton
                         objectName: "pollButton"
-                        iconText: "󰘻"
+                        controlHeight: messageComposerControls.controlHeight
+                        centeredIconText: "󰘻"
                         bordered: true
                         enabled: composer.enabled
                         foreground: root.foreground
                         tooltipText: "Create poll"
                         onClicked: root.openPollCreator()
                       }
-                      CrispButton {
+                      SquareControlButton {
                         id: voiceRecordButton
                         objectName: "voiceRecordButton"
-                        iconText: "󰍬"
+                        controlHeight: messageComposerControls.controlHeight
+                        centeredIconText: "󰍬"
                         bordered: true
                         enabled: composer.enabled && root.service
                           && !root.voiceOutboxEntry
@@ -4145,10 +4229,11 @@ Item {
                         tooltipText: "Record voice message"
                         onClicked: root.startVoiceRecording()
                       }
-                      CrispButton {
+                      SquareControlButton {
                         id: sendButton
                         objectName: "sendButton"
-                        iconText: "󰒊"
+                        controlHeight: messageComposerControls.controlHeight
+                        centeredIconText: "󰒊"
                         bordered: true
                         enabled: composer.enabled
                         foreground: root.foreground
@@ -4227,6 +4312,7 @@ Item {
                     }
                     Row {
                       id: voiceRecordingControls
+                      objectName: "voiceRecordingControls"
                       anchors.left: parent.left
                       anchors.right: parent.right
                       anchors.leftMargin: Style.space(14)
@@ -4235,6 +4321,12 @@ Item {
                       spacing: Style.space(8)
                       visible: root.voiceRecordingActive
 
+                      Item {
+                        width: Math.max(0, parent.width
+                          - voiceRecordingStatus.width - voiceCancelButton.width
+                          - voiceSendButton.width - parent.spacing * 3)
+                        height: 1
+                      }
                       Text {
                         id: voiceRecordingStatus
                         objectName: "voiceRecordingStatus"
@@ -4245,25 +4337,21 @@ Item {
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
                       }
-                      Item {
-                        width: Math.max(0, parent.width
-                          - voiceRecordingStatus.width - voiceCancelButton.width
-                          - voiceSendButton.width - parent.spacing * 3)
-                        height: 1
-                      }
-                      CrispButton {
+                      SquareControlButton {
                         id: voiceCancelButton
                         objectName: "voiceCancelButton"
-                        iconText: "󰅖"
+                        controlHeight: messageComposerControls.controlHeight
+                        centeredIconText: "󰅖"
                         bordered: true
                         foreground: root.foreground
                         tooltipText: "Discard voice message"
                         onClicked: root.stopVoiceRecording(false)
                       }
-                      CrispButton {
+                      SquareControlButton {
                         id: voiceSendButton
                         objectName: "voiceSendButton"
-                        iconText: "󰒊"
+                        controlHeight: messageComposerControls.controlHeight
+                        centeredIconText: "󰒊"
                         bordered: true
                         enabled: root.voiceRecordingDurationMs >= 250
                         foreground: root.foreground

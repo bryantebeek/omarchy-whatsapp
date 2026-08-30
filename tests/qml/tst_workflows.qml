@@ -49,6 +49,18 @@ TestCase {
     return false
   }
 
+  function verifyCenteredSquareButton(button, input) {
+    compare(button.width, input.height)
+    compare(button.height, input.height)
+    compare(button.width, button.height)
+    compare(button.centeredIconItem.x + button.centeredIconItem.width / 2,
+      button.width / 2)
+    compare(button.centeredIconItem.y + button.centeredIconItem.height / 2,
+      button.height / 2)
+    compare(button.centeredIconItem.horizontalAlignment, Text.AlignHCenter)
+    compare(button.centeredIconItem.verticalAlignment, Text.AlignVCenter)
+  }
+
   function syntheticMessages(count) {
     var messages = []
     for (var i = 0; i < count; i++) {
@@ -75,6 +87,10 @@ TestCase {
     verify(callRecorded("setPanelState"))
 
     var search = control("chatSearch")
+    var unreadFilterButton = control("unreadFilterButton")
+    var newChatButton = control("newChatButton")
+    verifyCenteredSquareButton(unreadFilterButton, search)
+    verifyCenteredSquareButton(newChatButton, search)
     search.text = "alice"
     tryCompare(panel.filteredChats, "length", 1)
     compare(panel.filteredChats[0].jid, "alice@s.whatsapp.net")
@@ -102,6 +118,10 @@ TestCase {
     compare(newChat.text, "")
 
     var composer = control("composer")
+    var composerButtons = [control("pollButton"),
+      control("voiceRecordButton"), control("sendButton")]
+    for (var index = 0; index < composerButtons.length; index++)
+      verifyCenteredSquareButton(composerButtons[index], composer)
     var sendButton = control("sendButton")
     compare(sendButton.text, "")
     compare(sendButton.tooltipText, "Send message")
@@ -127,8 +147,24 @@ TestCase {
     compare(panel.voiceRecordingActive, true)
     compare(service.chatStateUpdates[service.chatStateUpdates.length - 1],
       "recording")
-    compare(control("voiceRecordingStatus").text, "●  0:02")
+    var composer = control("composer")
+    var recordingControls = control("voiceRecordingControls")
+    var voiceCancelButton = control("voiceCancelButton")
+    var voiceRecordingStatus = control("voiceRecordingStatus")
     var voiceSendButton = control("voiceSendButton")
+    verifyCenteredSquareButton(voiceCancelButton, composer)
+    verifyCenteredSquareButton(voiceSendButton, composer)
+    compare(voiceCancelButton.width, recordButton.width)
+    compare(voiceSendButton.width, recordButton.width)
+    compare(voiceRecordingStatus.text, "●  0:02")
+    tryVerify(function() {
+      return voiceRecordingStatus.x > 0
+        && voiceRecordingStatus.x + voiceRecordingStatus.width
+          + recordingControls.spacing === voiceCancelButton.x
+        && voiceCancelButton.x + voiceCancelButton.width
+          + recordingControls.spacing === voiceSendButton.x
+        && voiceSendButton.x + voiceSendButton.width === recordingControls.width
+    })
     compare(voiceSendButton.enabled, true)
     voiceSendButton.click()
     compare(panel.voiceRecordingActive, false)
@@ -142,7 +178,7 @@ TestCase {
 
     recordButton.click()
     compare(panel.voiceRecordingActive, true)
-    control("voiceCancelButton").click()
+    voiceCancelButton.click()
     compare(panel.voiceRecordingActive, false)
     compare(service.sentVoiceMessages.length, 1)
     compare(service.discardedVoiceRecordings.length, 1)
@@ -409,11 +445,18 @@ TestCase {
     verify(firstDivider.height > 0)
     compare(sameDayDivider.height, 0)
     verify(nextDivider.height > 0)
+    compare(firstDivider.bottomSpacing, Style.space(12))
+    compare(firstDivider.height,
+      firstDivider.contentHeight + firstDivider.bottomSpacing)
+    compare(firstDivider.contentCenterOffset,
+      -firstDivider.bottomSpacing / 2)
     verify(firstDivider.lineWidth > 0)
     verify(control("dateDividerLeftLine-date-1").width > 0)
     verify(control("dateDividerRightLine-date-1").width > 0)
-    compare(control("dateDividerLabel-date-1").text,
+    var firstDateLabel = control("dateDividerLabel-date-1")
+    compare(firstDateLabel.text,
       firstDay.toLocaleDateString(Qt.locale(), "dddd, d MMMM yyyy"))
+    compare(firstDateLabel.font.pixelSize, panel.messageMetaFontSize + 2)
     compare(control("dateDividerLabel-date-3").text,
       secondDay.toLocaleDateString(Qt.locale(), "dddd, d MMMM yyyy"))
     compare(control("messageBubble-date-1").y, firstDivider.height)
@@ -549,6 +592,52 @@ TestCase {
     panel.open('{"chatJid":"alice@s.whatsapp.net"}')
     var imagePath = String(Qt.resolvedUrl("fixtures/pixel.svg"))
     imagePath = decodeURIComponent(imagePath.substring("file://".length))
+    service.loadMessages([{
+      id: "text-style",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "me",
+      from_me: true,
+      text: "Normal bubble",
+      timestamp: 100
+    }, {
+      id: "image-style",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "me",
+      from_me: true,
+      text: "[Image]",
+      timestamp: 101,
+      media: {
+        kind: "image",
+        path: imagePath,
+        thumbnail_path: imagePath,
+        downloaded: false,
+        width: 1,
+        height: 1
+      }
+    }], "")
+    tryCompare(control("messageList"), "count", 2)
+    var textBubble = control("messageBubble-text-style")
+    var imageBubble = control("messageBubble-image-style")
+    compare(imageBubble.borderOnlyMedia, false)
+    compare(imageBubble.radius, textBubble.radius)
+    compare(imageBubble.color, textBubble.color)
+    compare(imageBubble.borderLeft, textBubble.borderLeft)
+    compare(imageBubble.borderTop, textBubble.borderTop)
+    compare(imageBubble.horizontalPadding, textBubble.horizontalPadding)
+    var mediaCard = control("mediaPreviewCard-image-style")
+    var imageMask = control("mediaPreviewMask-image-style")
+    var previewImage = control("mediaPreviewImage-image-style")
+    var downloadButton = control("mediaDownloadButton-image-style")
+    compare(mediaCard.topMargin, Style.space(8))
+    compare(previewImage.y, mediaCard.topMargin)
+    compare(previewImage.height, mediaCard.height - mediaCard.topMargin)
+    compare(imageMask.radius, imageBubble.radius)
+    compare(imageMask.y, mediaCard.topMargin)
+    compare(previewImage.layer.enabled, true)
+    compare(downloadButton.y + downloadButton.height / 2,
+      mediaCard.topMargin
+        + (mediaCard.height - mediaCard.topMargin) / 2)
+
     panel.openImagePreview(imagePath, "7")
     verify(panel.imagePreviewUrl.endsWith("/fixtures/pixel.svg?v=7"))
 
