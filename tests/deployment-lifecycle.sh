@@ -82,8 +82,27 @@ assert_state_preserved
 "$repo_dir/install.sh" --no-build >/dev/null
 cmp "$release_daemon" "$HOME/.local/bin/omarchy-whatsappd"
 cmp "$release_ctl" "$HOME/.local/bin/omarchy-whatsappctl"
+"$repo_dir/scripts/setup-daemon.sh" check
 assert_state_preserved
 "$repo_dir/install.sh" --no-build >/dev/null
+assert_state_preserved
+OMARCHY_WHATSAPP_BUILD_DIR="$repo_dir/target" \
+  "$repo_dir/scripts/setup-daemon.sh" setup >/dev/null
+"$repo_dir/scripts/setup-daemon.sh" check
+assert_state_preserved
+
+# The in-plugin setup path builds outside the watched plugin checkout and then
+# installs only runtime files, leaving the already-enabled plugin tree alone.
+external_target="$test_dir/external-target"
+mkdir -p -- "$external_target/release"
+install -m 755 "$release_daemon" "$external_target/release/omarchy-whatsappd"
+install -m 755 "$release_ctl" "$external_target/release/omarchy-whatsappctl"
+plugin_manifest="$HOME/.config/omarchy/plugins/io.github.bryantebeek.whatsapp/manifest.json"
+plugin_manifest_digest=$(sha256sum "$plugin_manifest" | cut -d' ' -f1)
+CARGO_TARGET_DIR="$external_target" \
+  "$repo_dir/install.sh" --no-build --runtime-only >/dev/null
+[[ $(sha256sum "$plugin_manifest" | cut -d' ' -f1) == "$plugin_manifest_digest" ]]
+"$repo_dir/scripts/setup-daemon.sh" check
 assert_state_preserved
 
 # Ordinary removal preserves the session; the explicit purge is the sole
