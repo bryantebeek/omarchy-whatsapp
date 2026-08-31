@@ -2868,10 +2868,39 @@ impl Database {
                 source = MAX(contacts.source, excluded.source)",
             params![old_jid, new_jid],
         )?;
+        // A history sync can replay the same group message once with a LID
+        // participant and once with its phone-number participant. Collapse
+        // those rows before removing the alias: a plain UPDATE can violate the
+        // message identity key and roll back the entire contact migration.
         transaction.execute(
-            "UPDATE messages SET sender_jid = ?2 WHERE sender_jid = ?1",
+            "INSERT INTO messages
+             (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me,
+              read, starred, star_updated_at, receipt, delivered_at,
+              receipt_read_at, media_json, media_download)
+             SELECT chat_jid, id, ?2, sender_name, text, timestamp, from_me,
+                    read, starred, star_updated_at, receipt, delivered_at,
+                    receipt_read_at, media_json, media_download
+             FROM messages WHERE sender_jid = ?1
+             ON CONFLICT(chat_jid, sender_jid, id) DO UPDATE SET
+                sender_name = CASE
+                    WHEN messages.sender_name = ''
+                      OR messages.sender_name = messages.sender_jid
+                    THEN excluded.sender_name ELSE messages.sender_name END,
+                text = CASE WHEN messages.text = '' THEN excluded.text ELSE messages.text END,
+                timestamp = MAX(messages.timestamp, excluded.timestamp),
+                from_me = MAX(messages.from_me, excluded.from_me),
+                read = MAX(messages.read, excluded.read),
+                starred = CASE WHEN excluded.star_updated_at >= messages.star_updated_at
+                               THEN excluded.starred ELSE messages.starred END,
+                star_updated_at = MAX(messages.star_updated_at, excluded.star_updated_at),
+                receipt = MAX(messages.receipt, excluded.receipt),
+                delivered_at = COALESCE(messages.delivered_at, excluded.delivered_at),
+                receipt_read_at = COALESCE(messages.receipt_read_at, excluded.receipt_read_at),
+                media_json = COALESCE(messages.media_json, excluded.media_json),
+                media_download = COALESCE(messages.media_download, excluded.media_download)",
             params![old_jid, new_jid],
         )?;
+        transaction.execute("DELETE FROM messages WHERE sender_jid = ?1", [old_jid])?;
         transaction.execute(
             "UPDATE OR IGNORE message_reads SET reader_jid = ?2 WHERE reader_jid = ?1",
             params![old_jid, new_jid],
@@ -4432,16 +4461,33 @@ mod tests {
             .update_address_book_name(lid_jid, "Ada Lovelace")
             .unwrap();
 
+        // History can contain the same group message under both forms of the
+        // participant identity. This was the production collision that used
+        // to abort the entire direct-chat merge.
+        let group_jid = "123-456@g.us";
+        let mut lid_group_message = message("shared-group-message", 15);
+        lid_group_message.chat_jid = group_jid.into();
+        lid_group_message.sender_jid = lid_jid.into();
+        database
+            .insert_history_message(&lid_group_message, "Friends", true)
+            .unwrap();
+        let mut phone_group_message = lid_group_message.clone();
+        phone_group_message.sender_jid = phone_jid.into();
+        database
+            .insert_history_message(&phone_group_message, "Friends", true)
+            .unwrap();
+        assert_eq!(database.messages(group_jid, 10).unwrap().len(), 2);
+
         database.migrate_contact_jid(lid_jid, phone_jid).unwrap();
 
         let chats = database.list_chats(10).unwrap();
-        assert_eq!(chats.len(), 1);
-        assert_eq!(chats[0].jid, phone_jid);
-        assert_eq!(chats[0].name, "Ada Lovelace");
-        assert_eq!(chats[0].phone_number.as_deref(), Some("31612345678"));
-        assert_eq!(chats[0].last_message, "message recent");
-        assert_eq!(chats[0].last_timestamp, 20);
-        assert_eq!(chats[0].unread, 0);
+        assert_eq!(chats.len(), 2);
+        let direct = chats.iter().find(|chat| chat.jid == phone_jid).unwrap();
+        assert_eq!(direct.name, "Ada Lovelace");
+        assert_eq!(direct.phone_number.as_deref(), Some("31612345678"));
+        assert_eq!(direct.last_message, "message recent");
+        assert_eq!(direct.last_timestamp, 20);
+        assert_eq!(direct.unread, 0);
 
         let stored = database.messages(phone_jid, 10).unwrap();
         assert_eq!(
@@ -4452,6 +4498,9 @@ mod tests {
             ["old", "recent"]
         );
         assert_eq!(stored[1].sender_jid, phone_jid);
+        let group_messages = database.messages(group_jid, 10).unwrap();
+        assert_eq!(group_messages.len(), 1);
+        assert_eq!(group_messages[0].sender_jid, phone_jid);
         assert!(database.messages(lid_jid, 10).unwrap().is_empty());
         assert_eq!(database.contact_name(lid_jid).unwrap(), None);
         assert_eq!(

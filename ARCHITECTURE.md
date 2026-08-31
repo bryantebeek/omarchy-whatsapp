@@ -59,8 +59,12 @@ UI, media references, per-sender emoji reactions, synchronized chat settings,
 poll definitions, daemon-private poll creation secrets, each participant's
 latest poll selection, and unread handling. Only aggregate poll results and the
 local user's selected options cross IPC. Inserts are idempotent on
-`(chat_jid, id)`, so offline replay does not duplicate messages or unread
-counts. Retention is capped per chat and never deletes protocol state.
+`(chat_jid, sender_jid, id)`, so equal message IDs from distinct group senders
+remain distinct without duplicating unread counts. Before history is persisted,
+all encountered WhatsApp LIDs are resolved to the same phone-number identity
+used by live events. Alias reconciliation transactionally collapses any legacy
+rows stored under both forms, preserving their strongest message and chat
+state. Retention is capped per chat and never deletes protocol state.
 Schema upgrades inspect existing columns before applying migrations, so an
 already-applied migration is idempotent while storage, permission, and corruption
 errors remain fatal and visible. A panicked database worker rolls back its active

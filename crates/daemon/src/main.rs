@@ -905,12 +905,13 @@ impl Shared {
         &self,
         lazy: &whatsapp_rust::types::events::LazyHistorySync,
         own_pn: Option<&str>,
+        aliases: &HashMap<String, String>,
     ) -> Result<Vec<PendingMedia>> {
         let mut pending_media = Vec::new();
         let mut pending_documents = 0;
         let mut stream = lazy.stream();
         while let Some(conversation) = stream.next_conversation()? {
-            let chat_jid = normalize_jid(&conversation.id);
+            let chat_jid = canonical_history_jid(&conversation.id, aliases);
             if chat_jid.ends_with("@broadcast") || chat_jid.ends_with("@newsletter") {
                 continue;
             }
@@ -927,7 +928,7 @@ impl Shared {
                 .iter()
                 .filter_map(|history| history.message.as_option())
                 .filter_map(|wire| {
-                    if let Some(reaction) = history_reaction(&chat_jid, wire) {
+                    if let Some(reaction) = history_reaction(&chat_jid, wire, aliases) {
                         if let Err(error) = self.database.apply_reaction(
                             &chat_jid,
                             &reaction.message_id,
@@ -940,7 +941,8 @@ impl Shared {
                         }
                         return None;
                     }
-                    let result = history_message(&chat_jid, &chat_name, wire, &self.media_dir);
+                    let result =
+                        history_message(&chat_jid, &chat_name, wire, &self.media_dir, aliases);
                     if let Some(base) = wire
                         .message
                         .as_option()
@@ -1051,7 +1053,7 @@ impl Shared {
                 let option_names: Vec<String> =
                     options.into_iter().map(|option| option.name).collect();
                 if let (Some(creator_jid), Some(secret)) = (
-                    history_poll_creator(&chat_jid, wire, own_pn),
+                    history_poll_creator(&chat_jid, wire, own_pn, aliases),
                     wire.message_secret
                         .as_deref()
                         .or_else(|| message_secret(outer, base)),
@@ -1085,7 +1087,7 @@ impl Shared {
                                 "history group poll vote is missing its participant");
                             continue;
                         };
-                        normalize_jid(participant)
+                        canonical_history_jid(participant, aliases)
                     } else {
                         chat_jid.clone()
                     };
@@ -1581,6 +1583,55 @@ fn normalize_jid(value: &str) -> String {
         .map_or_else(|_| value.to_owned(), |jid| jid.to_non_ad_string())
 }
 
+fn canonical_history_jid(value: &str, aliases: &HashMap<String, String>) -> String {
+    let normalized = normalize_jid(value);
+    aliases.get(&normalized).cloned().unwrap_or(normalized)
+}
+
+fn collect_history_lid_jid(jids: &mut HashSet<String>, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    let Ok(jid) = value.parse::<Jid>() else {
+        return;
+    };
+    if jid.is_lid() {
+        jids.insert(jid.to_non_ad_string());
+    }
+}
+
+// Lazy history parsing is synchronous and deliberately bounded-memory. Scan
+// the compressed payload once for identity dependencies so their async SDK
+// lookups finish before a second bounded pass writes any conversation state.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn history_lid_jids(
+    lazy: &whatsapp_rust::types::events::LazyHistorySync,
+) -> Result<HashSet<String>> {
+    let mut jids = HashSet::new();
+    let mut stream = lazy.stream();
+    while let Some(conversation) = stream.next_conversation()? {
+        collect_history_lid_jid(&mut jids, Some(&conversation.id));
+        for wire in conversation
+            .messages
+            .iter()
+            .filter_map(|history| history.message.as_option())
+        {
+            collect_history_lid_jid(&mut jids, wire.participant.as_deref());
+            if let Some(key) = wire.key.as_option() {
+                collect_history_lid_jid(&mut jids, key.remote_jid.as_deref());
+                collect_history_lid_jid(&mut jids, key.participant.as_deref());
+            }
+            for update in &wire.poll_updates {
+                if let Some(key) = update.poll_update_message_key.as_option() {
+                    collect_history_lid_jid(&mut jids, key.remote_jid.as_deref());
+                    collect_history_lid_jid(&mut jids, key.participant.as_deref());
+                }
+            }
+        }
+    }
+    Ok(jids)
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn canonical_contact_jid(shared: &Shared, client: &Client, jid: &Jid) -> String {
     let raw = jid.to_non_ad_string();
@@ -1632,7 +1683,6 @@ async fn canonical_contact_jid(shared: &Shared, client: &Client, jid: &Jid) -> S
             Ok(false) => {}
             Err(error) => {
                 warn!(%error, %alias, %canonical, "could not merge WhatsApp contact alias");
-                return raw;
             }
         }
     }
@@ -2080,11 +2130,45 @@ async fn process_history_event(
     client: Arc<Client>,
     jobs: Arc<GenerationJobs>,
 ) {
+    let Event::HistorySync(history) = &*event else {
+        return;
+    };
+    let history = history.clone();
+    let scan_history = history.clone();
+    let candidates =
+        match tokio::task::spawn_blocking(move || history_lid_jids(&scan_history)).await {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(error)) => {
+                error!(%error, "could not inspect history sync identities");
+                return;
+            }
+            Err(error) => {
+                error!(%error, "history identity worker panicked");
+                return;
+            }
+        };
+    if !shared.clock.is_current(generation) {
+        return;
+    }
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort_unstable();
+    let mut aliases = HashMap::with_capacity(candidates.len());
+    for raw in candidates {
+        if !shared.clock.is_current(generation) {
+            return;
+        }
+        let Ok(jid) = raw.parse::<Jid>() else {
+            continue;
+        };
+        let canonical = canonical_contact_jid(&shared, &client, &jid).await;
+        if canonical != raw {
+            aliases.insert(raw, canonical);
+        }
+    }
     let ingest_shared = Arc::clone(&shared);
     let own_pn = client.pn().map(|jid| jid.to_non_ad_string());
-    let result = tokio::task::spawn_blocking(move || match &*event {
-        Event::HistorySync(history) => ingest_shared.ingest_history(history, own_pn.as_deref()),
-        _ => Ok(Vec::new()),
+    let result = tokio::task::spawn_blocking(move || {
+        ingest_shared.ingest_history(&history, own_pn.as_deref(), &aliases)
     })
     .await;
     if !shared.clock.is_current(generation) {
@@ -2698,7 +2782,11 @@ struct HistoryReaction {
     timestamp: i64,
 }
 
-fn history_reaction(chat_jid: &str, wire: &wa::WebMessageInfo) -> Option<HistoryReaction> {
+fn history_reaction(
+    chat_jid: &str,
+    wire: &wa::WebMessageInfo,
+    aliases: &HashMap<String, String>,
+) -> Option<HistoryReaction> {
     let envelope_key = wire.key.as_option()?;
     let reaction = find_reaction_message(wire.message.as_option()?)?;
     let target = reaction.key.as_option()?;
@@ -2706,11 +2794,12 @@ fn history_reaction(chat_jid: &str, wire: &wa::WebMessageInfo) -> Option<History
     let reactor_jid = if from_me {
         "me".to_owned()
     } else {
-        normalize_jid(
+        canonical_history_jid(
             wire.participant
                 .as_deref()
                 .or(envelope_key.participant.as_deref())
                 .unwrap_or(chat_jid),
+            aliases,
         )
     };
     let timestamp = reaction
@@ -2746,19 +2835,20 @@ fn history_poll_creator(
     chat_jid: &str,
     wire: &wa::WebMessageInfo,
     own_pn: Option<&str>,
+    aliases: &HashMap<String, String>,
 ) -> Option<String> {
     let key = wire.key.as_option()?;
     if key.from_me.unwrap_or(false) {
         key.participant
             .as_deref()
             .or(wire.participant.as_deref())
-            .map(normalize_jid)
+            .map(|jid| canonical_history_jid(jid, aliases))
             .or_else(|| own_pn.map(str::to_owned))
     } else if chat_jid.ends_with("@g.us") {
         wire.participant
             .as_deref()
             .or(key.participant.as_deref())
-            .map(normalize_jid)
+            .map(|jid| canonical_history_jid(jid, aliases))
     } else {
         Some(chat_jid.to_owned())
     }
@@ -2769,6 +2859,7 @@ fn history_message(
     chat_name: &str,
     wire: &wa::WebMessageInfo,
     media_dir: &Path,
+    aliases: &HashMap<String, String>,
 ) -> Option<Message> {
     let key = wire.key.as_option()?;
     let id = key.id.clone()?;
@@ -2777,11 +2868,12 @@ fn history_message(
     let sender_jid = if from_me {
         "me".to_owned()
     } else {
-        normalize_jid(
+        canonical_history_jid(
             wire.participant
                 .as_deref()
                 .or(key.participant.as_deref())
                 .unwrap_or(chat_jid),
+            aliases,
         )
     };
     let sender_name = if from_me {
@@ -6505,7 +6597,8 @@ mod tests {
             ..Default::default()
         };
 
-        let reaction = history_reaction("123-456@g.us", &wire).unwrap();
+        let aliases = HashMap::new();
+        let reaction = history_reaction("123-456@g.us", &wire, &aliases).unwrap();
         assert_eq!(reaction.message_id, "parent-message");
         assert_eq!(reaction.reactor_jid, "2@s.whatsapp.net");
         assert_eq!(reaction.emoji, "👍");
@@ -6531,13 +6624,14 @@ mod tests {
             message_timestamp: Some(u64::MAX),
             ..Default::default()
         };
-        let own = history_reaction("chat", &own_wire).unwrap();
+        let own = history_reaction("chat", &own_wire, &aliases).unwrap();
         assert_eq!(own.reactor_jid, "me");
         assert_eq!(own.timestamp, i64::MAX);
     }
 
     #[test]
     fn history_identity_poll_hash_and_message_fallbacks_are_explicit() {
+        let aliases = HashMap::new();
         let options = vec!["Soup".to_owned(), "Salad".to_owned()];
         let soup = whatsapp_rust::wacore::poll::compute_option_hash("Soup").to_vec();
         assert_eq!(
@@ -6556,26 +6650,41 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            history_poll_creator("chat@g.us", &key(true, Some("1:2@s.whatsapp.net")), None)
-                .as_deref(),
+            history_poll_creator(
+                "chat@g.us",
+                &key(true, Some("1:2@s.whatsapp.net")),
+                None,
+                &aliases,
+            )
+            .as_deref(),
             Some("1@s.whatsapp.net")
         );
         assert_eq!(
-            history_poll_creator("chat@g.us", &key(true, None), Some("me@s.whatsapp.net"))
-                .as_deref(),
+            history_poll_creator(
+                "chat@g.us",
+                &key(true, None),
+                Some("me@s.whatsapp.net"),
+                &aliases,
+            )
+            .as_deref(),
             Some("me@s.whatsapp.net")
         );
         assert_eq!(
-            history_poll_creator("chat@g.us", &key(false, Some("2:3@s.whatsapp.net")), None)
-                .as_deref(),
+            history_poll_creator(
+                "chat@g.us",
+                &key(false, Some("2:3@s.whatsapp.net")),
+                None,
+                &aliases,
+            )
+            .as_deref(),
             Some("2@s.whatsapp.net")
         );
         assert_eq!(
-            history_poll_creator("2@s.whatsapp.net", &key(false, None), None).as_deref(),
+            history_poll_creator("2@s.whatsapp.net", &key(false, None), None, &aliases).as_deref(),
             Some("2@s.whatsapp.net")
         );
         assert_eq!(
-            history_poll_creator("chat@g.us", &wa::WebMessageInfo::default(), None),
+            history_poll_creator("chat@g.us", &wa::WebMessageInfo::default(), None, &aliases,),
             None
         );
 
@@ -6585,7 +6694,8 @@ mod tests {
                 "chat",
                 "Chat",
                 &wa::WebMessageInfo::default(),
-                directory.path()
+                directory.path(),
+                &aliases,
             )
             .is_none()
         );
@@ -6593,7 +6703,7 @@ mod tests {
             key: MessageField::some(wa::MessageKey::default()),
             ..Default::default()
         };
-        assert!(history_message("chat", "Chat", &missing_id, directory.path()).is_none());
+        assert!(history_message("chat", "Chat", &missing_id, directory.path(), &aliases).is_none());
 
         let outgoing = wa::WebMessageInfo {
             key: MessageField::some(wa::MessageKey {
@@ -6605,7 +6715,8 @@ mod tests {
             message_timestamp: Some(u64::MAX),
             ..Default::default()
         };
-        let outgoing = history_message("chat", "Chat", &outgoing, directory.path()).unwrap();
+        let outgoing =
+            history_message("chat", "Chat", &outgoing, directory.path(), &aliases).unwrap();
         assert_eq!(outgoing.sender_jid, "me");
         assert_eq!(outgoing.sender_name, "You");
         assert_eq!(outgoing.timestamp, i64::MAX);
@@ -6619,7 +6730,8 @@ mod tests {
             message: MessageField::some(wa::Message::text("hello")),
             ..Default::default()
         };
-        let incoming = history_message("chat", "Chat name", &incoming, directory.path()).unwrap();
+        let incoming =
+            history_message("chat", "Chat name", &incoming, directory.path(), &aliases).unwrap();
         assert_eq!(incoming.sender_jid, "chat");
         assert_eq!(incoming.sender_name, "Chat name");
 
@@ -6633,8 +6745,14 @@ mod tests {
             message: MessageField::some(wa::Message::text("hello")),
             ..Default::default()
         };
-        let participant =
-            history_message("chat@g.us", "Chat", &participant_fallback, directory.path()).unwrap();
+        let participant = history_message(
+            "chat@g.us",
+            "Chat",
+            &participant_fallback,
+            directory.path(),
+            &aliases,
+        )
+        .unwrap();
         assert_eq!(participant.sender_jid, "3@s.whatsapp.net");
         assert_eq!(participant.sender_name, "3@s.whatsapp.net");
 
@@ -6656,7 +6774,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            history_message("chat", "Chat", &final_location, directory.path())
+            history_message("chat", "Chat", &final_location, directory.path(), &aliases)
                 .unwrap()
                 .media,
             Some(MessageMedia::Location {
@@ -6666,6 +6784,31 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn history_identity_aliases_are_canonical_before_modeling() {
+        let lid = "100000012345678@lid";
+        let phone = "31612345678@s.whatsapp.net";
+        let aliases = HashMap::from([(lid.to_owned(), phone.to_owned())]);
+
+        assert_eq!(canonical_history_jid(lid, &aliases), phone);
+        assert_eq!(
+            canonical_history_jid("100000012345678:7@lid", &aliases),
+            phone
+        );
+        assert_eq!(
+            canonical_history_jid("31600000000:4@s.whatsapp.net", &aliases),
+            "31600000000@s.whatsapp.net"
+        );
+        assert_eq!(canonical_history_jid("malformed", &aliases), "malformed");
+
+        let mut collected = HashSet::new();
+        collect_history_lid_jid(&mut collected, None);
+        collect_history_lid_jid(&mut collected, Some("malformed"));
+        collect_history_lid_jid(&mut collected, Some("31600000000@s.whatsapp.net"));
+        collect_history_lid_jid(&mut collected, Some("100000012345678:7@lid"));
+        assert_eq!(collected, HashSet::from([lid.to_owned()]));
     }
 
     #[test]
@@ -7494,18 +7637,19 @@ mod tests {
     fn history_sync_populates_initial_chat_list() {
         let directory = tempfile::tempdir().unwrap();
         let shared = test_shared(&directory);
-        let jid = "31612345678@s.whatsapp.net";
+        let lid_jid = "100000012345678@lid";
+        let phone_jid = "31612345678@s.whatsapp.net";
         let history = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: jid.into(),
+                id: lid_jid.into(),
                 name: Some("Ada".into()),
                 unread_count: Some(1),
                 conversation_timestamp: Some(1_700_000_000),
                 messages: vec![wa::HistorySyncMsg {
                     message: MessageField::some(wa::WebMessageInfo {
                         key: MessageField::some(wa::MessageKey {
-                            remote_jid: Some(jid.into()),
+                            remote_jid: Some(lid_jid.into()),
                             from_me: Some(false),
                             id: Some("MSG-1".into()),
                             ..Default::default()
@@ -7532,15 +7676,22 @@ mod tests {
             Some(100),
         );
 
-        shared.ingest_history(&lazy, None).unwrap();
+        assert_eq!(
+            history_lid_jids(&lazy).unwrap(),
+            HashSet::from([lid_jid.into()])
+        );
+        let aliases = HashMap::from([(lid_jid.into(), phone_jid.into())]);
+        shared.ingest_history(&lazy, None, &aliases).unwrap();
 
         let chats = shared.database.list_chats(10).unwrap();
         assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].jid, phone_jid);
         assert_eq!(chats[0].name, "Ada");
         assert_eq!(chats[0].unread, 1);
         assert_eq!(chats[0].last_message, "hello from history");
-        let messages = shared.database.messages(jid, 10).unwrap();
+        let messages = shared.database.messages(phone_jid, 10).unwrap();
         assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender_jid, phone_jid);
         assert_eq!(messages[0].text, "hello from history");
         assert_eq!(messages[0].sender_name, "Ada");
     }
