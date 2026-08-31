@@ -1065,6 +1065,92 @@ TestCase {
     compare(service.lastError, "")
   }
 
+  function findProcess(argument) {
+    for (var i = TestIo.processes.length - 1; i >= 0; i--) {
+      var command = TestIo.processes[i].command || []
+      for (var j = 0; j < command.length; j++)
+        if (String(command[j]) === argument) return TestIo.processes[i]
+    }
+    return null
+  }
+
+  function test_daemon_setup_reports_progress_and_failure_reasons() {
+    service.daemonRuntimeChecked = false
+    service.daemonRuntimeReady = false
+    service.daemonSetupBusy = false
+    service.daemonSetupError = ""
+    service.daemonSetupDetail = ""
+
+    // Without a plugin source directory there is no helper to run, so the
+    // service falls back to starting the packaged unit and reports why setup
+    // is unavailable.
+    compare(service.daemonSetupScript, "")
+    service.checkDaemonRuntime()
+    verify(findProcess("omarchy-whatsapp.service") !== null)
+    compare(service.setupDaemonRuntime(), false)
+    verify(service.daemonSetupError.indexOf("setup helper") >= 0)
+
+    service.manifest = { id: "test.whatsapp", __sourceDir: "/tmp/whatsapp-plugin" }
+    verify(service.daemonSetupScript.indexOf("setup-daemon.sh") >= 0)
+    service.daemonRuntimeChecked = false
+    service.daemonRuntimeReady = false
+    service.daemonSetupError = ""
+
+    // A runtime that is already current starts the service without setup.
+    service.checkDaemonRuntime()
+    var check = findProcess("check")
+    verify(check !== null)
+    check.finish(0)
+    compare(service.daemonRuntimeReady, true)
+    compare(service.daemonSetupRequired, false)
+
+    // A stale runtime asks the user to run setup.
+    service.checkDaemonRuntime()
+    check = findProcess("check")
+    check.finish(1)
+    compare(service.daemonRuntimeReady, false)
+    compare(service.daemonSetupRequired, true)
+
+    compare(service.setupDaemonRuntime(), true)
+    compare(service.daemonSetupBusy, true)
+    compare(service.setupDaemonRuntime(), false)
+    var setup = findProcess("setup")
+    verify(setup !== null)
+
+    // Both streams feed the progress line, with the setup prefix removed.
+    setup.emitStdout("setup: building the daemon")
+    compare(service.daemonSetupDetail, "building the daemon")
+    setup.emitStderr("linking")
+    compare(service.daemonSetupDetail, "linking")
+    setup.emitStdout("   ")
+    compare(service.daemonSetupDetail, "linking")
+    setup.emitStdout(new Array(300).join("x"))
+    compare(service.daemonSetupDetail.length, 238)
+
+    setup.finish(21)
+    compare(service.daemonSetupBusy, false)
+    compare(service.daemonRuntimeReady, false)
+    verify(service.daemonSetupError.indexOf("mise") >= 0)
+
+    compare(service.setupDaemonRuntime(), true)
+    findProcess("setup").finish(20)
+    verify(service.daemonSetupError.indexOf("jq") >= 0)
+
+    compare(service.setupDaemonRuntime(), true)
+    findProcess("setup").finish(0)
+    compare(service.daemonRuntimeReady, true)
+    compare(service.daemonSetupError, "")
+    // Reconnecting on success clears the progress line the handler set.
+    compare(service.daemonSetupDetail, "")
+
+    // Retrying after a failed check re-runs the check rather than the socket.
+    service.daemonRuntimeChecked = true
+    service.daemonRuntimeReady = false
+    service.retryDaemon()
+    compare(service.daemonSetupError, "")
+    verify(findProcess("check") !== null)
+  }
+
   function test_reconnect_sequence() {
     verify(TestIo.sockets.length > 0)
     var socket = TestIo.sockets[TestIo.sockets.length - 1]

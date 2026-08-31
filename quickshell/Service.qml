@@ -472,6 +472,8 @@ Item {
     voiceMessageRequestChatJid = ""
     voiceMessageRequestDurationMs = 0
     return true
+  }
+
   function updateDaemonSetupDetail(line) {
     var detail = String(line || "").trim()
     if (!detail) return
