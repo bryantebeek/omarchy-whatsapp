@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 25;
+pub const PROTOCOL_VERSION: u16 = 27;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -47,6 +47,8 @@ pub struct Chat {
 pub struct ChatParticipant {
     pub jid: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     pub is_me: bool,
 }
 
@@ -399,6 +401,11 @@ pub enum ServerEvent {
         chat_jid: String,
         message_id: String,
         media: MessageMedia,
+    },
+    MediaDownloadFailed {
+        chat_jid: String,
+        message_id: String,
+        message: String,
     },
     Sent {
         message: Message,
@@ -789,6 +796,7 @@ mod tests {
             participants: vec![ChatParticipant {
                 jid: "1@s.whatsapp.net".into(),
                 name: "Ada".into(),
+                aliases: vec!["246204789186724@lid".into()],
                 is_me: false,
             }],
         });
@@ -797,6 +805,12 @@ mod tests {
             serde_json::from_str::<ServerFrame>(&response_json).unwrap(),
             response
         );
+
+        let legacy = serde_json::from_str::<ChatParticipant>(
+            r#"{"jid":"1@s.whatsapp.net","name":"Ada","is_me":false}"#,
+        )
+        .unwrap();
+        assert!(legacy.aliases.is_empty());
     }
 
     #[test]
@@ -888,6 +902,17 @@ mod tests {
                 },
             },
         );
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn failed_media_download_event_round_trip_is_stable() {
+        let frame = ServerFrame::event(ServerEvent::MediaDownloadFailed {
+            chat_jid: "1@s.whatsapp.net".into(),
+            message_id: "image-1".into(),
+            message: "WhatsApp did not return download details for this image".into(),
+        });
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
     }

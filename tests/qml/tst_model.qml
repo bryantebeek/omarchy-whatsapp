@@ -268,6 +268,40 @@ TestCase {
     compare(Model.linkifiedMessage(data.input, data.color), data.expected)
   }
 
+  function test_contactMention() {
+    var contacts = [
+      { jid: "team@g.us", name: "Team", is_group: true },
+      {
+        jid: "316111@s.whatsapp.net", name: "Alice",
+        aliases: ["246204789186724@lid"]
+      },
+      { jid: "100000@lid", phone_number: "+31 (6) 222", name: "Bob" },
+      { jid: "316333@s.whatsapp.net", name: "316333@s.whatsapp.net" },
+      { jid: "316444@s.whatsapp.net", name: "Me", is_me: true }
+    ]
+    compare(Model.contactMention("316111", contacts).name, "Alice")
+    compare(Model.contactMention("246204789186724", contacts).name, "Alice")
+    compare(Model.contactMention("+31 6 222", contacts).jid, "100000@lid")
+    compare(Model.contactMention("316333", contacts), null)
+    compare(Model.contactMention("316444", contacts), null)
+    compare(Model.contactMention("999", contacts), null)
+    compare(Model.contactMention("", contacts), null)
+    compare(Model.contactMention("316111", null), null)
+  }
+
+  function test_linkifiedMessage_resolves_known_mentions() {
+    var contacts = [{
+      jid: "316111@s.whatsapp.net", name: "Alice <Admin>"
+    }]
+    compare(Model.linkifiedMessage(
+      "Hi @316111 and @999. Mail a@316111.test https://example.test/@316111",
+      "#00ff00", contacts),
+      "Hi <a href=\"mention:316111%40s.whatsapp.net\"><font color=\"#00ff00\">"
+        + "@Alice &lt;Admin&gt;</font></a> and @999. Mail a@316111.test "
+        + "<a href=\"https://example.test/@316111\"><font color=\"#00ff00\">"
+        + "https://example.test/@316111</font></a>")
+  }
+
   function test_connectionLabel_data() {
     return [
       { tag: "connected", input: "connected", expected: "Connected" },

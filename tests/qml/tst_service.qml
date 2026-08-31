@@ -432,7 +432,20 @@ TestCase {
     var requestId = Number(Object.keys(service.mediaDownloadRequestIds)[0])
     service.finishMediaDownloadRequest(null)
     service.finishMediaDownloadRequest({ id: 999 })
+    // The ack only confirms the daemon queued the transfer, so the message
+    // stays busy until the broadcast reports the outcome.
     service.finishMediaDownloadRequest({ id: requestId })
+    compare(Object.keys(service.mediaDownloadRequestIds).length, 0)
+    compare(service.mediaDownloading(message), true)
+    service.clearMediaDownloadState("chat", "missing")
+    compare(service.mediaDownloading(message), true)
+    service.clearMediaDownloadState("chat", "m1")
+    compare(service.mediaDownloading(message), false)
+
+    // A rejected request is never queued, so its marker clears immediately.
+    compare(service.downloadMedia(message), true)
+    requestId = Number(Object.keys(service.mediaDownloadRequestIds)[0])
+    service.finishMediaDownloadRequest({ id: requestId, event: "error" })
     compare(service.mediaDownloading(message), false)
 
     var sticker = { id: "s1", chat_jid: "chat", media: {
@@ -445,6 +458,7 @@ TestCase {
     } }), false)
     requestId = Number(Object.keys(service.mediaDownloadRequestIds)[0])
     service.finishMediaDownloadRequest({ id: requestId })
+    service.clearMediaDownloadState("chat", "s1")
     compare(service.mediaDownloading(sticker), false)
 
     var automatic = { id: "s2", chat_jid: "chat", media: {
@@ -468,6 +482,7 @@ TestCase {
     compare(service.autoDownloadStickers([automatic]), 0)
     requestId = Number(Object.keys(service.mediaDownloadRequestIds)[0])
     service.finishMediaDownloadRequest({ id: requestId })
+    service.clearMediaDownloadState("chat", "s2")
 
     service.selectedChatJid = "chat"
     service.messages = [message]
@@ -828,8 +843,25 @@ TestCase {
     compare(service.groupParticipantsError, "failed")
 
     service.messages = [{ id: "m1", chat_jid: "group@g.us", media: { kind: "image" } }]
+    service.mediaDownloadRequests = ({ "group@g.us\nm1": true })
     service.handleLine(JSON.stringify({ event: "media_downloaded", chat_jid: "group@g.us", message_id: "m1", media: { kind: "image", path: "/tmp/new" } }))
     compare(service.messageMedia(service.messages[0]).path, "/tmp/new")
+    compare(service.mediaDownloading(service.messages[0]), false)
+
+    // A background download that fails releases the message and reports why.
+    service.mediaDownloadRequests = ({ "group@g.us\nm1": true })
+    service.handleLine(JSON.stringify({
+      event: "media_download_failed", chat_jid: "group@g.us", message_id: "m1",
+      message: "WhatsApp did not return download details for this image"
+    }))
+    compare(service.mediaDownloading(service.messages[0]), false)
+    compare(service.lastError, "WhatsApp did not return download details for this image")
+    compare(service.lastErrorRequestId, "")
+    service.mediaDownloadRequests = ({ "group@g.us\nm1": true })
+    service.handleLine(JSON.stringify({
+      event: "media_download_failed", chat_jid: "group@g.us", message_id: "m1"
+    }))
+    compare(service.lastError, "WhatsApp media download failed")
 
     service.messages = [
       { id: "own", chat_jid: "group@g.us", from_me: true, receipt: 0 },

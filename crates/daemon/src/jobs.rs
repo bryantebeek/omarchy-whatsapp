@@ -1,18 +1,31 @@
 use omarchy_whatsapp_protocol::Command;
 use std::time::Duration;
 
+// A connection executes a few commands at a time but may queue a burst of
+// cheap ones (for example one avatar request per visible sender) without
+// being rejected; the queue bound is the safety valve against a runaway
+// client, not a pace regulator.
 pub const MAX_CONNECTION_JOBS: usize = 8;
+pub const MAX_QUEUED_CONNECTION_JOBS: usize = 64;
 pub const MAX_IPC_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+// Media and avatar fetches run in background jobs so the commands that request
+// them ack immediately and never hold a connection permit across network I/O.
+pub const MAX_PARALLEL_MEDIA_DOWNLOADS: usize = 3;
+pub const MAX_PARALLEL_AVATAR_FETCHES: usize = 3;
+// Queued jobs outlive the command that requested them, so the backlog needs its
+// own ceiling: acking immediately must not let a client accumulate unbounded
+// pending work.
+pub const MAX_PENDING_MEDIA_DOWNLOADS: usize = 64;
+pub const MAX_PENDING_AVATAR_FETCHES: usize = 256;
+pub const MEDIA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+pub const AVATAR_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[must_use]
 pub fn timeout(command: &Command) -> Duration {
     match command {
         Command::SendVoiceMessage { .. } | Command::CreatePoll { .. } => Duration::from_secs(120),
-        Command::DownloadImage { .. }
-        | Command::DownloadSticker { .. }
-        | Command::DownloadVideo { .. }
-        | Command::DownloadAudio { .. }
-        | Command::GetGroupParticipants { .. } => Duration::from_secs(60),
+        Command::GetGroupParticipants { .. } => Duration::from_secs(60),
         _ => Duration::from_secs(30),
     }
 }
@@ -23,10 +36,6 @@ pub fn conflict_key(command: &Command) -> Option<String> {
         Command::SendMessage { chat_jid, .. }
         | Command::CreatePoll { chat_jid, .. }
         | Command::VotePoll { chat_jid, .. }
-        | Command::DownloadImage { chat_jid, .. }
-        | Command::DownloadSticker { chat_jid, .. }
-        | Command::DownloadVideo { chat_jid, .. }
-        | Command::DownloadAudio { chat_jid, .. }
         | Command::React { chat_jid, .. }
         | Command::MarkRead { chat_jid }
         | Command::SetChatPinned { chat_jid, .. }
@@ -36,10 +45,16 @@ pub fn conflict_key(command: &Command) -> Option<String> {
         Command::RetryTextMessage { delivery_id } | Command::DiscardTextMessage { delivery_id } => {
             format!("text:{delivery_id}")
         }
-        Command::RequestAvatar { jid } => format!("avatar:{jid}"),
         Command::SetActiveChat { .. } | Command::SetPresence { .. } => "connection-intent".into(),
         Command::ResyncChatState | Command::Logout => "global-session".into(),
-        Command::GetState
+        // Downloads and avatar fetches only enqueue background work; their own
+        // in-flight sets already deduplicate per resource.
+        Command::DownloadImage { .. }
+        | Command::DownloadSticker { .. }
+        | Command::DownloadVideo { .. }
+        | Command::DownloadAudio { .. }
+        | Command::RequestAvatar { .. }
+        | Command::GetState
         | Command::ListChats { .. }
         | Command::GetMessages { .. }
         | Command::GetGroupParticipants { .. }
@@ -66,14 +81,19 @@ mod tests {
             Duration::from_secs(120)
         );
         assert_eq!(
-            timeout(&Command::DownloadImage {
+            timeout(&Command::GetGroupParticipants {
                 chat_jid: "chat".into(),
-                message_id: "message".into(),
             }),
             Duration::from_secs(60)
         );
         assert_eq!(timeout(&Command::Ping), Duration::from_secs(30));
+        // Media downloads only enqueue a background job, so the command itself
+        // keeps the short default deadline.
         for command in [
+            Command::DownloadImage {
+                chat_jid: "chat".into(),
+                message_id: "m".into(),
+            },
             Command::DownloadSticker {
                 chat_jid: "chat".into(),
                 message_id: "m".into(),
@@ -86,11 +106,8 @@ mod tests {
                 chat_jid: "chat".into(),
                 message_id: "m".into(),
             },
-            Command::GetGroupParticipants {
-                chat_jid: "chat".into(),
-            },
         ] {
-            assert_eq!(timeout(&command), Duration::from_secs(60));
+            assert_eq!(timeout(&command), Duration::from_secs(30));
         }
         assert_eq!(
             timeout(&Command::CreatePoll {
@@ -154,34 +171,6 @@ mod tests {
                 "chat:chat",
             ),
             (
-                Command::DownloadImage {
-                    chat_jid: "chat".into(),
-                    message_id: "m".into(),
-                },
-                "chat:chat",
-            ),
-            (
-                Command::DownloadSticker {
-                    chat_jid: "chat".into(),
-                    message_id: "m".into(),
-                },
-                "chat:chat",
-            ),
-            (
-                Command::DownloadVideo {
-                    chat_jid: "chat".into(),
-                    message_id: "m".into(),
-                },
-                "chat:chat",
-            ),
-            (
-                Command::DownloadAudio {
-                    chat_jid: "chat".into(),
-                    message_id: "m".into(),
-                },
-                "chat:chat",
-            ),
-            (
                 Command::SetChatPinned {
                     chat_jid: "chat".into(),
                     pinned: true,
@@ -221,12 +210,6 @@ mod tests {
                 "text:delivery",
             ),
             (
-                Command::RequestAvatar {
-                    jid: "person".into(),
-                },
-                "avatar:person",
-            ),
-            (
                 Command::SetActiveChat {
                     chat_jid: Some("chat".into()),
                 },
@@ -245,6 +228,25 @@ mod tests {
             },
             Command::GetGroupParticipants {
                 chat_jid: "chat".into(),
+            },
+            Command::DownloadImage {
+                chat_jid: "chat".into(),
+                message_id: "m".into(),
+            },
+            Command::DownloadSticker {
+                chat_jid: "chat".into(),
+                message_id: "m".into(),
+            },
+            Command::DownloadVideo {
+                chat_jid: "chat".into(),
+                message_id: "m".into(),
+            },
+            Command::DownloadAudio {
+                chat_jid: "chat".into(),
+                message_id: "m".into(),
+            },
+            Command::RequestAvatar {
+                jid: "person".into(),
             },
             Command::ListVoiceOutbox,
             Command::ListTextOutbox,

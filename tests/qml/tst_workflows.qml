@@ -107,6 +107,37 @@ TestCase {
     compare(panel.opened, false)
   }
 
+  function test_mention_contact_name_and_open_dm() {
+    panel.open('{"chatJid":"team@g.us"}')
+    service.groupParticipants = [{
+      jid: "316222@s.whatsapp.net", name: "Bob & Sons",
+      aliases: ["246204789186724@lid"], is_me: false
+    }]
+    service.groupParticipantsChatJid = "team@g.us"
+    service.loadMessages([{
+      id: "mention-1",
+      chat_jid: "team@g.us",
+      sender_jid: "alice@s.whatsapp.net",
+      sender_name: "Alice's profile",
+      text: "Please ask @246204789186724 or @999",
+      timestamp: 100
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    var delegate = control("messageDelegate-mention-1")
+    compare(delegate.senderLabelText, "Alice's profile")
+    verify(delegate.renderedMessageText.indexOf("@Bob &amp; Sons") >= 0)
+    verify(delegate.renderedMessageText.indexOf("mention:316222%40s.whatsapp.net") >= 0)
+    verify(delegate.renderedMessageText.indexOf("@999") >= 0)
+
+    control("messageText-mention-1")
+      .linkActivated("mention:316222%40s.whatsapp.net")
+    compare(service.selectedChatJid, "316222@s.whatsapp.net")
+    verify(service.selectedChat !== null)
+    compare(service.selectedChat.name, "Bob & Sons")
+    compare(service.selectedChat.is_group, false)
+    verify(callRecorded("selectChat"))
+  }
+
   function test_new_conversation_and_send_message() {
     panel.open("{}")
     var newChat = control("newChat")

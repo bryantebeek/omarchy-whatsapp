@@ -105,6 +105,20 @@ Item {
     }
     return output
   }
+  readonly property var messageMentionContacts: {
+    var output = []
+    var chats = service ? service.chats : []
+    if (!Array.isArray(chats)) chats = []
+    for (var i = 0; i < chats.length; i++) {
+      var chat = chats[i] || {}
+      if (chat.is_group !== true) output.push(chat)
+    }
+    var participants = service && Array.isArray(service.groupParticipants)
+      ? service.groupParticipants : []
+    for (var j = 0; j < participants.length; j++)
+      output.push(participants[j] || {})
+    return output
+  }
 
   onFilteredChatsChanged: root.syncChatRenderModel()
 
@@ -389,6 +403,56 @@ Item {
       root.revealSelectedChat()
       composer.forceActiveFocus()
     })
+  }
+
+  function mentionContactForJid(jid) {
+    var value = String(jid || "")
+    var phone = Model.contactPhoneNumber("", value).replace(/[^0-9]/g, "")
+    if (!value || !phone) return null
+    var contacts = messageMentionContacts
+    for (var i = 0; i < contacts.length; i++) {
+      var contact = contacts[i] || {}
+      if (String(contact.jid || "") !== value) continue
+      var resolved = Model.contactMention(phone, [contact])
+      if (resolved) return resolved
+    }
+    return null
+  }
+
+  function ensureMentionDirectChat(contact) {
+    if (!service || !contact || !contact.jid) return false
+    var chats = Array.isArray(service.chats) ? service.chats : []
+    for (var i = 0; i < chats.length; i++)
+      if (String((chats[i] || {}).jid || "") === String(contact.jid)) return true
+    service.chats = [{
+      jid: String(contact.jid),
+      name: String(contact.name || ""),
+      phone_number: Model.contactPhoneNumber("", contact.jid),
+      last_message: "",
+      last_sender_name: "",
+      last_timestamp: 0,
+      unread: 0,
+      pinned: false,
+      muted: false,
+      is_group: false
+    }].concat(chats)
+    return true
+  }
+
+  function openMessageLink(link) {
+    var value = String(link || "")
+    var prefix = "mention:"
+    if (value.indexOf(prefix) !== 0) {
+      Qt.openUrlExternally(value)
+      return true
+    }
+    var jid = ""
+    try { jid = decodeURIComponent(value.substring(prefix.length)) }
+    catch (error) { return false }
+    var contact = mentionContactForJid(jid)
+    if (!contact || !ensureMentionDirectChat(contact)) return false
+    chooseChat(contact.jid)
+    return true
   }
 
   function firstVisibleChatIndex() {
@@ -2527,7 +2591,8 @@ Item {
                         ? "Me" : Model.friendlyName(modelData.sender_name,
                           modelData.sender_jid)
                       readonly property string renderedMessageText:
-                        Model.linkifiedMessage(modelData.text, root.accent)
+                        Model.linkifiedMessage(modelData.text, root.accent,
+                          root.messageMentionContacts)
                       readonly property bool showSenderAvatar: !modelData.from_me
                         && showSenderLabel
                       readonly property var previousMessage: root.service
@@ -2885,6 +2950,7 @@ Item {
                           }
                           Text {
                             id: messageText
+                            objectName: "messageText-" + String(modelData.id || "")
                             visible: !messageDelegate.mediaData
                             width: parent.width
                             text: messageDelegate.renderedMessageText
@@ -2897,7 +2963,7 @@ Item {
                               ? Text.AlignRight : Text.AlignLeft
 
                             onLinkActivated: function (link) {
-                              Qt.openUrlExternally(link)
+                              root.openMessageLink(link)
                             }
 
                             HoverHandler {
@@ -2907,6 +2973,8 @@ Item {
                           }
                           Text {
                             id: mediaCaptionText
+                            objectName: "mediaCaptionText-"
+                              + String(modelData.id || "")
                             visible: messageDelegate.hasMediaCaption
                             width: parent.width
                             text: messageDelegate.renderedMessageText
@@ -2919,7 +2987,7 @@ Item {
                               ? Text.AlignRight : Text.AlignLeft
 
                             onLinkActivated: function (link) {
-                              Qt.openUrlExternally(link)
+                              root.openMessageLink(link)
                             }
 
                             HoverHandler {

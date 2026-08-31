@@ -29,7 +29,7 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
-  readonly property int protocolVersion: 25
+  readonly property int protocolVersion: 27
 
   property bool connected: false
   property bool protocolCompatible: false
@@ -825,9 +825,7 @@ Item {
 
   function commandTimeoutMs(command) {
     var value = String(command || "")
-    if (["download_image", "download_sticker", "download_video",
-         "download_audio", "send_voice_message"].indexOf(value) >= 0)
-      return 120000
+    if (value === "send_voice_message") return 120000
     if (["resync_chat_state", "logout"].indexOf(value) >= 0) return 60000
     return 30000
   }
@@ -1069,12 +1067,24 @@ Item {
     var id = String(frame.id)
     var key = mediaDownloadRequestIds[id]
     if (!key) return
-    var requests = Object.assign({}, mediaDownloadRequests)
     var requestIds = Object.assign({}, mediaDownloadRequestIds)
-    delete requests[key]
     delete requestIds[id]
-    mediaDownloadRequests = requests
     mediaDownloadRequestIds = requestIds
+    // An ack only confirms the daemon queued the download; the busy marker
+    // clears when the media_downloaded or media_download_failed broadcast
+    // arrives. Errors and timeouts release the marker immediately.
+    if (frame.event !== "error") return
+    var requests = Object.assign({}, mediaDownloadRequests)
+    delete requests[key]
+    mediaDownloadRequests = requests
+  }
+
+  function clearMediaDownloadState(chatJid, messageId) {
+    var key = String(chatJid || "") + "\n" + String(messageId || "")
+    if (mediaDownloadRequests[key] !== true) return
+    var requests = Object.assign({}, mediaDownloadRequests)
+    delete requests[key]
+    mediaDownloadRequests = requests
   }
 
   function refreshMetadata() {
@@ -1428,7 +1438,12 @@ Item {
         groupParticipantsError = ""
       }
     } else if (frame.event === "media_downloaded") {
+      clearMediaDownloadState(frame.chat_jid, frame.message_id)
       applyDownloadedMedia(frame)
+    } else if (frame.event === "media_download_failed") {
+      clearMediaDownloadState(frame.chat_jid, frame.message_id)
+      lastError = String(frame.message || "WhatsApp media download failed")
+      lastErrorRequestId = ""
     } else if (frame.event === "receipts") {
       applyReceipts(frame)
     } else if (frame.event === "presence") {

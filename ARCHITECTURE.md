@@ -96,6 +96,15 @@ appearance-agnostic.
 - Slow clients may lose broadcasts. The daemon repeats the versioned `hello` and
   current state after lag, which explicitly makes the service refresh chats,
   messages, avatars, and outbox state from authoritative snapshots.
+- A connection executes a bounded number of commands in parallel and queues the
+  rest; only a client that exceeds the much larger queue bound is rejected with
+  `too many active requests`. Each command's deadline covers the queue wait, so
+  a queued request fails visibly instead of stalling behind stuck work.
+- Media downloads and avatar requests never run on the command path. They
+  validate, ack, and hand the transfer to a deduplicated background queue with
+  its own parallelism limit, so slow network work cannot starve cheap commands.
+  Outcomes arrive as `media_downloaded`, `media_download_failed`, and `avatars`
+  broadcasts, which every connected client observes.
 
 The shared Rust types in `crates/protocol` are the canonical wire contract.
 

@@ -208,13 +208,49 @@ function trimmedLink(value) {
   return { url: url, suffix: suffix }
 }
 
-function linkifiedMessage(value, linkColor) {
+function contactMention(phoneNumber, contacts) {
+  var digits = String(phoneNumber || "").replace(/[^0-9]/g, "")
+  if (!digits || !Array.isArray(contacts)) return null
+  for (var i = 0; i < contacts.length; i++) {
+    var contact = contacts[i] || {}
+    if (contact.is_group === true || contact.is_me === true) continue
+    var jid = String(contact.jid || "").trim()
+    var name = String(contact.name || "").trim()
+    if (!jid || !name || name === jid || name.indexOf("@lid") >= 0) continue
+    var addresses = [jid]
+    if (Array.isArray(contact.aliases)) addresses = addresses.concat(contact.aliases)
+    var matched = contactPhoneNumber(contact.phone_number, jid)
+      .replace(/[^0-9]/g, "") === digits
+    for (var j = 0; !matched && j < addresses.length; j++) {
+      var address = String(addresses[j] || "")
+      matched = address.split("@")[0].replace(/[^0-9]/g, "") === digits
+    }
+    if (!matched) continue
+    return { jid: jid, name: friendlyName(name, jid) }
+  }
+  return null
+}
+
+function linkifiedMessage(value, linkColor, contacts) {
   var input = String(value || "")
-  var pattern = /(?:https?:\/\/|www\.)[^\s<>"']+/gi
+  var pattern = /(?:https?:\/\/|www\.)[^\s<>"']+|@[0-9]+/gi
   var output = ""
   var cursor = 0
   var match
   while ((match = pattern.exec(input)) !== null) {
+    if (match[0].charAt(0) === "@") {
+      var before = match.index > 0 ? input.charAt(match.index - 1) : ""
+      var after = input.charAt(pattern.lastIndex)
+      if (/[A-Za-z0-9_]/.test(before) || /[A-Za-z0-9_]/.test(after)) continue
+      var mention = contactMention(match[0].substr(1), contacts)
+      if (!mention) continue
+      output += escapedMessageText(input.slice(cursor, match.index))
+      output += "<a href=\"mention:" + escapeHtml(encodeURIComponent(mention.jid))
+        + "\"><font color=\"" + escapeHtml(String(linkColor || "")) + "\">@"
+        + escapedMessageText(mention.name) + "</font></a>"
+      cursor = pattern.lastIndex
+      continue
+    }
     var parts = trimmedLink(match[0])
     if (!parts.url) continue
     var href = parts.url.indexOf("www.") === 0
