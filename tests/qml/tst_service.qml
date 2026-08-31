@@ -856,53 +856,6 @@ TestCase {
     compare(service.selectedChat.name, "Bob from daemon")
   }
 
-  function test_daemon_runtime_setup_lifecycle() {
-    service.manifest = {
-      id: "test.whatsapp",
-      __sourceDir: "/synthetic/plugin"
-    }
-    compare(service.pluginDir, "/synthetic/plugin")
-    compare(service.daemonSetupScript, "/synthetic/plugin/scripts/setup-daemon.sh")
-
-    service.daemonSetupDetail = "unchanged"
-    service.updateDaemonSetupDetail("  ")
-    compare(service.daemonSetupDetail, "unchanged")
-    service.updateDaemonSetupDetail("setup: building locally")
-    compare(service.daemonSetupDetail, "building locally")
-    service.updateDaemonSetupDetail("x".repeat(300))
-    compare(service.daemonSetupDetail.length, 238)
-    verify(service.daemonSetupDetail.endsWith("…"))
-
-    service.daemonSetupBusy = true
-    compare(service.setupDaemonRuntime(), false)
-    service.daemonSetupBusy = false
-    TestIo.processStarts = []
-    compare(service.setupDaemonRuntime(), true)
-    compare(TestIo.processStarts.length, 1)
-    compare(TestIo.processStarts[0].join(" "),
-      "/usr/bin/bash /synthetic/plugin/scripts/setup-daemon.sh setup")
-
-    service.finishDaemonRuntimeSetup(20)
-    compare(service.daemonRuntimeReady, false)
-    verify(service.daemonSetupError.indexOf("jq") >= 0)
-    service.daemonSetupDetail = ""
-    service.finishDaemonRuntimeSetup(21)
-    verify(service.daemonSetupError.indexOf("Rust") >= 0)
-    service.finishDaemonRuntimeSetup(22)
-    compare(service.daemonSetupError, "The WhatsApp daemon could not be set up.")
-    service.reconnectAttempt = 4
-    service.finishDaemonRuntimeSetup(0)
-    compare(service.daemonRuntimeReady, true)
-    compare(service.daemonSetupDetail, "")
-    compare(service.daemonSetupError, "")
-    compare(service.reconnectAttempt, 0)
-
-    service.finishDaemonStart(1)
-    compare(service.daemonRuntimeReady, false)
-    service.finishDaemonStart(0)
-    compare(service.daemonRuntimeReady, true)
-  }
-
   function test_event_groups_media_messages_and_errors() {
     service.chats = [{ jid: "group@g.us", is_group: true }]
     service.selectedChatJid = "group@g.us"
@@ -1136,6 +1089,92 @@ TestCase {
     service.selectedChatJid = "chat"
     compare(service.sendMessage("new action"), true)
     compare(service.lastError, "")
+  }
+
+  function findProcess(argument) {
+    for (var i = TestIo.processes.length - 1; i >= 0; i--) {
+      var command = TestIo.processes[i].command || []
+      for (var j = 0; j < command.length; j++)
+        if (String(command[j]) === argument) return TestIo.processes[i]
+    }
+    return null
+  }
+
+  function test_daemon_setup_reports_progress_and_failure_reasons() {
+    service.daemonRuntimeChecked = false
+    service.daemonRuntimeReady = false
+    service.daemonSetupBusy = false
+    service.daemonSetupError = ""
+    service.daemonSetupDetail = ""
+
+    // Without a plugin source directory there is no helper to run, so the
+    // service falls back to starting the packaged unit and reports why setup
+    // is unavailable.
+    compare(service.daemonSetupScript, "")
+    service.checkDaemonRuntime()
+    verify(findProcess("omarchy-whatsapp.service") !== null)
+    compare(service.setupDaemonRuntime(), false)
+    verify(service.daemonSetupError.indexOf("setup helper") >= 0)
+
+    service.manifest = { id: "test.whatsapp", __sourceDir: "/tmp/whatsapp-plugin" }
+    verify(service.daemonSetupScript.indexOf("setup-daemon.sh") >= 0)
+    service.daemonRuntimeChecked = false
+    service.daemonRuntimeReady = false
+    service.daemonSetupError = ""
+
+    // A runtime that is already current starts the service without setup.
+    service.checkDaemonRuntime()
+    var check = findProcess("check")
+    verify(check !== null)
+    check.finish(0)
+    compare(service.daemonRuntimeReady, true)
+    compare(service.daemonSetupRequired, false)
+
+    // A stale runtime asks the user to run setup.
+    service.checkDaemonRuntime()
+    check = findProcess("check")
+    check.finish(1)
+    compare(service.daemonRuntimeReady, false)
+    compare(service.daemonSetupRequired, true)
+
+    compare(service.setupDaemonRuntime(), true)
+    compare(service.daemonSetupBusy, true)
+    compare(service.setupDaemonRuntime(), false)
+    var setup = findProcess("setup")
+    verify(setup !== null)
+
+    // Both streams feed the progress line, with the setup prefix removed.
+    setup.emitStdout("setup: building the daemon")
+    compare(service.daemonSetupDetail, "building the daemon")
+    setup.emitStderr("linking")
+    compare(service.daemonSetupDetail, "linking")
+    setup.emitStdout("   ")
+    compare(service.daemonSetupDetail, "linking")
+    setup.emitStdout(new Array(300).join("x"))
+    compare(service.daemonSetupDetail.length, 238)
+
+    setup.finish(21)
+    compare(service.daemonSetupBusy, false)
+    compare(service.daemonRuntimeReady, false)
+    verify(service.daemonSetupError.indexOf("mise") >= 0)
+
+    compare(service.setupDaemonRuntime(), true)
+    findProcess("setup").finish(20)
+    verify(service.daemonSetupError.indexOf("jq") >= 0)
+
+    compare(service.setupDaemonRuntime(), true)
+    findProcess("setup").finish(0)
+    compare(service.daemonRuntimeReady, true)
+    compare(service.daemonSetupError, "")
+    // Reconnecting on success clears the progress line the handler set.
+    compare(service.daemonSetupDetail, "")
+
+    // Retrying after a failed check re-runs the check rather than the socket.
+    service.daemonRuntimeChecked = true
+    service.daemonRuntimeReady = false
+    service.retryDaemon()
+    compare(service.daemonSetupError, "")
+    verify(findProcess("check") !== null)
   }
 
   function test_reconnect_sequence() {
