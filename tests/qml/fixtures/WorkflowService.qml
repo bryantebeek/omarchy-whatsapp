@@ -12,6 +12,10 @@ QtObject {
   property string chatStateResyncMessage: ""
   readonly property bool chatStateResyncBusy:
     chatStateResyncStatus === "requested" || chatStateResyncStatus === "syncing"
+  property bool daemonSetupRequired: false
+  property bool daemonSetupBusy: false
+  property string daemonSetupDetail: ""
+  property string daemonSetupError: ""
   property bool unreadOnly: false
   property var chats: []
   property var messages: []
@@ -60,6 +64,47 @@ QtObject {
   }
 
   function refreshMetadata() { record("refreshMetadata", null) }
+
+  function setupDaemonRuntime() {
+    if (daemonSetupBusy) return false
+    daemonSetupBusy = true
+    record("setupDaemonRuntime", null)
+    return true
+  }
+
+  function retryDaemon() { record("retryDaemon", null) }
+
+  function ensureDirectChat(jid, name) {
+    var value = String(jid || "")
+    if (!value) return false
+    for (var i = 0; i < chats.length; i++)
+      if (String((chats[i] || {}).jid || "") === value) return true
+    chats = [{
+      jid: value,
+      name: String(name || ""),
+      phone_number: value.split("@")[0],
+      last_message: "",
+      last_sender_name: "",
+      last_timestamp: 0,
+      unread: 0,
+      pinned: false,
+      muted: false,
+      is_group: false
+    }].concat(chats)
+    return true
+  }
+
+  function receiveChats(value) {
+    var incoming = Array.isArray(value) ? value.slice() : []
+    var selected = selectedChat
+    if (selected && selected.jid) {
+      var found = false
+      for (var i = 0; i < incoming.length; i++)
+        if (String((incoming[i] || {}).jid || "") === String(selected.jid)) found = true
+      if (!found) incoming = [selected].concat(incoming)
+    }
+    chats = incoming
+  }
 
   function requestChatStateResync() {
     if (connectionState !== "connected" || chatStateResyncBusy) return false

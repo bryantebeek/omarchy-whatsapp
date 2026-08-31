@@ -5,6 +5,8 @@ QtObject {
 
   property var command: []
   property bool running: false
+  property var stderr: null
+  property var stdout: null
   signal exited(int exitCode, int exitStatus)
 
   onRunningChanged: {

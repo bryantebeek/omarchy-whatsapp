@@ -54,6 +54,7 @@ def main() -> int:
     required_workflows = {
         "open_search_select_and_close",
         "mention_contact_name_and_open_dm",
+        "daemon_setup_recovery",
         "new_conversation_and_send_message",
         "record_and_send_voice_message",
         "presence_and_typing",

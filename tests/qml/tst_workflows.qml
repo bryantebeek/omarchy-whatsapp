@@ -136,6 +136,39 @@ TestCase {
     compare(service.selectedChat.name, "Bob & Sons")
     compare(service.selectedChat.is_group, false)
     verify(callRecorded("selectChat"))
+
+    service.receiveChats([
+      { jid: "team@g.us", name: "Release Team", is_group: true },
+      { jid: "alice@s.whatsapp.net", name: "Alice", is_group: false }
+    ])
+    compare(service.selectedChatJid, "316222@s.whatsapp.net")
+    verify(service.selectedChat !== null)
+    compare(service.selectedChat.name, "Bob & Sons")
+    compare(control("conversationTitle").text, "Bob & Sons")
+    compare(control("composer").enabled, true)
+  }
+
+  function test_daemon_setup_recovery() {
+    service.connectionState = "starting"
+    service.daemonSetupRequired = true
+    service.daemonSetupDetail = "Preparing the local build…"
+    panel.open("{}")
+    compare(panel.opened, true)
+    compare(panel.paired, false)
+    compare(panel.daemonSetupRequired, true)
+    compare(control("daemonSetupTitle").text, "Set up WhatsApp")
+    compare(control("daemonSetupButton").text, "Build and start daemon")
+
+    control("daemonSetupButton").click()
+    verify(callRecorded("setupDaemonRuntime"))
+    compare(service.daemonSetupBusy, true)
+    compare(control("daemonSetupButton").enabled, false)
+    compare(control("daemonSetupButton").text, "Setting up daemon…")
+
+    service.daemonSetupBusy = false
+    service.daemonSetupRequired = false
+    control("daemonRetryButton").click()
+    verify(callRecorded("retryDaemon"))
   }
 
   function test_new_conversation_and_send_message() {
@@ -145,6 +178,7 @@ TestCase {
     newChat.text = "+31 (6) 1234"
     control("openChatButton").click()
     compare(service.selectedChatJid, "3161234@s.whatsapp.net")
+    verify(service.selectedChat !== null)
     compare(panel.newChatVisible, false)
     compare(newChat.text, "")
 

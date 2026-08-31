@@ -426,23 +426,9 @@ Item {
   }
 
   function ensureMentionDirectChat(contact) {
-    if (!service || !contact || !contact.jid) return false
-    var chats = Array.isArray(service.chats) ? service.chats : []
-    for (var i = 0; i < chats.length; i++)
-      if (String((chats[i] || {}).jid || "") === String(contact.jid)) return true
-    service.chats = [{
-      jid: String(contact.jid),
-      name: String(contact.name || ""),
-      phone_number: Model.contactPhoneNumber("", contact.jid),
-      last_message: "",
-      last_sender_name: "",
-      last_timestamp: 0,
-      unread: 0,
-      pinned: false,
-      muted: false,
-      is_group: false
-    }].concat(chats)
-    return true
+    return !!(service && contact && contact.jid
+      && typeof service.ensureDirectChat === "function"
+      && service.ensureDirectChat(contact.jid, contact.name))
   }
 
   function openMessageLink(link) {
@@ -544,7 +530,8 @@ Item {
 
   function openNewChat() {
     var jid = Model.normalizedJid(newChat.text)
-    if (!jid || !service) return
+    if (!jid || !service || typeof service.ensureDirectChat !== "function"
+        || !service.ensureDirectChat(jid, "")) return
     newChat.text = ""
     newChatVisible = false
     service.selectChat(jid)
@@ -2486,6 +2473,7 @@ Item {
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: Style.space(2)
                         Text {
+                          objectName: "conversationTitle"
                           text: root.service && root.service.selectedChat
                             ? Model.friendlyName(root.service.selectedChat.name,
                               root.service.selectedChat.jid) : "Select a conversation"
@@ -4549,6 +4537,7 @@ Item {
               width: Math.min(parent.width - Style.space(48), Style.space(520))
               spacing: Style.space(14)
               Text {
+                objectName: "daemonSetupTitle"
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: root.daemonSetupRequired
                   ? "Set up WhatsApp"
@@ -4617,6 +4606,7 @@ Item {
                 wrapMode: Text.Wrap
               }
               CrispButton {
+                objectName: "daemonSetupButton"
                 visible: root.daemonSetupRequired
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: root.daemonSetupBusy
@@ -4629,6 +4619,7 @@ Item {
                 onClicked: if (root.service) root.service.setupDaemonRuntime()
               }
               CrispButton {
+                objectName: "daemonRetryButton"
                 visible: !root.pairing && !root.daemonSetupRequired
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: "Try again"

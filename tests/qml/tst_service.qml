@@ -830,6 +830,79 @@ TestCase {
     compare(service.messagesResponseSerial, 2)
   }
 
+  function test_chat_refresh_preserves_new_selected_direct_chat() {
+    service.chats = [{ jid: "existing@s.whatsapp.net", name: "Existing", is_group: false }]
+    compare(service.ensureDirectChat("", "Nobody"), false)
+    compare(service.ensureDirectChat("existing@s.whatsapp.net", "Ignored"), true)
+    compare(service.chats.length, 1)
+    compare(service.ensureDirectChat("316222@s.whatsapp.net", "Bob & Sons"), true)
+    compare(service.chats.length, 2)
+    service.selectChat("316222@s.whatsapp.net")
+    compare(service.selectedChat.name, "Bob & Sons")
+
+    service.handleLine(JSON.stringify({ event: "chats", chats: [
+      { jid: "existing@s.whatsapp.net", name: "Existing", is_group: false }
+    ] }))
+    compare(service.selectedChatJid, "316222@s.whatsapp.net")
+    verify(service.selectedChat !== null)
+    compare(service.selectedChat.name, "Bob & Sons")
+    compare(service.chats[0].jid, "316222@s.whatsapp.net")
+
+    service.handleLine(JSON.stringify({ event: "chats", chats: [
+      { jid: "316222@s.whatsapp.net", name: "Bob from daemon", is_group: false },
+      { jid: "existing@s.whatsapp.net", name: "Existing", is_group: false }
+    ] }))
+    compare(service.chats.length, 2)
+    compare(service.selectedChat.name, "Bob from daemon")
+  }
+
+  function test_daemon_runtime_setup_lifecycle() {
+    service.manifest = {
+      id: "test.whatsapp",
+      __sourceDir: "/synthetic/plugin"
+    }
+    compare(service.pluginDir, "/synthetic/plugin")
+    compare(service.daemonSetupScript, "/synthetic/plugin/scripts/setup-daemon.sh")
+
+    service.daemonSetupDetail = "unchanged"
+    service.updateDaemonSetupDetail("  ")
+    compare(service.daemonSetupDetail, "unchanged")
+    service.updateDaemonSetupDetail("setup: building locally")
+    compare(service.daemonSetupDetail, "building locally")
+    service.updateDaemonSetupDetail("x".repeat(300))
+    compare(service.daemonSetupDetail.length, 238)
+    verify(service.daemonSetupDetail.endsWith("…"))
+
+    service.daemonSetupBusy = true
+    compare(service.setupDaemonRuntime(), false)
+    service.daemonSetupBusy = false
+    TestIo.processStarts = []
+    compare(service.setupDaemonRuntime(), true)
+    compare(TestIo.processStarts.length, 1)
+    compare(TestIo.processStarts[0].join(" "),
+      "/usr/bin/bash /synthetic/plugin/scripts/setup-daemon.sh setup")
+
+    service.finishDaemonRuntimeSetup(20)
+    compare(service.daemonRuntimeReady, false)
+    verify(service.daemonSetupError.indexOf("jq") >= 0)
+    service.daemonSetupDetail = ""
+    service.finishDaemonRuntimeSetup(21)
+    verify(service.daemonSetupError.indexOf("Rust") >= 0)
+    service.finishDaemonRuntimeSetup(22)
+    compare(service.daemonSetupError, "The WhatsApp daemon could not be set up.")
+    service.reconnectAttempt = 4
+    service.finishDaemonRuntimeSetup(0)
+    compare(service.daemonRuntimeReady, true)
+    compare(service.daemonSetupDetail, "")
+    compare(service.daemonSetupError, "")
+    compare(service.reconnectAttempt, 0)
+
+    service.finishDaemonStart(1)
+    compare(service.daemonRuntimeReady, false)
+    service.finishDaemonStart(0)
+    compare(service.daemonRuntimeReady, true)
+  }
+
   function test_event_groups_media_messages_and_errors() {
     service.chats = [{ jid: "group@g.us", is_group: true }]
     service.selectedChatJid = "group@g.us"
