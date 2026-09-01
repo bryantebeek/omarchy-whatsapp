@@ -45,7 +45,7 @@ use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore::request::InfoQuery;
 use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::wacore_binary::{JidExt, NodeContent, SERVER_JID, builder::NodeBuilder};
-use whatsapp_rust::{SendOptions, UploadOptions, media};
+use whatsapp_rust::{PresencePolicy, SendOptions, UploadOptions, media};
 
 const CHAT_LIST_LIMIT: u32 = 500;
 const AVATAR_SYNC_LIMIT: u32 = 1_000;
@@ -136,6 +136,7 @@ struct Shared {
     media_dir: PathBuf,
     voice_outbox_dir: PathBuf,
     avatar_revision: AtomicU64,
+    presence_sync_generation: AtomicU64,
     app_state_failed: AtomicBool,
     app_state_activity_ms: AtomicU64,
     chat_state_resync: RwLock<(ChatStateResyncStatus, Option<String>)>,
@@ -298,6 +299,22 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .state(Utc::now().timestamp())
+    }
+
+    fn begin_presence_sync(&self, generation: u64) {
+        self.presence_sync_generation
+            .store(generation, Ordering::SeqCst);
+    }
+
+    fn finish_presence_sync(&self, generation: u64) -> bool {
+        self.presence_sync_generation
+            .compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn presence_sync_pending(&self) -> bool {
+        let generation = self.presence_sync_generation.load(Ordering::SeqCst);
+        self.clock.is_current(generation)
     }
 
     fn set_lease_active_chat(
@@ -3347,8 +3364,10 @@ async fn handle_app_event(
         }
         Event::SelfPushNameUpdated(update) => {
             info!(old = %update.old_name, new = %update.new_name, "own WhatsApp profile name changed");
-            if shared.lease_state().available
-                && !update.new_name.is_empty()
+            if effective_presence_available(
+                shared.lease_state().available,
+                shared.presence_sync_pending(),
+            ) && !update.new_name.is_empty()
                 && let Err(error) = client.presence().set_available().await
             {
                 warn!(%error, "could not restore deferred available WhatsApp presence");
@@ -3500,6 +3519,11 @@ async fn handle_app_event(
         Event::OfflineSyncCompleted(details) => {
             info!(count = details.count, "WhatsApp offline sync completed");
             broadcast_snapshot(&shared);
+            if shared.finish_presence_sync(generation) {
+                let intent = shared.lease_state();
+                force_reconcile_connection_intent(&shared, &leases::LeaseState::default(), &intent)
+                    .await;
+            }
             jobs.spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
         }
         Event::DirtyState(details) => {
@@ -3811,6 +3835,7 @@ async fn run_daemon() -> Result<()> {
         media_dir,
         voice_outbox_dir,
         avatar_revision: AtomicU64::new(0),
+        presence_sync_generation: AtomicU64::new(0),
         app_state_failed: AtomicBool::new(false),
         app_state_activity_ms: AtomicU64::new(0),
         chat_state_resync: RwLock::new((ChatStateResyncStatus::Idle, None)),
@@ -3850,6 +3875,7 @@ async fn run_daemon() -> Result<()> {
     // rebuilding only the protocol client so the UI receives a fresh code.
     loop {
         let generation = shared.clock.begin_generation();
+        shared.begin_presence_sync(generation);
         let generation_jobs = Arc::new(GenerationJobs::default());
         shared.app_state_failed.store(false, Ordering::Relaxed);
         shared.app_state_activity_ms.store(0, Ordering::Relaxed);
@@ -3895,6 +3921,7 @@ async fn run_daemon() -> Result<()> {
 
         let bot = Bot::builder()
             .with_backend(store)
+            .with_presence_policy(PresencePolicy::Manual)
             .with_event_delivery(EventDelivery::Ordered { capacity: 4_096 })
             .with_inbound_durability_hook(inbound::DurableInboundHook::new(Arc::clone(
                 &shared.database,
@@ -3951,7 +3978,7 @@ async fn run_daemon() -> Result<()> {
                     let connected_shared = Arc::clone(&shared);
                     connected_jobs.spawn(async move {
                         let intent = connected_shared.lease_state();
-                        reconcile_connection_intent(
+                        force_reconcile_connection_intent(
                             &connected_shared,
                             &leases::LeaseState::default(),
                             &intent,
@@ -4187,11 +4214,36 @@ async fn reconcile_connection_intent(
     before: &leases::LeaseState,
     after: &leases::LeaseState,
 ) {
+    reconcile_connection_intent_inner(shared, before, after, false).await;
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn force_reconcile_connection_intent(
+    shared: &Shared,
+    before: &leases::LeaseState,
+    after: &leases::LeaseState,
+) {
+    reconcile_connection_intent_inner(shared, before, after, true).await;
+}
+
+fn effective_presence_available(requested: bool, sync_pending: bool) -> bool {
+    requested && !sync_pending
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn reconcile_connection_intent_inner(
+    shared: &Shared,
+    before: &leases::LeaseState,
+    after: &leases::LeaseState,
+    force_presence: bool,
+) {
     let Some(client) = shared.client.read().await.clone() else {
         return;
     };
-    if before.available != after.available {
-        let result = if after.available {
+    if force_presence || before.available != after.available {
+        let available =
+            effective_presence_available(after.available, shared.presence_sync_pending());
+        let result = if available {
             if client.push_name().is_empty() {
                 Ok(())
             } else {
@@ -4201,7 +4253,7 @@ async fn reconcile_connection_intent(
             client.presence().set_unavailable().await
         };
         if let Err(error) = result {
-            warn!(%error, available = after.available, "could not reconcile leased WhatsApp presence");
+            warn!(%error, requested = after.available, available, "could not reconcile leased WhatsApp presence");
         }
     }
     for raw in before.active_chats.difference(&after.active_chats) {
@@ -5585,6 +5637,7 @@ mod tests {
             media_dir: directory.path().join("media"),
             voice_outbox_dir: directory.path().join("outbox"),
             avatar_revision: AtomicU64::new(0),
+            presence_sync_generation: AtomicU64::new(0),
             app_state_failed: AtomicBool::new(false),
             app_state_activity_ms: AtomicU64::new(0),
             chat_state_resync: RwLock::new((ChatStateResyncStatus::Idle, None)),
@@ -5638,6 +5691,32 @@ mod tests {
         assert!(pending.await.unwrap_err().is_cancelled());
         assert!(jobs.handles.lock().unwrap().is_empty());
         jobs.abort_all();
+    }
+
+    #[test]
+    fn presence_stays_unavailable_until_the_current_generation_finishes_syncing() {
+        assert!(!effective_presence_available(false, false));
+        assert!(!effective_presence_available(false, true));
+        assert!(effective_presence_available(true, false));
+        assert!(!effective_presence_available(true, true));
+
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        assert!(!shared.presence_sync_pending());
+
+        let first = shared.clock.begin_generation();
+        shared.begin_presence_sync(first);
+        assert!(shared.presence_sync_pending());
+        assert!(!shared.finish_presence_sync(first.saturating_add(1)));
+        assert!(shared.presence_sync_pending());
+
+        let second = shared.clock.begin_generation();
+        assert!(!shared.presence_sync_pending());
+        shared.begin_presence_sync(second);
+        assert!(!shared.finish_presence_sync(first));
+        assert!(shared.presence_sync_pending());
+        assert!(shared.finish_presence_sync(second));
+        assert!(!shared.presence_sync_pending());
     }
 
     #[tokio::test]

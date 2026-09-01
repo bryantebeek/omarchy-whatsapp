@@ -143,10 +143,14 @@ linking, and profile-about events are explicitly excluded.
 An ordered compile-time test fails when upstream appends a new event kind until
 it is classified.
 
-Presence and chat state are intentionally ephemeral. While the panel is focused,
-the daemon advertises this linked device as available and subscribes to presence
-for the active direct conversation. The composer sends composing once per typing
-burst and paused after inactivity, sending, selection changes, or focus loss.
+Presence and chat state are intentionally ephemeral. The daemon configures
+`whatsapp-rust` for manual global-presence ownership, so library reconnect and
+push-name handling cannot briefly advertise the linked device as available.
+Every connection remains unavailable while its offline catch-up is pending;
+after `OfflineSyncCompleted`, the daemon advertises availability only while the
+panel is focused. It still subscribes to presence for the active direct
+conversation. The composer sends composing once per typing burst and paused
+after inactivity, sending, selection changes, or focus loss.
 Incoming online, last-seen, typing, and recording events cross IPC but are never
 written to `history.db`; the shell expires typing indicators defensively if a
 pause broadcast is lost.

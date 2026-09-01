@@ -50,9 +50,10 @@ mind.
   in-process Lottie renderer.
 - **Presence and shell integration:** show online and last-seen presence plus
   direct and group typing/recording indicators; publish local availability and
-  composer activity; open location cards in OpenStreetMap; deep-link from native
-  notifications and Omarchy search; and expose connection/unread state in the
-  bar widget.
+  composer activity only after reconnect catch-up finishes, keeping the linked
+  device unavailable during background sync; open location cards in
+  OpenStreetMap; deep-link from native notifications and Omarchy search; and
+  expose connection/unread state in the bar widget.
 - **Recovery:** reconnect automatically, recover durable incoming work, text
   sends, voice sends, and read intents across interruptions, and offer a manual
   chat-state resync for unread, pinned, archived, and muted state without
