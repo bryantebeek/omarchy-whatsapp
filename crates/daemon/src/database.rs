@@ -33,6 +33,7 @@ fn update_poll_tallies(
     media: &mut MessageMedia,
     counts: &HashMap<String, u32>,
     selected_by_me: &std::collections::HashSet<String>,
+    voter_jids: &HashMap<String, Vec<String>>,
     total_voters: u32,
 ) -> bool {
     let MessageMedia::Poll {
@@ -43,12 +44,103 @@ fn update_poll_tallies(
     else {
         return false;
     };
+    let mut changed = *media_total_voters != total_voters;
     *media_total_voters = total_voters;
     for option in options {
-        option.votes = counts.get(&option.name).copied().unwrap_or(0);
-        option.selected_by_me = selected_by_me.contains(&option.name);
+        let vote_count = counts.get(&option.name).copied().unwrap_or(0);
+        let selected = selected_by_me.contains(&option.name);
+        let option_voters = voter_jids.get(&option.name).cloned().unwrap_or_default();
+        changed |= option.votes != vote_count
+            || option.selected_by_me != selected
+            || option.voter_jids != option_voters;
+        option.votes = vote_count;
+        option.selected_by_me = selected;
+        option.voter_jids = option_voters;
     }
-    true
+    changed
+}
+
+fn reconcile_poll_tallies(
+    connection: &Connection,
+    chat_jid: &str,
+    message_id: &str,
+    media: &mut MessageMedia,
+) -> Result<bool> {
+    if !matches!(media, MessageMedia::Poll { .. }) {
+        return Ok(false);
+    }
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut selected_by_me = std::collections::HashSet::new();
+    let mut voter_jids: HashMap<String, Vec<String>> = HashMap::new();
+    let mut total_voters = 0u32;
+    let mut statement = connection.prepare(
+        "SELECT voter_jid, selected_options, from_me FROM poll_votes
+         WHERE chat_jid = ?1 AND message_id = ?2
+         ORDER BY timestamp DESC, voter_jid",
+    )?;
+    let rows = statement.query_map(params![chat_jid, message_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, bool>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (voter_jid, json, own) = row?;
+        let selections: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+        if !selections.is_empty() {
+            total_voters = total_voters.saturating_add(1);
+        }
+        for selection in selections {
+            *counts.entry(selection.clone()).or_default() += 1;
+            let voters = voter_jids.entry(selection.clone()).or_default();
+            if !voters.contains(&voter_jid) {
+                voters.push(voter_jid.clone());
+            }
+            if own {
+                selected_by_me.insert(selection);
+            }
+        }
+    }
+    Ok(update_poll_tallies(
+        media,
+        &counts,
+        &selected_by_me,
+        &voter_jids,
+        total_voters,
+    ))
+}
+
+fn reconcile_all_poll_tallies(connection: &mut Connection) -> Result<()> {
+    let targets = {
+        let mut statement = connection.prepare(
+            "SELECT chat_jid, id, media_json FROM messages
+             WHERE media_json LIKE '%\"kind\":\"poll\"%'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let transaction = connection.transaction()?;
+    for (chat_jid, message_id, media_json) in targets {
+        let Ok(mut media) = serde_json::from_str::<MessageMedia>(&media_json) else {
+            continue;
+        };
+        if reconcile_poll_tallies(&transaction, &chat_jid, &message_id, &mut media)? {
+            transaction.execute(
+                "UPDATE messages SET media_json = ?3
+                 WHERE chat_jid = ?1 AND id = ?2",
+                params![chat_jid, message_id, serde_json::to_string(&media)?],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 fn quoted_identifier(value: &str) -> String {
@@ -666,6 +758,7 @@ impl Database {
              WHERE last_message = '[Unsupported message]'",
             [],
         )?;
+        reconcile_all_poll_tallies(&mut connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             protocol_db: path.with_file_name("session.db"),
@@ -1793,50 +1886,18 @@ impl Database {
                 timestamp,
             ],
         )? > 0;
-        if !changed {
-            transaction.commit()?;
-            return Ok(false);
-        }
-
-        let mut counts: HashMap<String, u32> = HashMap::new();
-        let mut selected_by_me = std::collections::HashSet::new();
-        let mut total_voters = 0u32;
-        {
-            let mut statement = transaction.prepare(
-                "SELECT selected_options, from_me FROM poll_votes
-                 WHERE chat_jid = ?1 AND message_id = ?2",
+        let tallies_changed =
+            reconcile_poll_tallies(&transaction, chat_jid, message_id, &mut media)?;
+        if tallies_changed {
+            let updated_json = serde_json::to_string(&media)?;
+            transaction.execute(
+                "UPDATE messages SET media_json = ?3
+                 WHERE chat_jid = ?1 AND id = ?2",
+                params![chat_jid, message_id, updated_json],
             )?;
-            let rows = statement.query_map(params![chat_jid, message_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
-            })?;
-            for row in rows {
-                let (json, own) = row?;
-                let selections: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
-                if !selections.is_empty() {
-                    total_voters = total_voters.saturating_add(1);
-                }
-                for selection in selections {
-                    *counts.entry(selection.clone()).or_default() += 1;
-                    if own {
-                        selected_by_me.insert(selection);
-                    }
-                }
-            }
         }
-        debug_assert!(update_poll_tallies(
-            &mut media,
-            &counts,
-            &selected_by_me,
-            total_voters,
-        ));
-        let updated_json = serde_json::to_string(&media)?;
-        transaction.execute(
-            "UPDATE messages SET media_json = ?3
-             WHERE chat_jid = ?1 AND id = ?2",
-            params![chat_jid, message_id, updated_json],
-        )?;
         transaction.commit()?;
-        Ok(true)
+        Ok(changed || tallies_changed)
     }
 
     pub fn unread_total(&self) -> Result<u32> {
@@ -2586,7 +2647,6 @@ impl Database {
                 }
             }
         }
-        let json = serde_json::to_string(&merged_media)?;
         let gif_placeholder = matches!(
             merged_media,
             MessageMedia::Video {
@@ -2596,6 +2656,8 @@ impl Database {
         )
         .then_some("[GIF]");
         let transaction = connection.transaction()?;
+        reconcile_poll_tallies(&transaction, chat_jid, message_id, &mut merged_media)?;
+        let json = serde_json::to_string(&merged_media)?;
         let updated = transaction.execute(
             "UPDATE messages SET
                 media_json = ?3,
@@ -3155,6 +3217,31 @@ impl Database {
                        AND media_json LIKE '%\"live\":true%'
                        AND COALESCE(json_extract(media_json, '$.duration_seconds'), 0) = 0)
                  )
+                 ORDER BY timestamp DESC LIMIT 1",
+                [chat_jid],
+                |row| {
+                    let timestamp: i64 = row.get(3)?;
+                    Ok(HistoryCursor {
+                        chat_jid: chat_jid.to_owned(),
+                        message_id: row.get(0)?,
+                        sender_jid: row.get(1)?,
+                        from_me: row.get(2)?,
+                        timestamp_ms: timestamp.saturating_mul(1_000),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn poll_metadata_recovery_cursor(&self, chat_jid: &str) -> Result<Option<HistoryCursor>> {
+        let connection = self.connection();
+        connection
+            .query_row(
+                "SELECT id, sender_jid, from_me, timestamp FROM messages
+                 WHERE chat_jid = ?1
+                   AND media_json LIKE '%\"kind\":\"poll\"%'
+                   AND COALESCE(json_extract(media_json, '$.selectable_count'), 1) = 1
                  ORDER BY timestamp DESC LIMIT 1",
                 [chat_jid],
                 |row| {
@@ -5011,11 +5098,13 @@ mod tests {
                     name: "Soup".into(),
                     votes: 0,
                     selected_by_me: false,
+                    voter_jids: Vec::new(),
                 },
                 omarchy_whatsapp_protocol::PollOption {
                     name: "Salad".into(),
                     votes: 0,
                     selected_by_me: false,
+                    voter_jids: Vec::new(),
                 },
             ],
             selectable_count: 2,
@@ -5083,6 +5172,10 @@ mod tests {
         assert_eq!(*total_voters, 2);
         assert_eq!(options[0].votes, 0);
         assert_eq!(options[1].votes, 2);
+        assert_eq!(
+            options[1].voter_jids,
+            vec!["2@s.whatsapp.net".to_owned(), "me".to_owned()]
+        );
 
         let refreshed_poll = MessageMedia::Poll {
             question: "Lunch?".into(),
@@ -5091,11 +5184,13 @@ mod tests {
                     name: "Soup".into(),
                     votes: 0,
                     selected_by_me: false,
+                    voter_jids: Vec::new(),
                 },
                 omarchy_whatsapp_protocol::PollOption {
                     name: "Salad".into(),
                     votes: 0,
                     selected_by_me: false,
+                    voter_jids: Vec::new(),
                 },
             ],
             selectable_count: 2,
@@ -5122,7 +5217,193 @@ mod tests {
         assert_eq!(total_voters, 2);
         assert_eq!(options[1].votes, 2);
         assert!(options[1].selected_by_me);
+        assert_eq!(
+            options[1].voter_jids,
+            vec!["2@s.whatsapp.net".to_owned(), "me".to_owned()]
+        );
+
+        let stale_json = serde_json::to_string(&refreshed_poll).unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE messages SET media_json = ?3 WHERE chat_jid = ?1 AND id = ?2",
+                params![poll.chat_jid, poll.id, stale_json],
+            )
+            .unwrap();
+        assert!(
+            database
+                .apply_poll_vote(&poll.chat_jid, &poll.id, "me", &["Salad".into()], true, 101,)
+                .unwrap()
+        );
+        assert!(
+            !database
+                .apply_poll_vote(&poll.chat_jid, &poll.id, "me", &["Salad".into()], true, 101,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn poll_tallies_repair_on_reopen_and_legacy_single_metadata_is_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let database = Database::open(&path).unwrap();
+        let mut poll = message("legacy-poll", 10);
+        poll.text = "[Poll] Choose".into();
+        poll.media = Some(MessageMedia::Poll {
+            question: "Choose".into(),
+            options: vec![
+                omarchy_whatsapp_protocol::PollOption {
+                    name: "One".into(),
+                    votes: 0,
+                    selected_by_me: false,
+                    voter_jids: Vec::new(),
+                },
+                omarchy_whatsapp_protocol::PollOption {
+                    name: "Two".into(),
+                    votes: 0,
+                    selected_by_me: false,
+                    voter_jids: Vec::new(),
+                },
+            ],
+            selectable_count: 1,
+            total_voters: 0,
+            quiz: false,
+            correct_option_index: None,
+            end_timestamp: 0,
+        });
+        database.insert_message(&poll, "Ada", false, false).unwrap();
+        database
+            .apply_poll_vote(&poll.chat_jid, &poll.id, "me", &["Two".into()], true, 100)
+            .unwrap();
+        let stale_json = serde_json::to_string(poll.media.as_ref().unwrap()).unwrap();
+        database
+            .connection()
+            .execute(
+                "UPDATE messages SET media_json = ?3 WHERE chat_jid = ?1 AND id = ?2",
+                params![poll.chat_jid, poll.id, stale_json],
+            )
+            .unwrap();
+        drop(database);
+
+        let database = Database::open(&path).unwrap();
+        let Some(MessageMedia::Poll {
+            options,
+            total_voters,
+            ..
+        }) = database.messages(&poll.chat_jid, 10).unwrap()[0]
+            .media
+            .clone()
+        else {
+            panic!("expected repaired poll")
+        };
+        assert_eq!(total_voters, 1);
+        assert_eq!(options[1].votes, 1);
         assert!(options[1].selected_by_me);
+        assert_eq!(options[1].voter_jids, vec!["me"]);
+        assert_eq!(
+            database
+                .poll_metadata_recovery_cursor(&poll.chat_jid)
+                .unwrap(),
+            Some(HistoryCursor {
+                chat_jid: poll.chat_jid.clone(),
+                message_id: poll.id.clone(),
+                sender_jid: poll.sender_jid.clone(),
+                from_me: poll.from_me,
+                timestamp_ms: poll.timestamp * 1_000,
+            })
+        );
+
+        let mut refreshed = poll.media.unwrap();
+        let MessageMedia::Poll {
+            selectable_count, ..
+        } = &mut refreshed
+        else {
+            unreachable!()
+        };
+        *selectable_count = 2;
+        assert!(
+            database
+                .update_message_media(&poll.chat_jid, &poll.id, &refreshed)
+                .unwrap()
+        );
+        assert!(
+            database
+                .poll_metadata_recovery_cursor(&poll.chat_jid)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn poll_tally_repair_handles_malformed_media_and_storage_errors() {
+        let missing = Connection::open_in_memory().unwrap();
+        let mut poll = MessageMedia::Poll {
+            question: "Choose".into(),
+            options: vec![omarchy_whatsapp_protocol::PollOption {
+                name: "One".into(),
+                votes: 0,
+                selected_by_me: false,
+                voter_jids: Vec::new(),
+            }],
+            selectable_count: 1,
+            total_voters: 0,
+            quiz: false,
+            correct_option_index: None,
+            end_timestamp: 0,
+        };
+        assert!(reconcile_poll_tallies(&missing, "chat", "poll", &mut poll).is_err());
+        let mut missing = missing;
+        assert!(reconcile_all_poll_tallies(&mut missing).is_err());
+
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (
+                    chat_jid TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    media_json TEXT NOT NULL,
+                    PRIMARY KEY (chat_jid, id)
+                 );
+                 CREATE TABLE poll_votes (
+                    chat_jid TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    voter_jid TEXT NOT NULL,
+                    selected_options TEXT NOT NULL,
+                    from_me INTEGER NOT NULL,
+                    timestamp INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (chat_jid, id, media_json) VALUES ('chat', 'bad', ?1)",
+                [r#"{"kind":"poll","#],
+            )
+            .unwrap();
+        reconcile_all_poll_tallies(&mut connection).unwrap();
+        connection.execute("DELETE FROM messages", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (chat_jid, id, media_json) VALUES ('chat', 'poll', ?1)",
+                [serde_json::to_string(&poll).unwrap()],
+            )
+            .unwrap();
+        reconcile_all_poll_tallies(&mut connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO poll_votes
+                 (chat_jid, message_id, voter_jid, selected_options, from_me, timestamp)
+                 VALUES ('chat', 'poll', 'me', '[\"One\"]', 1, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_poll_repair BEFORE UPDATE ON messages
+                 BEGIN SELECT RAISE(ABORT, 'synthetic repair failure'); END;",
+            )
+            .unwrap();
+        assert!(reconcile_all_poll_tallies(&mut connection).is_err());
     }
 
     fn durable_inbound(sender: &str, id: &str, committed_at: i64) -> DurableInbound {
@@ -5435,6 +5716,7 @@ mod tests {
             &mut non_poll,
             &HashMap::new(),
             &std::collections::HashSet::new(),
+            &HashMap::new(),
             0,
         ));
         assert!(
@@ -5536,6 +5818,7 @@ mod tests {
                 name: "One".into(),
                 votes: 0,
                 selected_by_me: false,
+                voter_jids: Vec::new(),
             }],
             selectable_count: 0,
             total_voters: 0,

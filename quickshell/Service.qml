@@ -33,7 +33,7 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
-  readonly property int protocolVersion: 27
+  readonly property int protocolVersion: 28
 
   property bool connected: false
   property bool protocolCompatible: false
@@ -43,6 +43,7 @@ Item {
   property int unreadTotal: 0
   property var avatarAvailable: ({})
   property var avatarRevisions: ({})
+  property string ownAvatarJid: ""
   property int mediaRevision: 0
   property var mediaOverrides: ({})
   property var mediaOverrideRevisions: ({})
@@ -868,9 +869,28 @@ Item {
     return output
   }
 
+  function avatarJid(jid) {
+    var value = String(jid || "")
+    return value === "me" ? ownAvatarJid : value
+  }
+
+  function rememberOwnAvatarJid(participants) {
+    if (!Array.isArray(participants)) return false
+    for (var i = 0; i < participants.length; i++) {
+      var participant = participants[i] || {}
+      var jid = String(participant.jid || "")
+      if (participant.is_me !== true || !jid || jid === "me") continue
+      if (ownAvatarJid === jid) return false
+      ownAvatarJid = jid
+      requestAvatar(jid)
+      return true
+    }
+    return false
+  }
+
   function avatarUrl(jid) {
-    if (!jid || String(jid) === "me") return ""
-    var key = String(jid)
+    var key = avatarJid(jid)
+    if (!key) return ""
     if (avatarAvailable[key] !== true) return ""
     return "file://" + statePath + "/avatars/" + hexKey(key)
       + ".img?v=" + Number(avatarRevisions[key] || 0)
@@ -882,8 +902,8 @@ Item {
   }
 
   function requestAvatar(jid) {
-    if (jid && String(jid) !== "me")
-      send("request_avatar", { jid: String(jid) })
+    var key = avatarJid(jid)
+    if (key) send("request_avatar", { jid: key })
   }
 
   function openMap(latitudeE7, longitudeE7) {
@@ -1561,7 +1581,9 @@ Item {
         refreshSelectedGroupParticipants()
     } else if (frame.event === "group_participants") {
       if (String(frame.chat_jid || "") === selectedChatJid) {
-        groupParticipants = copyArray(frame.participants)
+        var participants = copyArray(frame.participants)
+        groupParticipants = participants
+        rememberOwnAvatarJid(participants)
         groupParticipantsChatJid = String(frame.chat_jid || "")
         groupParticipantsError = ""
       }

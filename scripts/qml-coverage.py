@@ -63,6 +63,7 @@ def main() -> int:
         "pin_and_unpin_conversation",
         "load_history_and_receive_updates",
         "conversation_date_dividers",
+        "create_render_and_vote_in_poll",
         "event_updates_preserve_conversation_viewport",
         "open_media_and_recover_connection",
         "render_and_download_stickers",

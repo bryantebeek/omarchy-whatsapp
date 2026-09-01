@@ -323,6 +323,19 @@ Item {
       ? " + " + remaining + (remaining === 1 ? " other" : " others") : "")
   }
 
+  function pollVoterName(jid) {
+    var value = String(jid || "")
+    if (value === "me") return "You"
+    var participants = service && Array.isArray(service.groupParticipants)
+      ? service.groupParticipants : []
+    for (var i = 0; i < participants.length; i++) {
+      var participant = participants[i] || {}
+      if (String(participant.jid || "") === value)
+        return Model.friendlyName(participant.name, value)
+    }
+    return Model.friendlyName("", value)
+  }
+
   function conversationChatActivity() {
     if (!service || !service.selectedChat) return ""
     var chat = service.selectedChat
@@ -3045,40 +3058,80 @@ Item {
                                     modelData.selected_by_me === true
                                   readonly property int votes:
                                     Number(modelData.votes || 0)
+                                  readonly property var voterJids:
+                                    modelData.voter_jids
+                                    && typeof modelData.voter_jids.length === "number"
+                                    ? modelData.voter_jids : []
                                   width: pollContent.width
-                                  height: Math.max(Style.space(38),
-                                    pollOptionLabel.implicitHeight + Style.space(16))
+                                  height: Math.max(Style.space(52),
+                                    pollOptionLabel.implicitHeight + Style.space(26))
 
-                                  CrispBorderSurface {
+                                  CrispButton {
+                                    id: pollOptionButton
+                                    objectName: "pollOptionButton-"
+                                      + String(messageDelegate.modelData.id || "")
+                                      + "-" + String(pollOption.index)
                                     anchors.fill: parent
-                                    radius: Style.cornerRadius + Style.space(2)
-                                    color: pollOption.selected
-                                      ? Style.selectedFillFor(root.foreground, root.accent)
-                                      : Style.normalFillFor(root.foreground, root.accent)
-                                    sourceBorderSpec: Border.flat(
-                                      pollOption.selected ? root.accent
-                                        : Style.normalBorderFor(root.foreground, root.accent),
-                                      Math.max(1, Style.normalBorderWidth))
+                                    readonly property color subtleBorderColor:
+                                      Qt.rgba(root.foreground.r,
+                                        root.foreground.g, root.foreground.b, 0.10)
+                                    radius: bubble.radius
+                                    foreground: root.foreground
+                                    accent: root.accent
+                                    background: Style.normalFillFor(
+                                      root.foreground, root.accent)
+                                    bordered: true
+                                    borderSpec: root.devicePixelBorderSpec(
+                                      pollOptionButton._showFocusRing
+                                        ? pollOptionButton._focusBorderSpec
+                                        : Border.flat(subtleBorderColor,
+                                          Math.max(1, Style.normalBorderWidth)))
+                                    selected: pollOption.selected
+                                    enabled: !pollCard.ended && root.service
+                                      && !root.service.pollVotePending(
+                                        messageDelegate.modelData)
+                                    focusable: true
+                                    onClicked: messageDelegate.togglePollOption(
+                                      pollOption.index)
+                                  }
+
+                                  Rectangle {
+                                    id: pollProgressTrack
+                                    objectName: "pollProgressTrack-"
+                                      + String(messageDelegate.modelData.id || "")
+                                      + "-" + String(pollOption.index)
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    anchors.bottom: parent.bottom
+                                    height: Style.space(9)
+                                    radius: height / 2
+                                    color: Style.normalFillFor(
+                                      root.foreground, root.accent)
 
                                     Rectangle {
+                                      objectName: "pollProgressFill-"
+                                        + String(messageDelegate.modelData.id || "")
+                                        + "-" + String(pollOption.index)
                                       anchors.left: parent.left
+                                      anchors.top: parent.top
                                       anchors.bottom: parent.bottom
-                                      height: Math.max(1, Style.normalBorderWidth * 2)
                                       width: pollCard.totalVoters > 0
                                         ? parent.width * Math.min(1,
                                           pollOption.votes / pollCard.totalVoters) : 0
+                                      radius: height / 2
                                       color: root.accent
-                                      opacity: 0.75
+                                      opacity: 0.9
                                     }
                                   }
 
                                   Text {
                                     id: pollOptionLabel
                                     anchors.left: parent.left
-                                    anchors.right: pollOptionCount.left
+                                    anchors.right: pollVoteSummary.left
                                     anchors.leftMargin: Style.space(10)
                                     anchors.rightMargin: Style.space(8)
                                     anchors.verticalCenter: parent.verticalCenter
+                                    anchors.verticalCenterOffset: -Style.space(5)
                                     text: (pollOption.selected ? "✓  " : "")
                                       + String(pollOption.modelData.name || "")
                                     color: root.foreground
@@ -3088,25 +3141,138 @@ Item {
                                     textFormat: Text.PlainText
                                   }
 
-                                  Text {
-                                    id: pollOptionCount
+                                  Item {
+                                    id: pollVoteSummary
+                                    objectName: "pollVoteSummary-"
+                                      + String(messageDelegate.modelData.id || "")
+                                      + "-" + String(pollOption.index)
+                                    readonly property int avatarSize: Style.space(22)
+                                    readonly property int avatarStride: Style.space(14)
+                                    readonly property real avatarStackWidth:
+                                      pollOption.voterJids.length > 0
+                                      ? avatarSize + (pollOption.voterJids.length - 1)
+                                        * avatarStride : 0
                                     anchors.right: parent.right
                                     anchors.rightMargin: Style.space(10)
                                     anchors.verticalCenter: parent.verticalCenter
-                                    text: String(pollOption.votes)
-                                    color: root.sidebarSecondary
-                                    font.family: root.fontFamily
-                                    font.pixelSize: root.messageMetaFontSize
-                                  }
+                                    anchors.verticalCenterOffset: -Style.space(5)
+                                    width: pollOptionCount.implicitWidth
+                                      + (avatarStackWidth > 0
+                                        ? Style.space(5) + avatarStackWidth : 0)
+                                    height: avatarSize
 
-                                  MouseArea {
-                                    objectName: "pollOptionMouse-" + String(pollOption.index)
-                                    anchors.fill: parent
-                                    enabled: !pollCard.ended && root.service
-                                      && !root.service.pollVotePending(messageDelegate.modelData)
-                                    cursorShape: enabled
-                                      ? Qt.PointingHandCursor : Qt.ArrowCursor
-                                    onClicked: messageDelegate.togglePollOption(pollOption.index)
+                                    Text {
+                                      id: pollOptionCount
+                                      objectName: "pollOptionCount-"
+                                        + String(messageDelegate.modelData.id || "")
+                                        + "-" + String(pollOption.index)
+                                      anchors.left: parent.left
+                                      anchors.verticalCenter: parent.verticalCenter
+                                      text: String(pollOption.votes)
+                                      color: root.sidebarSecondary
+                                      font.family: root.fontFamily
+                                      font.pixelSize: root.messageMetaFontSize
+                                    }
+
+                                    Item {
+                                      id: pollVoterStack
+                                      objectName: "pollVoterStack-"
+                                        + String(messageDelegate.modelData.id || "")
+                                        + "-" + String(pollOption.index)
+                                      anchors.left: pollOptionCount.right
+                                      anchors.leftMargin: Style.space(5)
+                                      anchors.verticalCenter: parent.verticalCenter
+                                      width: pollVoteSummary.avatarStackWidth
+                                      height: pollVoteSummary.avatarSize
+
+                                      Repeater {
+                                        model: pollOption.voterJids
+
+                                        delegate: CrispBorderSurface {
+                                          id: pollVoterAvatar
+                                          required property var modelData
+                                          required property int index
+                                          readonly property string voterJid:
+                                            String(modelData || "")
+                                          objectName: "pollVoterAvatar-"
+                                            + String(messageDelegate.modelData.id || "")
+                                            + "-" + String(pollOption.index)
+                                            + "-" + String(index)
+                                          x: index * pollVoteSummary.avatarStride
+                                          z: pollOption.voterJids.length - index
+                                          width: pollVoteSummary.avatarSize
+                                          height: width
+                                          radius: width / 2
+                                          clip: true
+                                          color: Style.normalFillFor(
+                                            root.foreground, root.accent)
+                                          sourceBorderSpec: Border.flat(
+                                            Style.normalBorderFor(
+                                              root.foreground, root.accent),
+                                            Math.max(1, Style.normalBorderWidth))
+
+                                          Component.onCompleted: {
+                                            if (root.service)
+                                              root.service.requestAvatar(voterJid)
+                                          }
+
+                                          Text {
+                                            anchors.centerIn: parent
+                                            visible: !pollVoterImage.hasRenderedAvatar
+                                            text: Model.initials(
+                                              root.pollVoterName(
+                                                pollVoterAvatar.voterJid),
+                                              pollVoterAvatar.voterJid)
+                                            color: root.foreground
+                                            font.family: root.fontFamily
+                                            font.pixelSize: Math.max(7,
+                                              root.messageMetaFontSize - 2)
+                                            font.bold: true
+                                          }
+
+                                          Rectangle {
+                                            id: pollVoterMask
+                                            anchors.fill: parent
+                                            radius: width / 2
+                                            visible: false
+                                            layer.enabled: true
+                                          }
+
+                                          Image {
+                                            id: pollVoterImage
+                                            objectName: "pollVoterImage-"
+                                              + String(messageDelegate.modelData.id || "")
+                                              + "-" + String(pollOption.index)
+                                              + "-" + String(index)
+                                            property bool hasRenderedAvatar: false
+                                            anchors.fill: parent
+                                            source: root.service
+                                              ? root.service.avatarUrl(
+                                                pollVoterAvatar.voterJid) : ""
+                                            asynchronous: true
+                                            cache: false
+                                            retainWhileLoading: true
+                                            fillMode: Image.PreserveAspectCrop
+                                            onSourceChanged: if (String(source) === "")
+                                              hasRenderedAvatar = false
+                                            onStatusChanged: {
+                                              if (status === Image.Ready)
+                                                hasRenderedAvatar = true
+                                              else if (status === Image.Error)
+                                                hasRenderedAvatar = false
+                                            }
+                                            layer.enabled: true
+                                            layer.smooth: true
+                                            layer.effect: MultiEffect {
+                                              maskEnabled: true
+                                              maskSource: pollVoterMask
+                                              maskThresholdMin: 0.5
+                                              maskSpreadAtMin: 1.0
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
                                   }
                                 }
                               }

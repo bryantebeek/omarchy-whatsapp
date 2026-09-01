@@ -909,8 +909,9 @@ impl Shared {
         lazy: &whatsapp_rust::types::events::LazyHistorySync,
         own_pn: Option<&str>,
         aliases: &HashMap<String, String>,
-    ) -> Result<Vec<PendingMedia>> {
+    ) -> Result<(Vec<PendingMedia>, HashSet<String>)> {
         let mut pending_media = Vec::new();
+        let mut changed_message_chats = HashSet::new();
         let mut pending_documents = 0;
         let mut stream = lazy.stream();
         while let Some(conversation) = stream.next_conversation()? {
@@ -1032,9 +1033,14 @@ impl Shared {
                 let inserted = self
                     .database
                     .insert_history_message(&message, &chat_name, is_group)?;
-                if !inserted && let Some(media) = &message.media {
-                    self.database
-                        .update_message_media(&message.chat_jid, &message.id, media)?;
+                if inserted {
+                    changed_message_chats.insert(message.chat_jid.clone());
+                } else if let Some(media) = &message.media
+                    && self
+                        .database
+                        .update_message_media(&message.chat_jid, &message.id, media)?
+                {
+                    changed_message_chats.insert(message.chat_jid.clone());
                 }
             }
             for wire in conversation
@@ -1103,7 +1109,7 @@ impl Shared {
                                 .unwrap_or(0)
                                 .saturating_mul(1_000)
                         });
-                    if let Err(error) = self.database.apply_poll_vote(
+                    match self.database.apply_poll_vote(
                         &chat_jid,
                         message_id,
                         &voter_jid,
@@ -1111,8 +1117,14 @@ impl Shared {
                         from_me,
                         timestamp,
                     ) {
-                        warn!(%error, %chat_jid, %message_id,
-                            "could not persist history poll vote");
+                        Ok(true) => {
+                            changed_message_chats.insert(chat_jid.clone());
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            warn!(%error, %chat_jid, %message_id,
+                                "could not persist history poll vote");
+                        }
                     }
                 }
             }
@@ -1130,7 +1142,7 @@ impl Shared {
                     .update_contact_name(&normalize_jid(&jid), &name)?;
             }
         }
-        Ok(pending_media)
+        Ok((pending_media, changed_message_chats))
     }
 }
 
@@ -1315,6 +1327,7 @@ fn poll_media(message: &wa::Message) -> Option<MessageMedia> {
             name,
             votes: 0,
             selected_by_me: false,
+            voter_jids: Vec::new(),
         })
         .collect();
     if options.len() < 2 {
@@ -1331,16 +1344,22 @@ fn poll_media(message: &wa::Message) -> Option<MessageMedia> {
     if end_timestamp > 10_000_000_000 {
         end_timestamp = end_timestamp.div_euclid(1_000);
     }
+    let maximum_selectable = u32::try_from(options.len()).unwrap_or(u32::MAX);
+    // WhatsApp clients encode multiple-answer polls either with the explicit
+    // limit or with zero, including v3 messages produced outside WA Web.
+    // A missing count remains the backwards-compatible single-answer default.
+    let selectable_count = match poll.selectable_options_count {
+        Some(0) => maximum_selectable,
+        None => 1,
+        Some(count) => count.clamp(1, maximum_selectable),
+    };
     Some(MessageMedia::Poll {
         question: poll
             .name
             .as_deref()
             .and_then(nonempty)
             .unwrap_or_else(|| "Poll".to_owned()),
-        selectable_count: poll
-            .selectable_options_count
-            .unwrap_or(1)
-            .clamp(1, u32::try_from(options.len()).unwrap_or(u32::MAX)),
+        selectable_count,
         options,
         total_voters: 0,
         quiz: poll.poll_type == Some(wa::message::PollType::QUIZ),
@@ -2222,8 +2241,11 @@ async fn process_history_event(
         return;
     }
     match result {
-        Ok(Ok(pending_media)) => {
+        Ok(Ok((pending_media, changed_message_chats))) => {
             broadcast_chats(&shared);
+            for chat_jid in changed_message_chats {
+                broadcast_messages(&shared, &chat_jid);
+            }
             shared.publish(ServerEvent::Unread {
                 total: shared.unread_total_or_zero(),
             });
@@ -4748,7 +4770,7 @@ async fn request_exact_message(
     client.send_pdo_placeholder_resend_request(&info).await
 }
 
-async fn finish_media_recovery_attempt(shared: &Shared, chat_jid: &str, succeeded: bool) -> bool {
+async fn finish_recovery_attempt(shared: &Shared, recovery_key: &str, succeeded: bool) -> bool {
     // The set is a successful-attempt marker as well as an in-flight guard.
     // Only a total transient failure should re-arm the next UI refresh.
     if succeeded {
@@ -4758,7 +4780,47 @@ async fn finish_media_recovery_attempt(shared: &Shared, chat_jid: &str, succeede
         .media_recovery_requested
         .write()
         .await
-        .remove(chat_jid)
+        .remove(recovery_key)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn schedule_message_recovery(
+    shared: &Arc<Shared>,
+    client: Arc<Client>,
+    cursor: database::HistoryCursor,
+    recovery_key: String,
+    label: &'static str,
+) {
+    let recovery_shared = Arc::clone(shared);
+    let generation = shared.clock.generation();
+    tokio::spawn(async move {
+        let chat = cursor.chat_jid.parse::<Jid>();
+        let exact_result = request_exact_message(&client, &cursor).await;
+        let history_result = match chat {
+            Ok(chat) => {
+                client
+                    .fetch_message_history(
+                        &chat,
+                        &cursor.message_id,
+                        cursor.from_me,
+                        cursor.timestamp_ms,
+                        50,
+                    )
+                    .await
+            }
+            Err(error) => Err(error.into()),
+        };
+        if let (Err(exact_error), Err(history_error)) = (&exact_result, &history_result) {
+            warn!(%exact_error, %history_error, message_id = %cursor.message_id,
+                recovery = label, "could not request message recovery");
+        }
+        let succeeded = exact_result.is_ok() || history_result.is_ok();
+        if !recovery_shared.clock.is_current(generation) {
+            finish_recovery_attempt(&recovery_shared, &recovery_key, false).await;
+            return;
+        }
+        finish_recovery_attempt(&recovery_shared, &recovery_key, succeeded).await;
+    });
 }
 
 // IPC command-to-SDK dispatch is the outbound transport adapter. Command
@@ -4816,54 +4878,32 @@ async fn handle_command(
                             .write()
                             .await
                             .insert(chat_jid.clone())
-                        && let Ok(jid) = chat_jid.parse::<Jid>()
                     {
-                        let recovery_chat_jid = chat_jid.clone();
-                        let recovery_shared = Arc::clone(shared);
-                        let generation = shared.clock.generation();
-                        tokio::spawn(async move {
-                            let exact_result = request_exact_message(&client, &cursor).await;
-                            if let Err(error) = &exact_result {
-                                warn!(%error, %jid, message_id = %cursor.message_id,
-                                    "could not request exact media recovery");
-                            }
-                            if !recovery_shared.clock.is_current(generation) {
-                                finish_media_recovery_attempt(
-                                    &recovery_shared,
-                                    &recovery_chat_jid,
-                                    false,
-                                )
-                                .await;
-                                return;
-                            }
-                            let history_result = client
-                                .fetch_message_history(
-                                    &jid,
-                                    &cursor.message_id,
-                                    cursor.from_me,
-                                    cursor.timestamp_ms,
-                                    50,
-                                )
-                                .await;
-                            if let Err(error) = &history_result {
-                                warn!(%error, %jid, "could not request media history recovery");
-                            }
-                            if !recovery_shared.clock.is_current(generation) {
-                                finish_media_recovery_attempt(
-                                    &recovery_shared,
-                                    &recovery_chat_jid,
-                                    false,
-                                )
-                                .await;
-                                return;
-                            }
-                            finish_media_recovery_attempt(
-                                &recovery_shared,
-                                &recovery_chat_jid,
-                                exact_result.is_ok() || history_result.is_ok(),
-                            )
-                            .await;
-                        });
+                        schedule_message_recovery(
+                            shared,
+                            client,
+                            cursor,
+                            chat_jid.clone(),
+                            "media",
+                        );
+                    }
+                    let poll_recovery_key = format!("poll:{chat_jid}");
+                    if let Some(cursor) =
+                        shared.database.poll_metadata_recovery_cursor(&chat_jid)?
+                        && let Some(client) = shared.client.read().await.clone()
+                        && shared
+                            .media_recovery_requested
+                            .write()
+                            .await
+                            .insert(poll_recovery_key.clone())
+                    {
+                        schedule_message_recovery(
+                            shared,
+                            client,
+                            cursor,
+                            poll_recovery_key,
+                            "poll metadata",
+                        );
                     }
                     shared.database.messages(&chat_jid, limit)?
                 },
@@ -5170,6 +5210,7 @@ async fn handle_command(
                             name,
                             votes: 0,
                             selected_by_me: false,
+                            voter_jids: Vec::new(),
                         })
                         .collect(),
                     selectable_count: if correct_option_index.is_some() {
@@ -6332,7 +6373,7 @@ mod tests {
             .write()
             .await
             .insert("chat@s.whatsapp.net".into());
-        assert!(finish_media_recovery_attempt(&shared, "chat@s.whatsapp.net", false).await);
+        assert!(finish_recovery_attempt(&shared, "chat@s.whatsapp.net", false).await);
         assert!(shared.media_recovery_requested.read().await.is_empty());
 
         shared
@@ -6340,7 +6381,7 @@ mod tests {
             .write()
             .await
             .insert("chat@s.whatsapp.net".into());
-        assert!(!finish_media_recovery_attempt(&shared, "chat@s.whatsapp.net", true).await);
+        assert!(!finish_recovery_attempt(&shared, "chat@s.whatsapp.net", true).await);
         assert!(
             shared
                 .media_recovery_requested
@@ -6992,6 +7033,55 @@ mod tests {
             ),
             Some(MessageMedia::Poll { .. })
         ));
+    }
+
+    #[test]
+    fn poll_selectable_count_respects_multiple_answer_envelopes() {
+        let poll = wa::message::PollCreationMessage {
+            name: Some("Choose".into()),
+            options: ["One", "Two", "Three"]
+                .into_iter()
+                .map(|name| wa::message::poll_creation_message::Option {
+                    option_name: Some(name.into()),
+                    ..Default::default()
+                })
+                .collect(),
+            selectable_options_count: Some(0),
+            ..Default::default()
+        };
+        let multiple = wa::Message {
+            poll_creation_message: MessageField::some(poll.clone()),
+            ..Default::default()
+        };
+        let multiple_v3 = wa::Message {
+            poll_creation_message_v3: MessageField::some(poll.clone()),
+            ..Default::default()
+        };
+        let default_single = wa::Message {
+            poll_creation_message_v3: MessageField::some(wa::message::PollCreationMessage {
+                selectable_options_count: None,
+                ..poll.clone()
+            }),
+            ..Default::default()
+        };
+        let capped = wa::Message {
+            poll_creation_message: MessageField::some(wa::message::PollCreationMessage {
+                selectable_options_count: Some(99),
+                ..poll
+            }),
+            ..Default::default()
+        };
+
+        let selectable = |message: &wa::Message| match poll_media(message) {
+            Some(MessageMedia::Poll {
+                selectable_count, ..
+            }) => selectable_count,
+            _ => panic!("expected poll media"),
+        };
+        assert_eq!(selectable(&multiple), 3);
+        assert_eq!(selectable(&multiple_v3), 3);
+        assert_eq!(selectable(&default_single), 1);
+        assert_eq!(selectable(&capped), 3);
     }
 
     #[test]

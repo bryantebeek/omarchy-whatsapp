@@ -356,18 +356,29 @@ TestCase {
   }
 
   function test_urls_and_external_actions() {
+    compare(service.avatarJid("me"), "")
     compare(service.avatarUrl("me"), "")
     compare(service.avatarUrl("missing"), "")
-    service.avatarAvailable = { "a@s.whatsapp.net": true }
-    service.avatarRevisions = { "a@s.whatsapp.net": 3 }
+    service.ownAvatarJid = "self@s.whatsapp.net"
+    compare(service.avatarJid("me"), "self@s.whatsapp.net")
+    service.avatarAvailable = {
+      "a@s.whatsapp.net": true,
+      "self@s.whatsapp.net": true
+    }
+    service.avatarRevisions = {
+      "a@s.whatsapp.net": 3,
+      "self@s.whatsapp.net": 4
+    }
     verify(service.avatarUrl("a@s.whatsapp.net").endsWith("6140732e77686174736170702e6e6574.img?v=3"))
+    verify(service.avatarUrl("me").endsWith("73656c6640732e77686174736170702e6e6574.img?v=4"))
     compare(service.fileUrl("", 2), "")
     compare(service.fileUrl("/tmp/file", 2), "file:///tmp/file?v=2")
     service.mediaRevision = 9
     compare(service.fileUrl("/tmp/file"), "file:///tmp/file?v=9")
 
     service.requestAvatar("me")
-    compare(TestIo.socketWrites.length, 0)
+    compare(lastFrame().jid, "self@s.whatsapp.net")
+    TestIo.socketWrites = []
     service.requestAvatar("contact")
     compare(lastFrame().command, "request_avatar")
 
@@ -867,6 +878,27 @@ TestCase {
     requestId = Number(Object.keys(service.groupParticipantRequestJids)[0])
     service.handleLine(JSON.stringify({ id: requestId, event: "error", message: "failed" }))
     compare(service.groupParticipantsError, "failed")
+
+    compare(service.rememberOwnAvatarJid(null), false)
+    compare(service.rememberOwnAvatarJid([
+      { jid: "other@s.whatsapp.net", is_me: false }
+    ]), false)
+    requestId = service.requestGroupParticipants("group@g.us")
+    requestId = Number(Object.keys(service.groupParticipantRequestJids)[0])
+    service.handleLine(JSON.stringify({
+      id: requestId,
+      event: "group_participants",
+      chat_jid: "group@g.us",
+      participants: [
+        { jid: "self@s.whatsapp.net", name: "", is_me: true },
+        { jid: "other@s.whatsapp.net", name: "Other", is_me: false }
+      ]
+    }))
+    compare(service.ownAvatarJid, "self@s.whatsapp.net")
+    compare(service.groupParticipants.length, 2)
+    compare(lastFrame().command, "request_avatar")
+    compare(lastFrame().jid, "self@s.whatsapp.net")
+    compare(service.rememberOwnAvatarJid(service.groupParticipants), false)
 
     service.messages = [{ id: "m1", chat_jid: "group@g.us", media: { kind: "image" } }]
     service.mediaDownloadRequests = ({ "group@g.us\nm1": true })

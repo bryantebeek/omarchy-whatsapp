@@ -35,11 +35,13 @@ QtObject {
   property var textOutboxEntries: []
   property var pollVotes: []
   property var createdPolls: []
+  property bool pollVotePendingValue: false
   property string selectedChatJid: ""
   property var groupParticipants: []
   property string groupParticipantsChatJid: ""
   property string groupParticipantsError: ""
   property var mediaDownloadRequests: ({})
+  property var avatarUrls: ({})
   property var calls: []
   property var sentMessages: []
   property var sentVoiceMessages: []
@@ -251,7 +253,7 @@ QtObject {
     return true
   }
 
-  function pollVotePending() { return false }
+  function pollVotePending() { return pollVotePendingValue }
 
   function votePoll(message, selectedOptions) {
     pollVotes = pollVotes.concat([{
@@ -297,8 +299,8 @@ QtObject {
   function fileUrl(path, revision) {
     return path ? "file://" + String(path) + "?v=" + String(revision || 0) : ""
   }
-  function avatarUrl() { return "" }
-  function requestAvatar() {}
+  function avatarUrl(jid) { return String(avatarUrls[String(jid || "")] || "") }
+  function requestAvatar(jid) { record("requestAvatar", String(jid || "")) }
   function refreshSelectedGroupParticipants() { return false }
   function reactToMessage() { return true }
   function openMap() {}

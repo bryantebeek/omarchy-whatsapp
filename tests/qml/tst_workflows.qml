@@ -663,11 +663,13 @@ TestCase {
         kind: "poll",
         question: "Lunch?",
         selectable_count: 1,
-        total_voters: 1,
+        total_voters: 3,
         end_timestamp: 0,
         options: [
-          { name: "Soup", votes: 1, selected_by_me: false },
-          { name: "Salad", votes: 0, selected_by_me: false }
+          { name: "Soup", votes: 2, selected_by_me: false,
+            voter_jids: ["alice@s.whatsapp.net", "bob@s.whatsapp.net"] },
+          { name: "Salad", votes: 1, selected_by_me: false,
+            voter_jids: ["carol@s.whatsapp.net"] }
         ]
       }
     }], "")
@@ -676,9 +678,77 @@ TestCase {
     compare(pollDelegate.mediaData.kind, "poll")
     compare(pollDelegate.isPoll, true)
     verify(control("pollCard-poll-1") !== null)
-    pollDelegate.togglePollOption(0)
+    var pollOptionButton = control("pollOptionButton-poll-1-0")
+    var progressTrack = control("pollProgressTrack-poll-1-0")
+    var progressFill = control("pollProgressFill-poll-1-0")
+    var voterStack = control("pollVoterStack-poll-1-0")
+    compare(control("pollOption-0").voterJids.length, 2)
+    verify(voterStack.width > 0)
+    tryVerify(function() {
+      return findChild(panel, "pollVoterAvatar-poll-1-0-0") !== null
+        && findChild(panel, "pollVoterAvatar-poll-1-0-1") !== null
+    })
+    var firstVoter = control("pollVoterAvatar-poll-1-0-0")
+    var secondVoter = control("pollVoterAvatar-poll-1-0-1")
+    compare(pollOptionButton.radius, control("messageBubble-poll-1").radius)
+    verify(Border.color(pollOptionButton.borderSpec).a > 0)
+    verify(Border.color(pollOptionButton.borderSpec).a <= 0.11)
+    verify(progressTrack.height >= 8)
+    compare(progressTrack.x, 0)
+    compare(progressTrack.width, pollOptionButton.width)
+    compare(progressTrack.y + progressTrack.height, pollOptionButton.height)
+    verify(progressFill.width > progressTrack.width * 0.65)
+    verify(progressFill.width < progressTrack.width * 0.68)
+    compare(control("pollOptionCount-poll-1-0").text, "2")
+    compare(firstVoter.voterJid, "alice@s.whatsapp.net")
+    compare(secondVoter.voterJid, "bob@s.whatsapp.net")
+    verify(secondVoter.x > firstVoter.x)
+    verify(secondVoter.x < firstVoter.x + firstVoter.width)
+    verify(voterStack.width > firstVoter.width)
+    verify(service.calls.filter(function(call) {
+      return call.name === "requestAvatar"
+    }).length >= 3)
+    compare(pollOptionButton.enabled, true)
+    pollOptionButton.click()
     compare(service.pollVotes.length, 1)
     compare(service.pollVotes[0].selectedOptions[0], "Soup")
+
+    service.pollVotePendingValue = true
+    compare(pollOptionButton.enabled, false)
+    service.pollVotePendingValue = false
+    compare(pollOptionButton.enabled, true)
+
+    var multiplePoll = Object.assign({}, service.messages[0])
+    multiplePoll.id = "poll-multiple"
+    service.avatarUrls = {
+      "me": String(Qt.resolvedUrl("fixtures/pixel.svg"))
+    }
+    multiplePoll.media = Object.assign({}, multiplePoll.media, {
+      selectable_count: 2,
+      options: [
+        { name: "Soup", votes: 1, selected_by_me: true,
+          voter_jids: ["me"] },
+        { name: "Salad", votes: 0, selected_by_me: false,
+          voter_jids: [] },
+        { name: "Bread", votes: 0, selected_by_me: false,
+          voter_jids: [] }
+      ]
+    })
+    service.loadMessages([multiplePoll], "")
+    tryCompare(control("messageList"), "count", 1)
+    verify(String(control("pollVoterImage-poll-multiple-0-0").source)
+      .indexOf("/fixtures/pixel.svg") >= 0)
+    control("pollOptionButton-poll-multiple-1").click()
+    compare(service.pollVotes.length, 2)
+    compare(service.pollVotes[1].selectedOptions.length, 2)
+    compare(service.pollVotes[1].selectedOptions[0], "Soup")
+    compare(service.pollVotes[1].selectedOptions[1], "Salad")
+
+    multiplePoll.media = Object.assign({}, multiplePoll.media, {
+      end_timestamp: 1
+    })
+    service.loadMessages([multiplePoll], "")
+    compare(control("pollOptionButton-poll-multiple-0").enabled, false)
   }
 
   function test_open_media_and_recover_connection() {

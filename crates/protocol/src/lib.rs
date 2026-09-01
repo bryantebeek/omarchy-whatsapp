@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 27;
+pub const PROTOCOL_VERSION: u16 = 28;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -126,6 +126,8 @@ pub struct PollOption {
     pub votes: u32,
     #[serde(default)]
     pub selected_by_me: bool,
+    #[serde(default)]
+    pub voter_jids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -736,6 +738,7 @@ mod tests {
                 name: "Soup".into(),
                 votes: 2,
                 selected_by_me: true,
+                voter_jids: vec!["me".into(), "2@s.whatsapp.net".into()],
             }],
             selectable_count: 1,
             total_voters: 2,
@@ -745,7 +748,16 @@ mod tests {
         };
         let json = serde_json::to_string(&media).unwrap();
         assert_eq!(serde_json::from_str::<MessageMedia>(&json).unwrap(), media);
+        assert!(json.contains("\"voter_jids\":[\"me\",\"2@s.whatsapp.net\"]"));
         assert!(!json.contains("message_secret"));
+        let legacy = serde_json::from_str::<MessageMedia>(
+            r#"{"kind":"poll","question":"Old","options":[{"name":"One","votes":1,"selected_by_me":false}],"selectable_count":1}"#,
+        )
+        .unwrap();
+        let MessageMedia::Poll { options, .. } = legacy else {
+            unreachable!()
+        };
+        assert!(options[0].voter_jids.is_empty());
     }
 
     #[test]
