@@ -72,10 +72,15 @@ all encountered WhatsApp LIDs are resolved to the same phone-number identity
 used by live events. Alias reconciliation transactionally collapses any legacy
 rows stored under both forms, preserving their strongest message and chat
 state. Retention is capped per chat and never deletes protocol state.
-Schema upgrades inspect existing columns before applying migrations, so an
-already-applied migration is idempotent while storage, permission, and corruption
-errors remain fatal and visible. A panicked database worker rolls back its active
-transaction and later callers recover the mutex instead of cascading the panic.
+The schema is versioned with `PRAGMA user_version`: each one-time upgrade step
+runs at most once and records its version in the same transaction, while the
+table bootstrap and text-outbox crash recovery run on every open. Databases from
+before versioning start at version 0 and receive the whole ladder exactly once;
+the ladder still inspects existing columns, so a partially upgraded legacy file
+is safe. Storage, permission, and corruption errors remain fatal and visible. A
+panicked database worker rolls back its active transaction and later callers
+recover the mutex instead of cascading the panic. History sync commits one
+transaction per conversation rather than one per message.
 
 The active chat is ephemeral daemon state. The focused, visible Quickshell panel
 sets it and clears it when hidden or unfocused. Live incoming messages in that
@@ -114,6 +119,19 @@ appearance-agnostic.
   its own parallelism limit, so slow network work cannot starve cheap commands.
   Outcomes arrive as `media_downloaded`, `media_download_failed`, and `avatars`
   broadcasts, which every connected client observes.
+- Snapshot invalidations (`chats`, `messages` per chat, `unread`) are coalesced
+  per key: the first event publishes immediately and a burst inside the
+  following 50 ms window collapses into one trailing publish evaluated at flush
+  time. Avatar changes fold into one `avatars` event per 100 ms window carrying
+  every changed jid. Live `message`, `sent`, `text_delivery`, `state`, and
+  outbox broadcasts stay immediate.
+- The durable outbox loops hold their gates only across the database claim of
+  the next item; the network send runs ungated, so enqueueing or listing outbox
+  state never waits behind an in-flight delivery.
+- A delayed response that arrives after a newer broadcast for the same resource
+  still releases its request bookkeeping in the shell and, for the visible
+  conversation, triggers a fresh snapshot request rather than stalling until the
+  watchdog fires.
 
 The shared Rust types in `crates/protocol` are the canonical wire contract.
 
@@ -213,7 +231,11 @@ temporary file and atomically renamed after verification. Images are limited to
 25 MiB each and the media directory to 256 MiB; avatar responses are limited to
 1 MiB each and 64 MiB total. The shell automatically requests undownloaded WebP
 stickers as an active conversation loads. Location thumbnails use the same
-private cache.
+private cache. Cached documents keep the sender's file extension only when it is
+a short alphanumeric one that desktop openers display rather than launch;
+`.desktop`, `.AppImage`, shell scripts, and similar executable types are cached
+without an extension so `xdg-open` must sniff their content. Cache pruning only
+runs after a file was actually written, never on a read-only modelling pass.
 Every cache/outbox replacement uses a uniquely created owner-only temporary file,
 syncs its contents before atomic rename, and syncs the parent directory. Startup
 removes abandoned transfer files before cache accounting, so crashes cannot leak

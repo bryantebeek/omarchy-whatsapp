@@ -66,9 +66,13 @@ For changes under `quickshell/`:
 1. Run `/usr/lib/qt6/bin/qmlformat -n quickshell/*.qml`,
    `./scripts/qml-lint.sh`, and `omarchy plugin validate .`.
 2. Copy the changed QML and JavaScript files into the installed plugin's
-   `quickshell/` directory, preserving file modes. If `manifest.json` changed,
-   copy it to the installed plugin root. The repository's `install.sh` shows
-   the canonical file mapping.
+   `quickshell/` directory, preserving file modes. The panel is composed of
+   several component files (`Avatar.qml`, the `*Card.qml` components,
+   `DevicePixel*.qml`, `DevicePixel.js`, and so on), so copy every changed
+   `quickshell/*.qml`, `*.js`, `*.json`, and `icons/*` file, not just
+   `Panel.qml`. If `manifest.json` changed, copy it to the installed plugin
+   root. The repository's `install.sh` derives the runtime file set from the
+   `quickshell/` directory contents and is the canonical mapping.
 3. Validate the installed plugin directory.
 4. Run `./scripts/reload-quickshell.sh`. Do not replace it with a raw
    `rescanPlugins` followed by `omarchy restart shell`: plugin reload is

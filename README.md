@@ -317,7 +317,8 @@ only the explicit `--purge-data` option removes it.
 - Linked-device cryptographic state lives in
   `~/.local/state/omarchy-whatsapp/session.db`.
 - The UI index lives separately in `history.db` and retains at most 1,000
-  messages per chat. Poll creation secrets and each participant's latest vote
+  messages per chat; the panel opens the latest 300 and pages back to that
+  limit on request. Poll creation secrets and each participant's latest vote
   stay in this private database and are not exposed through shell IPC. Incoming
   work, outgoing text, and read intents are committed locally before their
   asynchronous processing completes, so reconnects or daemon restarts can
