@@ -1256,36 +1256,26 @@ impl Shared {
                 .last()
                 .map(|message| message.sender_name.clone())
                 .unwrap_or_default();
-            self.database
-                .insert_history_chat(&omarchy_whatsapp_protocol::Chat {
-                    jid: chat_jid.clone(),
-                    name: chat_name.clone(),
-                    phone_number: None,
-                    last_message: preview,
-                    last_sender_name,
-                    last_timestamp,
-                    unread: conversation.unread_count.unwrap_or(0),
-                    pinned: false,
-                    muted: false,
-                    is_group,
-                })?;
-            for message in messages {
-                if !message.from_me && message.sender_name != message.sender_jid {
-                    self.database
-                        .update_contact_name(&message.sender_jid, &message.sender_name)?;
-                }
-                let inserted = self
-                    .database
-                    .insert_history_message(&message, &chat_name, is_group)?;
-                if inserted {
-                    changed_message_chats.insert(message.chat_jid.clone());
-                } else if let Some(media) = &message.media
-                    && self
-                        .database
-                        .update_message_media(&message.chat_jid, &message.id, media)?
-                {
-                    changed_message_chats.insert(message.chat_jid.clone());
-                }
+            let chat = omarchy_whatsapp_protocol::Chat {
+                jid: chat_jid.clone(),
+                name: chat_name.clone(),
+                phone_number: None,
+                last_message: preview,
+                last_sender_name,
+                last_timestamp,
+                unread: conversation.unread_count.unwrap_or(0),
+                pinned: false,
+                muted: false,
+                is_group,
+            };
+            // One durable commit per conversation instead of one per message:
+            // a replayed sync otherwise costs an fsync for every message it
+            // stores.
+            if self
+                .database
+                .insert_history_conversation(&chat, &messages)?
+            {
+                changed_message_chats.insert(chat_jid.clone());
             }
             for wire in conversation
                 .messages
@@ -1643,11 +1633,14 @@ fn cache_location_thumbnail(
     let bytes = bytes.filter(|bytes| bytes.starts_with(&[0xff, 0xd8, 0xff]))?;
     let path = assets::location_thumbnail_path(directory, chat_jid, message_id);
     let unchanged = std::fs::read(&path).is_ok_and(|existing| existing == **bytes);
-    if !unchanged && let Err(error) = assets::write_private_bytes(&path, bytes) {
-        warn!(%error, "could not cache WhatsApp location thumbnail");
-        return None;
+    if !unchanged {
+        if let Err(error) = assets::write_private_bytes(&path, bytes) {
+            warn!(%error, "could not cache WhatsApp location thumbnail");
+            return None;
+        }
+        // Only a real write may pay for a full cache scan.
+        assets::prune_media_cache(directory, &path);
     }
-    assets::prune_media_cache(directory, &path);
     Some(path.to_string_lossy().into_owned())
 }
 
@@ -1675,14 +1668,6 @@ fn message_media(
             warn!(%error, "could not cache WhatsApp image thumbnail");
             assets::message_image_thumbnail_path(directory, chat_jid, message_id)
         });
-        assets::prune_media_cache(
-            directory,
-            if path.exists() {
-                &path
-            } else {
-                &thumbnail_path
-            },
-        );
         return Some(MessageMedia::Image {
             path: path.to_string_lossy().into_owned(),
             thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
@@ -1707,14 +1692,6 @@ fn message_media(
             warn!(%error, "could not cache WhatsApp sticker thumbnail");
             assets::message_sticker_thumbnail_path(directory, chat_jid, message_id)
         });
-        assets::prune_media_cache(
-            directory,
-            if path.exists() {
-                &path
-            } else {
-                &thumbnail_path
-            },
-        );
         return Some(MessageMedia::Sticker {
             path: path.to_string_lossy().into_owned(),
             thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
@@ -1748,14 +1725,6 @@ fn message_media(
             warn!(%error, "could not cache WhatsApp video thumbnail");
             assets::message_video_thumbnail_path(directory, chat_jid, message_id)
         });
-        assets::prune_media_cache(
-            directory,
-            if path.exists() {
-                &path
-            } else {
-                &thumbnail_path
-            },
-        );
         return Some(MessageMedia::Video {
             path: path.to_string_lossy().into_owned(),
             thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
@@ -1773,7 +1742,6 @@ fn message_media(
     if let Some(audio) = message.audio_message.as_option() {
         let path =
             assets::message_audio_path(directory, chat_jid, message_id, audio.mimetype.as_deref());
-        assets::prune_media_cache(directory, &path);
         return Some(MessageMedia::Audio {
             path: path.to_string_lossy().into_owned(),
             downloaded: path.exists(),
@@ -2183,11 +2151,17 @@ fn broadcast_text_outbox(shared: &Shared) {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn deliver_pending_text(shared: &Arc<Shared>, client: &Arc<Client>) -> Result<bool> {
-    let _outbox_guard = shared.text_outbox_gate.lock().await;
-    let Some(pending) = shared.database.claim_text_message()? else {
-        return Ok(false);
+    // The claim is the atomic transition, so the gate only has to cover it and
+    // the resulting snapshot. Holding it across the send would make every
+    // enqueue wait for the network and time the shell's request out.
+    let pending = {
+        let _outbox_guard = shared.text_outbox_gate.lock().await;
+        let Some(pending) = shared.database.claim_text_message()? else {
+            return Ok(false);
+        };
+        broadcast_text_outbox(shared);
+        pending
     };
-    broadcast_text_outbox(shared);
     let delivery_id = pending.delivery_id.clone();
     match send_claimed_text(shared, client, pending).await {
         Ok(message) => {
@@ -2290,9 +2264,16 @@ async fn run_text_outbox(shared: Arc<Shared>) {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn deliver_pending_read(shared: &Arc<Shared>, client: &Arc<Client>) -> Result<bool> {
-    let _outbox_guard = shared.read_outbox_gate.lock().await;
-    let Some(batch) = shared.database.next_read_batch()? else {
-        return Ok(false);
+    // `MarkRead` runs on every chat selection and focus change, so the gate is
+    // only held while the batch is selected. `finish_read_batch` deletes just
+    // the receipts in this batch, leaving anything queued during the send for
+    // the next iteration.
+    let batch = {
+        let _outbox_guard = shared.read_outbox_gate.lock().await;
+        let Some(batch) = shared.database.next_read_batch()? else {
+            return Ok(false);
+        };
+        batch
     };
     let chat: Jid = batch
         .chat_jid
@@ -4856,28 +4837,23 @@ async fn perform_media_download(
 }
 
 // Runs a queued avatar request; successes surface through the `avatars`
-// broadcast that `refresh_avatar` publishes.
+// broadcast that `refresh_avatar` publishes. The caller resolves the canonical
+// identity so the in-flight set already deduplicates a contact's LID and
+// phone-number forms.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn fetch_requested_avatar(shared: &Arc<Shared>, client: Arc<Client>, requested: &Jid) {
+async fn fetch_requested_avatar(shared: &Arc<Shared>, client: Arc<Client>, canonical: Jid) {
     let Ok(_permit) = shared.avatar_fetch_permits.acquire().await else {
         return;
     };
-    let canonical = canonical_contact_jid(shared, &client, requested).await;
-    let parsed: Jid = match canonical.parse() {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            warn!(%error, %canonical, "invalid canonical avatar JID");
-            return;
-        }
-    };
+    let canonical_jid = canonical.to_non_ad_string();
     if tokio::time::timeout(
         jobs::AVATAR_FETCH_TIMEOUT,
-        refresh_avatar(Arc::clone(shared), client, parsed, false),
+        refresh_avatar(Arc::clone(shared), client, canonical, false),
     )
     .await
     .is_err()
     {
-        warn!(%canonical, "WhatsApp avatar fetch timed out");
+        warn!(%canonical_jid, "WhatsApp avatar fetch timed out");
     }
 }
 
@@ -4966,6 +4942,298 @@ fn schedule_message_recovery(
         }
         finish_recovery_attempt(&recovery_shared, &recovery_key, succeeded).await;
     });
+}
+
+const MAX_POLL_QUESTION_CHARS: usize = 255;
+const MAX_POLL_OPTION_CHARS: usize = 100;
+const MAX_POLL_OPTIONS: usize = 12;
+
+/// A poll request that satisfied every daemon-side rule, so the outbound call
+/// and the locally stored card cannot disagree about what was asked.
+struct ValidatedPoll {
+    question: String,
+    options: Vec<String>,
+    selectable_count: u32,
+    correct_option_index: Option<u32>,
+}
+
+/// Applies the poll limits before any network call. The option cap otherwise
+/// lives only in the shell, and `omarchy-whatsappctl` bypasses it. An
+/// out-of-range selectable count is rejected rather than clamped, so a mistyped
+/// flag cannot silently create a different poll; a quiz always keeps exactly
+/// one selectable answer.
+fn validate_poll_request(
+    question: &str,
+    options: Vec<String>,
+    selectable_count: u32,
+    correct_option_index: Option<u32>,
+) -> Result<ValidatedPoll> {
+    let question = question.trim().to_owned();
+    if question.is_empty() {
+        bail!("poll question cannot be empty");
+    }
+    if question.chars().count() > MAX_POLL_QUESTION_CHARS {
+        bail!("poll question is longer than {MAX_POLL_QUESTION_CHARS} characters");
+    }
+    let mut trimmed: Vec<String> = Vec::with_capacity(options.len());
+    for option in options {
+        let option = option.trim().to_owned();
+        if option.is_empty() {
+            bail!("poll options cannot be empty");
+        }
+        if option.chars().count() > MAX_POLL_OPTION_CHARS {
+            bail!("a poll option is longer than {MAX_POLL_OPTION_CHARS} characters");
+        }
+        if trimmed.contains(&option) {
+            bail!("poll options must be distinct");
+        }
+        trimmed.push(option);
+    }
+    if !(2..=MAX_POLL_OPTIONS).contains(&trimmed.len()) {
+        bail!("a poll needs between 2 and {MAX_POLL_OPTIONS} options");
+    }
+    let selectable_count = if let Some(index) = correct_option_index {
+        if usize::try_from(index).unwrap_or(usize::MAX) >= trimmed.len() {
+            bail!("the correct quiz option is outside the poll");
+        }
+        1
+    } else {
+        let requested = usize::try_from(selectable_count).unwrap_or(usize::MAX);
+        if !(1..=trimmed.len()).contains(&requested) {
+            bail!(
+                "a poll must allow between 1 and {} selected options",
+                trimmed.len()
+            );
+        }
+        selectable_count
+    };
+    Ok(ValidatedPoll {
+        question,
+        options: trimmed,
+        selectable_count,
+        correct_option_index,
+    })
+}
+
+// Upload-and-send adapter for one recording. The durable job transitions, the
+// outbox bounds, and the resulting snapshots are measured in `voice_outbox`.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn send_voice_message(
+    shared: &Arc<Shared>,
+    chat_jid: String,
+    recording_id: String,
+) -> Result<ServerEvent> {
+    let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
+    let outbox_dir = shared.voice_outbox_dir.clone();
+    let prepare_recording_id = recording_id.clone();
+    let prepare_chat_jid = requested.to_non_ad_string();
+    // Preparation runs the outbox cleanup and writes the job, so it is the only
+    // step that can touch other recordings and the only one that needs the
+    // global gate. The `voice:<recording_id>` conflict key already serializes
+    // sending and discarding this recording across connections, and the upload
+    // below must not block a panel that is only listing the outbox.
+    let mut prepared = {
+        let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
+        tokio::task::spawn_blocking(move || {
+            voice_outbox::prepare(
+                &outbox_dir,
+                &prepare_recording_id,
+                &prepare_chat_jid,
+                Utc::now().timestamp(),
+            )
+        })
+        .await
+        .context("voice outbox preparation task failed")??
+    };
+    broadcast_voice_outbox(shared);
+    let result: Result<Message> = async {
+        let client = shared
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+        let requested: Jid = prepared
+            .job
+            .chat_jid
+            .parse()
+            .context("invalid persisted voice message chat JID")?;
+        let canonical = canonical_contact_jid(shared, &client, &requested).await;
+        let jid: Jid = canonical.parse().context("invalid canonical chat JID")?;
+        let delivery_id = prepared
+            .job
+            .message_id
+            .clone()
+            .unwrap_or_else(|| client.generate_message_id());
+        let canonical_jid = jid.to_non_ad_string();
+        let assigned_jid = canonical_jid.clone();
+        let assigned_delivery_id = delivery_id.clone();
+        prepared.job = persist_voice_job(shared, prepared.job.clone(), move |outbox, job| {
+            voice_outbox::assign_delivery(
+                outbox,
+                job,
+                &assigned_jid,
+                &assigned_delivery_id,
+                Utc::now().timestamp(),
+            )
+        })
+        .await?;
+        broadcast_voice_outbox(shared);
+        if let Some(message) = shared
+            .database
+            .message_by_id(&canonical_jid, &delivery_id)?
+        {
+            return Ok(message);
+        }
+        let upload = client
+            .upload(
+                std::mem::take(&mut prepared.bytes),
+                MediaType::Audio,
+                UploadOptions::new(),
+            )
+            .await
+            .context("uploading voice message")?;
+        let duration_seconds =
+            u32::try_from(prepared.job.duration_ms.div_ceil(1_000)).unwrap_or(u32::MAX);
+        let outbound = media::audio_message(
+            upload,
+            media::AudioOptions {
+                mimetype: Some("audio/ogg; codecs=opus".into()),
+                duration_seconds: Some(duration_seconds),
+                ptt: Some(true),
+                ..Default::default()
+            },
+        );
+        let sent = client
+            .send_message_with_options(
+                &jid,
+                outbound,
+                SendOptions::default().with_message_id(&delivery_id),
+            )
+            .await?;
+        if sent.message_id != delivery_id {
+            bail!("WhatsApp returned a different voice message ID");
+        }
+        let cached_path = assets::message_audio_path(
+            &shared.media_dir,
+            &canonical_jid,
+            &delivery_id,
+            Some("audio/ogg; codecs=opus"),
+        );
+        let recording_path = voice_outbox::recording_path(&shared.voice_outbox_dir, &recording_id)?;
+        let copy_source = recording_path.clone();
+        let copy_destination = cached_path.clone();
+        let downloaded = match tokio::task::spawn_blocking(move || {
+            assets::copy_private_file(&copy_source, &copy_destination)
+        })
+        .await
+        .context("voice cache copy task failed")?
+        {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(%error, "could not retain sent voice message in the private cache");
+                false
+            }
+        };
+        assets::prune_media_cache(
+            &shared.media_dir,
+            if downloaded {
+                &cached_path
+            } else {
+                &recording_path
+            },
+        );
+        let message = Message {
+            id: delivery_id,
+            chat_jid: canonical_jid,
+            sender_jid: "me".into(),
+            sender_name: "You".into(),
+            text: "[Voice message]".into(),
+            timestamp: Utc::now().timestamp(),
+            from_me: true,
+            receipt: 1,
+            delivered_at: None,
+            read_at: None,
+            delivered_to: Vec::new(),
+            read_by: Vec::new(),
+            media: Some(MessageMedia::Audio {
+                path: cached_path.to_string_lossy().into_owned(),
+                downloaded,
+                mime_type: "audio/ogg; codecs=opus".into(),
+                duration_seconds,
+                voice_message: true,
+            }),
+            reactions: Vec::new(),
+        };
+        let chat_name = shared
+            .database
+            .chat_name(&message.chat_jid)?
+            .or_else(|| {
+                shared
+                    .database
+                    .contact_name(&message.chat_jid)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_else(|| message.chat_jid.clone());
+        shared
+            .database
+            .insert_message(&message, &chat_name, jid.is_group(), false)?;
+        // The requesting connection already learns about the send from this
+        // command's `sent` response, so other clients only need a refresh.
+        broadcast_messages(shared, &message.chat_jid);
+        broadcast_chats(shared);
+        Ok(message)
+    }
+    .await;
+    match result {
+        Ok(message) => {
+            let job = prepared.job.clone();
+            match persist_voice_job(shared, job, |outbox, job| {
+                voice_outbox::finish_sent(outbox, job, Utc::now().timestamp())
+            })
+            .await
+            {
+                Ok(job) => prepared.job = job,
+                Err(error) => warn!(%error, "could not finalize a sent voice outbox entry"),
+            }
+            broadcast_voice_outbox(shared);
+            Ok(ServerEvent::Sent { message })
+        }
+        Err(error) => {
+            let job = prepared.job.clone();
+            let detail = error.to_string();
+            match persist_voice_job(shared, job, move |outbox, job| {
+                voice_outbox::mark_failed(outbox, job, &detail, Utc::now().timestamp())
+            })
+            .await
+            {
+                Ok(job) => prepared.job = job,
+                Err(persist_error) => {
+                    warn!(%persist_error, "could not retain a failed voice outbox entry");
+                }
+            }
+            broadcast_voice_outbox(shared);
+            Err(error)
+        }
+    }
+}
+
+// Voice outbox writes fsync a job file and rename it, so they run on the
+// blocking pool instead of stalling an async worker.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn persist_voice_job<F>(
+    shared: &Arc<Shared>,
+    mut job: voice_outbox::VoiceJob,
+    write: F,
+) -> Result<voice_outbox::VoiceJob>
+where
+    F: FnOnce(&Path, &mut voice_outbox::VoiceJob) -> Result<()> + Send + 'static,
+{
+    let outbox_dir = shared.voice_outbox_dir.clone();
+    tokio::task::spawn_blocking(move || write(&outbox_dir, &mut job).map(|()| job))
+        .await
+        .context("voice outbox write task failed")?
 }
 
 // IPC command-to-SDK dispatch is the outbound transport adapter. Command
@@ -5079,202 +5347,22 @@ async fn handle_command(
         Command::SendVoiceMessage {
             chat_jid,
             recording_id,
-        } => {
-            // IPC queues are per connection. Serialize the small voice outbox
-            // globally so the shell and CLI cannot prepare/send one recording
-            // concurrently with each other.
-            let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
-            let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
-            let outbox_dir = shared.voice_outbox_dir.clone();
-            let prepare_recording_id = recording_id.clone();
-            let prepare_chat_jid = requested.to_non_ad_string();
-            let mut prepared = tokio::task::spawn_blocking(move || {
-                voice_outbox::prepare(
-                    &outbox_dir,
-                    &prepare_recording_id,
-                    &prepare_chat_jid,
-                    Utc::now().timestamp(),
-                )
-            })
-            .await
-            .context("voice outbox preparation task failed")??;
-            broadcast_voice_outbox(shared);
-            let result: Result<Message> = async {
-                let client = shared
-                    .client
-                    .read()
-                    .await
-                    .clone()
-                    .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
-                let requested: Jid = prepared
-                    .job
-                    .chat_jid
-                    .parse()
-                    .context("invalid persisted voice message chat JID")?;
-                let canonical = canonical_contact_jid(shared, &client, &requested).await;
-                let jid: Jid = canonical.parse().context("invalid canonical chat JID")?;
-                let delivery_id = prepared
-                    .job
-                    .message_id
-                    .clone()
-                    .unwrap_or_else(|| client.generate_message_id());
-                voice_outbox::assign_delivery(
-                    &shared.voice_outbox_dir,
-                    &mut prepared.job,
-                    &jid.to_non_ad_string(),
-                    &delivery_id,
-                    Utc::now().timestamp(),
-                )?;
-                broadcast_voice_outbox(shared);
-                if let Some(message) = shared
-                    .database
-                    .message_by_id(&jid.to_non_ad_string(), &delivery_id)?
-                {
-                    return Ok(message);
-                }
-                let upload = client
-                    .upload(
-                        std::mem::take(&mut prepared.bytes),
-                        MediaType::Audio,
-                        UploadOptions::new(),
-                    )
-                    .await
-                    .context("uploading voice message")?;
-                let duration_seconds =
-                    u32::try_from(prepared.job.duration_ms.div_ceil(1_000)).unwrap_or(u32::MAX);
-                let outbound = media::audio_message(
-                    upload,
-                    media::AudioOptions {
-                        mimetype: Some("audio/ogg; codecs=opus".into()),
-                        duration_seconds: Some(duration_seconds),
-                        ptt: Some(true),
-                        ..Default::default()
-                    },
-                );
-                let sent = client
-                    .send_message_with_options(
-                        &jid,
-                        outbound,
-                        SendOptions::default().with_message_id(&delivery_id),
-                    )
-                    .await?;
-                if sent.message_id != delivery_id {
-                    bail!("WhatsApp returned a different voice message ID");
-                }
-                let cached_path = assets::message_audio_path(
-                    &shared.media_dir,
-                    &jid.to_non_ad_string(),
-                    &delivery_id,
-                    Some("audio/ogg; codecs=opus"),
-                );
-                let recording_path =
-                    voice_outbox::recording_path(&shared.voice_outbox_dir, &recording_id)?;
-                let copy_source = recording_path.clone();
-                let copy_destination = cached_path.clone();
-                let downloaded = match tokio::task::spawn_blocking(move || {
-                    assets::copy_private_file(&copy_source, &copy_destination)
-                })
-                .await
-                .context("voice cache copy task failed")?
-                {
-                    Ok(()) => true,
-                    Err(error) => {
-                        warn!(%error, "could not retain sent voice message in the private cache");
-                        false
-                    }
-                };
-                assets::prune_media_cache(
-                    &shared.media_dir,
-                    if downloaded {
-                        &cached_path
-                    } else {
-                        &recording_path
-                    },
-                );
-                let message = Message {
-                    id: delivery_id,
-                    chat_jid: jid.to_non_ad_string(),
-                    sender_jid: "me".into(),
-                    sender_name: "You".into(),
-                    text: "[Voice message]".into(),
-                    timestamp: Utc::now().timestamp(),
-                    from_me: true,
-                    receipt: 1,
-                    delivered_at: None,
-                    read_at: None,
-                    delivered_to: Vec::new(),
-                    read_by: Vec::new(),
-                    media: Some(MessageMedia::Audio {
-                        path: cached_path.to_string_lossy().into_owned(),
-                        downloaded,
-                        mime_type: "audio/ogg; codecs=opus".into(),
-                        duration_seconds,
-                        voice_message: true,
-                    }),
-                    reactions: Vec::new(),
-                };
-                let chat_name = shared
-                    .database
-                    .chat_name(&message.chat_jid)?
-                    .or_else(|| {
-                        shared
-                            .database
-                            .contact_name(&message.chat_jid)
-                            .ok()
-                            .flatten()
-                    })
-                    .unwrap_or_else(|| message.chat_jid.clone());
-                shared
-                    .database
-                    .insert_message(&message, &chat_name, jid.is_group(), false)?;
-                shared.publish(ServerEvent::Sent {
-                    message: message.clone(),
-                });
-                Ok(message)
-            }
-            .await;
-            match result {
-                Ok(message) => {
-                    if let Err(error) = voice_outbox::finish_sent(
-                        &shared.voice_outbox_dir,
-                        &mut prepared.job,
-                        Utc::now().timestamp(),
-                    ) {
-                        warn!(%error, "could not finalize a sent voice outbox entry");
-                    }
-                    broadcast_voice_outbox(shared);
-                    Ok(ServerEvent::Sent { message })
-                }
-                Err(error) => {
-                    if let Err(persist_error) = voice_outbox::mark_failed(
-                        &shared.voice_outbox_dir,
-                        &mut prepared.job,
-                        &error.to_string(),
-                        Utc::now().timestamp(),
-                    ) {
-                        warn!(%persist_error, "could not retain a failed voice outbox entry");
-                    }
-                    broadcast_voice_outbox(shared);
-                    Err(error)
-                }
-            }
-        }
+        } => send_voice_message(shared, chat_jid, recording_id).await,
         Command::DiscardVoiceRecording { recording_id } => {
+            // Discarding removes this recording's files while another command
+            // may be running the outbox cleanup, so it keeps the global gate.
             let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
             voice_outbox::discard(&shared.voice_outbox_dir, &recording_id)?;
             broadcast_voice_outbox(shared);
             Ok(ServerEvent::Ack)
         }
-        Command::ListVoiceOutbox => {
-            let _voice_outbox_guard = shared.voice_outbox_gate.lock().await;
-            voice_outbox_event(shared)
-        }
-        Command::ListTextOutbox => {
-            let _outbox_guard = shared.text_outbox_gate.lock().await;
-            Ok(ServerEvent::TextOutbox {
-                entries: shared.database.text_outbox()?,
-            })
-        }
+        // Listing an outbox is a snapshot of atomically written job files or a
+        // single query. Taking a delivery gate here would make the panel's
+        // first request wait for an in-flight upload and time out.
+        Command::ListVoiceOutbox => voice_outbox_event(shared),
+        Command::ListTextOutbox => Ok(ServerEvent::TextOutbox {
+            entries: shared.database.text_outbox()?,
+        }),
         Command::RetryTextMessage { delivery_id } => {
             let _outbox_guard = shared.text_outbox_gate.lock().await;
             if !shared.database.retry_text_message(&delivery_id)? {
@@ -5299,15 +5387,12 @@ async fn handle_command(
             selectable_count,
             correct_option_index,
         } => {
-            let question = question.trim().to_owned();
-            if question.is_empty() {
-                bail!("poll question cannot be empty");
-            }
-            let options: Vec<String> = options
-                .into_iter()
-                .map(|option| option.trim().to_owned())
-                .filter(|option| !option.is_empty())
-                .collect();
+            let ValidatedPoll {
+                question,
+                options,
+                selectable_count,
+                correct_option_index,
+            } = validate_poll_request(&question, options, selectable_count, correct_option_index)?;
             let client = shared
                 .client
                 .read()
@@ -5358,11 +5443,7 @@ async fn handle_command(
                             voter_jids: Vec::new(),
                         })
                         .collect(),
-                    selectable_count: if correct_option_index.is_some() {
-                        1
-                    } else {
-                        selectable_count
-                    },
+                    selectable_count,
                     total_voters: 0,
                     quiz: correct_option_index.is_some(),
                     correct_option_index,
@@ -5390,9 +5471,11 @@ async fn handle_command(
                 &creator_jid.to_non_ad_string(),
                 &message_secret,
             )?;
-            shared.publish(ServerEvent::Sent {
-                message: message.clone(),
-            });
+            // The requesting connection already learns about the poll from
+            // this command's `sent` response, so other clients only need a
+            // refresh instead of a second copy of the same message.
+            broadcast_messages(shared, &message.chat_jid);
+            broadcast_chats(shared);
             Ok(ServerEvent::Sent { message })
         }
         Command::VotePoll {
@@ -5565,20 +5648,26 @@ async fn handle_command(
                 .clone()
                 .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
             let requested: Jid = jid.parse().context("invalid avatar JID")?;
+            // Resolve the alias first: the shell renders the same contact under
+            // its LID and its phone number, and deduplicating the raw string
+            // would fetch that one avatar twice.
+            let canonical = canonical_contact_jid(shared, &client, &requested).await;
+            let target: Jid = canonical.parse().context("invalid canonical avatar JID")?;
             {
                 // Avatar requests are advisory: a queued or dropped one is
                 // re-requested the next time the contact is rendered, and the
                 // `avatars` broadcast announces every result.
                 let mut fetches = shared.avatar_fetches.lock().await;
-                if fetches.contains(&jid) || fetches.len() >= jobs::MAX_PENDING_AVATAR_FETCHES {
+                if fetches.contains(&canonical) || fetches.len() >= jobs::MAX_PENDING_AVATAR_FETCHES
+                {
                     return Ok(ServerEvent::Ack);
                 }
-                fetches.insert(jid.clone());
+                fetches.insert(canonical.clone());
             }
             let shared = Arc::clone(shared);
             tokio::spawn(async move {
-                fetch_requested_avatar(&shared, client, &requested).await;
-                shared.avatar_fetches.lock().await.remove(&jid);
+                fetch_requested_avatar(&shared, client, target).await;
+                shared.avatar_fetches.lock().await.remove(&canonical);
             });
             Ok(ServerEvent::Ack)
         }
@@ -8517,5 +8606,132 @@ mod tests {
         assert_eq!(messages[0].sender_jid, phone_jid);
         assert_eq!(messages[0].text, "hello from history");
         assert_eq!(messages[0].sender_name, "Ada");
+    }
+
+    #[test]
+    fn poll_requests_are_validated_before_any_network_call() {
+        let options = || vec!["Soup".to_owned(), " Salad ".to_owned()];
+        let poll = validate_poll_request(" Lunch? ", options(), 2, None).unwrap();
+        assert_eq!(poll.question, "Lunch?");
+        assert_eq!(poll.options, ["Soup", "Salad"]);
+        assert_eq!(poll.selectable_count, 2);
+        assert_eq!(poll.correct_option_index, None);
+
+        // A quiz has one right answer, so its selectable count is normalized
+        // regardless of what the caller asked for.
+        let quiz = validate_poll_request("Capital?", options(), 2, Some(1)).unwrap();
+        assert_eq!(quiz.selectable_count, 1);
+        assert_eq!(quiz.correct_option_index, Some(1));
+
+        let longest_question = "q".repeat(MAX_POLL_QUESTION_CHARS);
+        assert!(validate_poll_request(&longest_question, options(), 1, None).is_ok());
+        let longest_option = "o".repeat(MAX_POLL_OPTION_CHARS);
+        let widest: Vec<String> = (0..MAX_POLL_OPTIONS)
+            .map(|index| format!("option {index}"))
+            .collect();
+        assert!(validate_poll_request("q", widest, 1, None).is_ok());
+
+        assert!(validate_poll_request("   ", options(), 1, None).is_err());
+        assert!(
+            validate_poll_request(&format!("{longest_question}q"), options(), 1, None).is_err()
+        );
+        assert!(validate_poll_request("q", vec!["only".into()], 1, None).is_err());
+        let too_many: Vec<String> = (0..=MAX_POLL_OPTIONS)
+            .map(|index| format!("option {index}"))
+            .collect();
+        assert!(validate_poll_request("q", too_many, 1, None).is_err());
+        assert!(validate_poll_request("q", vec!["a".into(), "  ".into()], 1, None).is_err());
+        let over_long_option = vec!["a".to_owned(), format!("{longest_option}o")];
+        assert!(validate_poll_request("q", over_long_option, 1, None).is_err());
+        assert!(validate_poll_request("q", vec!["a".into(), " a ".into()], 1, None).is_err());
+        assert!(validate_poll_request("q", options(), 0, None).is_err());
+        assert!(validate_poll_request("q", options(), 3, None).is_err());
+        assert!(validate_poll_request("q", options(), 1, Some(2)).is_err());
+    }
+
+    #[tokio::test]
+    async fn outbox_listings_are_answered_while_a_delivery_holds_its_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        assets::private_dir(&shared.voice_outbox_dir).unwrap();
+        // An upload and a queued text send own these gates for as long as the
+        // network takes; opening the panel still lists both outboxes.
+        let voice_guard = shared.voice_outbox_gate.lock().await;
+        let text_guard = shared.text_outbox_gate.lock().await;
+        let (server_stream, mut client_stream) = UnixStream::pair().unwrap();
+        let server_shared = Arc::clone(&shared);
+        let server =
+            tokio::spawn(async move { serve_connection(server_stream, server_shared).await });
+
+        let mut buffer = Vec::new();
+        for _ in 0..3 {
+            buffer.clear();
+            read_test_frame(&mut client_stream, &mut buffer).await;
+        }
+
+        for (id, command) in [
+            (11_u64, Command::ListVoiceOutbox),
+            (12, Command::ListTextOutbox),
+        ] {
+            let request = serde_json::to_vec(&ClientFrame::new(Some(id), command)).unwrap();
+            client_stream.write_all(&request).await.unwrap();
+            client_stream.write_all(b"\n").await.unwrap();
+        }
+
+        let mut answered = HashMap::new();
+        while answered.len() < 2 {
+            buffer.clear();
+            let frame = read_test_frame(&mut client_stream, &mut buffer).await;
+            if let Some(id) = frame.id {
+                answered.insert(id, frame.event);
+            }
+        }
+        assert_eq!(
+            answered.remove(&11),
+            Some(ServerEvent::VoiceOutbox {
+                entries: Vec::new(),
+            })
+        );
+        assert_eq!(
+            answered.remove(&12),
+            Some(ServerEvent::TextOutbox {
+                entries: Vec::new(),
+            })
+        );
+
+        drop((voice_guard, text_guard));
+        drop(client_stream);
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[test]
+    fn an_unchanged_location_thumbnail_is_reused_without_rewriting_the_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_dir = directory.path().join("media");
+        assets::private_dir(&media_dir).unwrap();
+        let thumbnail = b"\xff\xd8\xffstatic".to_vec();
+        let first =
+            cache_location_thumbnail(&media_dir, "1@s.whatsapp.net", "here", Some(&thumbnail))
+                .unwrap();
+        let written = std::fs::metadata(&first).unwrap().modified().unwrap();
+        assert_eq!(
+            cache_location_thumbnail(&media_dir, "1@s.whatsapp.net", "here", Some(&thumbnail)),
+            Some(first.clone())
+        );
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().modified().unwrap(),
+            written
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), thumbnail);
+        // A payload without a JPEG signature is never cached.
+        assert_eq!(
+            cache_location_thumbnail(
+                &media_dir,
+                "1@s.whatsapp.net",
+                "here",
+                Some(&b"not a jpeg".to_vec()),
+            ),
+            None
+        );
     }
 }
