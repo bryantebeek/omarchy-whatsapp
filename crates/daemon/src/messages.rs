@@ -1,0 +1,1590 @@
+// Inbound message modelling: the live `MessageContext` adapter and the pure
+// decoders that turn WhatsApp protobuf payloads into the local UI model.
+
+use crate::history::option_names_for_hashes;
+use crate::identity::canonical_contact_jid;
+use crate::state::{Shared, broadcast_messages};
+use crate::util::nonempty;
+use crate::{assets, database, notification};
+use buffa::Message as _;
+use chrono::Utc;
+use omarchy_whatsapp_protocol::{Message, MessageMedia, PollOption, ServerEvent};
+use std::path::Path;
+use std::sync::Arc;
+use tracing::{error, warn};
+use whatsapp_rust::prelude::*;
+use whatsapp_rust::wacore_binary::JidExt;
+
+impl Shared {
+    // Adapter from upstream protobuf contexts into the durable local model.
+    // Its deterministic decoding helpers and every resulting database state
+    // transition are measured independently of the live SDK context.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(crate) async fn receive_message(
+        self: &Arc<Self>,
+        generation: u64,
+        context: MessageContext,
+    ) -> bool {
+        let info = &context.info;
+        if info.source.chat.is_status_broadcast() || info.source.chat.is_newsletter() {
+            return true;
+        }
+        let chat_jid = canonical_contact_jid(self, &context.client, &info.source.chat).await;
+        let sender_jid = canonical_contact_jid(self, &context.client, &info.source.sender).await;
+        let push_name = nonempty(&info.push_name).unwrap_or_else(|| sender_jid.clone());
+        if push_name != sender_jid
+            && let Err(error) = self.database.update_contact_name(&sender_jid, &push_name)
+        {
+            warn!(%error, %sender_jid, "could not persist message push name");
+        }
+        let sender_name = self
+            .database
+            .contact_name(&sender_jid)
+            .ok()
+            .flatten()
+            .unwrap_or(push_name);
+        let existing_name = self.database.chat_name(&chat_jid).ok().flatten();
+        let chat_name = if info.source.is_group {
+            match existing_name {
+                Some(name) if name != chat_jid => name,
+                _ => context
+                    .client
+                    .groups()
+                    .get_metadata(&info.source.chat)
+                    .await
+                    .ok()
+                    .and_then(|metadata| nonempty(&metadata.subject))
+                    .unwrap_or_else(|| chat_jid.clone()),
+            }
+        } else {
+            nonempty(&info.push_name)
+                .or(existing_name)
+                .unwrap_or_else(|| chat_jid.clone())
+        };
+        if !self.clock.is_current(generation) {
+            return false;
+        }
+        if let Some(reaction) = find_reaction_message(&context.message)
+            && let Some(target) = reaction.key.as_option()
+            && let Some(message_id) = target.id.as_deref()
+        {
+            let reactor_jid = if info.source.is_from_me {
+                "me"
+            } else {
+                sender_jid.as_str()
+            };
+            let emoji = reaction.text.as_deref().unwrap_or_default();
+            let timestamp = reaction
+                .sender_timestamp_ms
+                .unwrap_or_else(|| info.timestamp.timestamp_millis())
+                .div_euclid(1_000);
+            let persisted = match self.database.apply_reaction(
+                &chat_jid,
+                message_id,
+                reactor_jid,
+                emoji,
+                info.source.is_from_me,
+                timestamp,
+            ) {
+                Ok(true) => {
+                    broadcast_messages(self, &chat_jid);
+                    true
+                }
+                Ok(false) => true,
+                Err(error) => {
+                    warn!(%error, %chat_jid, %message_id, "could not persist reaction");
+                    false
+                }
+            };
+            return persisted;
+        }
+        let base = context.message.get_base_message();
+        if let Some(update) = base.poll_update_message.as_option() {
+            let Some(target_id) = update
+                .poll_creation_message_key
+                .as_option()
+                .and_then(|key| key.id.as_deref())
+            else {
+                warn!(message_id = %info.id, "poll vote is missing its parent message ID");
+                return true;
+            };
+            let stored = match self.database.poll_for_voting(&chat_jid, target_id) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => {
+                    warn!(%chat_jid, poll_message_id = %target_id,
+                        "could not apply poll vote because the parent poll is unavailable");
+                    return false;
+                }
+                Err(error) => {
+                    warn!(%error, %chat_jid, poll_message_id = %target_id,
+                        "could not load parent poll for incoming vote");
+                    return false;
+                }
+            };
+            let Some(vote) = update.vote.as_option() else {
+                return true;
+            };
+            let (Some(enc_payload), Some(enc_iv)) =
+                (vote.enc_payload.as_deref(), vote.enc_iv.as_deref())
+            else {
+                warn!(%chat_jid, poll_message_id = %target_id,
+                    "incoming poll vote has no encrypted payload");
+                return true;
+            };
+            let creator = match stored.creator_jid.parse::<Jid>() {
+                Ok(creator) => creator,
+                Err(error) => {
+                    warn!(%error, creator_jid = %stored.creator_jid,
+                        "stored poll creator JID is invalid");
+                    return true;
+                }
+            };
+            let raw_voter = info.source.sender.to_non_ad();
+            let hashes = match context
+                .client
+                .polls()
+                .decrypt_vote(
+                    whatsapp_rust::PollVoteCiphertext {
+                        enc_payload,
+                        enc_iv,
+                    },
+                    &stored.message_secret,
+                    target_id,
+                    &creator,
+                    &raw_voter,
+                )
+                .await
+            {
+                Ok(hashes) => hashes,
+                Err(error) => {
+                    warn!(%error, %chat_jid, poll_message_id = %target_id,
+                        "could not decrypt incoming poll vote");
+                    return true;
+                }
+            };
+            let Some(selected_options) = option_names_for_hashes(&stored.options, &hashes) else {
+                warn!(%chat_jid, poll_message_id = %target_id,
+                    "incoming poll vote references an unknown option");
+                return true;
+            };
+            if !self.clock.is_current(generation) {
+                return false;
+            }
+            let poll_timestamp = update
+                .sender_timestamp_ms
+                .unwrap_or_else(|| info.timestamp.timestamp_millis());
+            let voter_key = if info.source.is_from_me {
+                "me"
+            } else {
+                sender_jid.as_str()
+            };
+            let persisted = match self.database.apply_poll_vote(
+                &chat_jid,
+                target_id,
+                voter_key,
+                &selected_options,
+                info.source.is_from_me,
+                poll_timestamp,
+            ) {
+                Ok(true) => {
+                    broadcast_messages(self, &chat_jid);
+                    true
+                }
+                Ok(false) => true,
+                Err(error) => {
+                    warn!(%error, %chat_jid, poll_message_id = %target_id,
+                        "could not persist incoming poll vote");
+                    false
+                }
+            };
+            return persisted;
+        }
+        let media = message_media(
+            base,
+            &self.media_dir,
+            &chat_jid,
+            &info.id,
+            info.timestamp.timestamp(),
+            0,
+        );
+        let Some(text) = base
+            .text_content()
+            .map(str::to_owned)
+            .or_else(|| base.get_caption().map(str::to_owned))
+            .or_else(|| media_text(base, &info.media_type))
+        else {
+            tracing::debug!(message_id = %info.id, media_type = %info.media_type,
+                "ignored non-renderable WhatsApp control message");
+            return true;
+        };
+        let message = Message {
+            id: info.id.clone(),
+            chat_jid: chat_jid.clone(),
+            sender_jid,
+            sender_name,
+            text,
+            timestamp: info.timestamp.timestamp(),
+            from_me: info.source.is_from_me,
+            receipt: u8::from(info.source.is_from_me),
+            delivered_at: None,
+            read_at: None,
+            delivered_to: Vec::new(),
+            read_by: Vec::new(),
+            media,
+            reactions: Vec::new(),
+        };
+        if !self.clock.is_current(generation) {
+            return false;
+        }
+        let focused = self.chat_is_focused(&chat_jid);
+        let unread = !message.from_me && !focused;
+        let insert_result = if focused && !message.from_me {
+            self.database.insert_message_with_read_intent(
+                &message,
+                &chat_name,
+                info.source.is_group,
+                &database::UnreadReceipt {
+                    message_id: message.id.clone(),
+                    sender_jid: message.sender_jid.clone(),
+                    is_group: info.source.is_group,
+                },
+            )
+        } else {
+            self.database
+                .insert_message(&message, &chat_name, info.source.is_group, unread)
+        };
+        if insert_result.is_ok() && focused && !message.from_me {
+            self.read_outbox_notify.notify_one();
+        }
+        if insert_result.is_ok()
+            && matches!(message.media, Some(MessageMedia::Poll { .. }))
+            && let Some(secret) = message_secret(&context.message, base)
+            && let Err(error) = self.database.store_poll_secret(
+                &chat_jid,
+                &info.id,
+                &info.source.sender.to_non_ad_string(),
+                secret,
+            )
+        {
+            warn!(%error, %chat_jid, message_id = %info.id,
+                "could not persist poll message secret");
+        }
+        if let Some(image) = base.image_message.as_option()
+            && let Err(error) =
+                self.database
+                    .store_media_download(&chat_jid, &info.id, &image.encode_to_vec())
+        {
+            warn!(%error, %chat_jid, message_id = %info.id,
+                "could not persist WhatsApp image download metadata");
+        }
+        if let Some(video) = video_message(base)
+            && let Err(error) =
+                self.database
+                    .store_media_download(&chat_jid, &info.id, &video.encode_to_vec())
+        {
+            warn!(%error, %chat_jid, message_id = %info.id,
+                "could not persist WhatsApp video download metadata");
+        }
+        if let Some(audio) = base.audio_message.as_option()
+            && let Err(error) =
+                self.database
+                    .store_media_download(&chat_jid, &info.id, &audio.encode_to_vec())
+        {
+            warn!(%error, %chat_jid, message_id = %info.id,
+                "could not persist WhatsApp audio download metadata");
+        }
+        if let Some((sticker, lottie)) = sticker_message(base) {
+            let mut sticker = sticker.clone();
+            if lottie {
+                sticker.is_lottie = Some(true);
+            }
+            if let Err(error) =
+                self.database
+                    .store_media_download(&chat_jid, &info.id, &sticker.encode_to_vec())
+            {
+                warn!(%error, %chat_jid, message_id = %info.id,
+                    "could not persist WhatsApp sticker download metadata");
+            }
+        }
+        if insert_result.is_ok()
+            && info.source.is_group
+            && chat_name != chat_jid
+            && let Err(error) = self.database.update_group_name(&chat_jid, &chat_name)
+        {
+            warn!(%error, %chat_jid, "could not persist incoming group subject");
+        }
+        match insert_result {
+            Ok(true) => {
+                self.publish(ServerEvent::Message {
+                    message: message.clone(),
+                });
+                let total = self.unread_total_or_zero();
+                self.publish(ServerEvent::Unread { total });
+                if unread
+                    && !info.is_offline
+                    && !self
+                        .database
+                        .is_muted(&chat_jid, Utc::now().timestamp())
+                        .unwrap_or(false)
+                {
+                    notification::send(&message, &chat_name, info.source.is_group);
+                }
+                if let Some(document) = base.document_message.as_option().cloned() {
+                    let shared = Arc::clone(self);
+                    let client = Arc::clone(&context.client);
+                    let path = assets::message_document_path(
+                        &self.media_dir,
+                        &chat_jid,
+                        &info.id,
+                        document.file_name.as_deref().unwrap_or_default(),
+                    );
+                    let media_chat_jid = chat_jid.clone();
+                    tokio::spawn(async move {
+                        match assets::download_message_document(client, document, path).await {
+                            Ok(true) if shared.clock.is_current(generation) => {
+                                broadcast_messages(&shared, &media_chat_jid);
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                warn!(%error, chat_jid = %media_chat_jid, "could not cache WhatsApp document");
+                            }
+                        }
+                    });
+                }
+                true
+            }
+            Ok(false) => {
+                if let Some(media) = &message.media
+                    && self
+                        .database
+                        .update_message_media(&chat_jid, &message.id, media)
+                        .unwrap_or(false)
+                {
+                    broadcast_messages(self, &chat_jid);
+                }
+                true
+            }
+            Err(error) => {
+                error!(%error, "could not persist incoming message");
+                false
+            }
+        }
+    }
+}
+
+pub(crate) fn find_reaction_message(
+    message: &wa::Message,
+) -> Option<&wa::message::ReactionMessage> {
+    find_reaction_message_at_depth(message, 0)
+}
+
+fn find_reaction_message_at_depth(
+    message: &wa::Message,
+    depth: u8,
+) -> Option<&wa::message::ReactionMessage> {
+    if depth >= 16 {
+        return None;
+    }
+    if let Some(reaction) = message.reaction_message.as_option() {
+        return Some(reaction);
+    }
+    let protocol_edit = message
+        .protocol_message
+        .as_option()
+        .and_then(|protocol| protocol.edited_message.as_option());
+    let nested = [
+        message
+            .device_sent_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .ephemeral_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .view_once_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .view_once_message_v2
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .view_once_message_v2_extension
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .document_with_caption_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .edited_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        message
+            .group_mentioned_message
+            .as_option()
+            .and_then(|wrapper| wrapper.message.as_option()),
+        protocol_edit,
+    ];
+    nested
+        .into_iter()
+        .flatten()
+        .find_map(|inner| find_reaction_message_at_depth(inner, depth + 1))
+}
+
+fn media_placeholder(media_type: &str) -> Option<String> {
+    Some(
+        match media_type.to_ascii_lowercase().as_str() {
+            "image" => "[Image]",
+            "video" | "ptv" => "[Video]",
+            "audio" | "ptt" => "[Voice message]",
+            "document" => "[Document]",
+            "sticker" => "[Sticker]",
+            "contact" => "[Contact]",
+            "location" | "live_location" => "[Location]",
+            "poll" => "[Poll]",
+            _ => return None,
+        }
+        .to_owned(),
+    )
+}
+
+pub(crate) fn media_text(message: &wa::Message, fallback_type: &str) -> Option<String> {
+    if let Some(location) = message.location_message.as_option() {
+        return Some(
+            nonempty(location.name.as_deref().unwrap_or_default())
+                .or_else(|| nonempty(location.address.as_deref().unwrap_or_default()))
+                .unwrap_or_else(|| {
+                    if location.is_live.unwrap_or(false) {
+                        "[Live location]".to_owned()
+                    } else {
+                        "[Location]".to_owned()
+                    }
+                }),
+        );
+    }
+    if message.live_location_message.is_set() {
+        return Some("[Live location]".to_owned());
+    }
+    let known = if message.image_message.is_set() {
+        Some("[Image]")
+    } else if let Some(video) = video_message(message) {
+        Some(if video.gif_playback.unwrap_or(false) {
+            "[GIF]"
+        } else {
+            "[Video]"
+        })
+    } else if message.audio_message.is_set() {
+        Some("[Voice message]")
+    } else if message.document_message.is_set() {
+        Some("[Document]")
+    } else if message.sticker_message.is_set() || message.lottie_sticker_message.is_set() {
+        Some("[Sticker]")
+    } else if message.contact_message.is_set() || message.contacts_array_message.is_set() {
+        Some("[Contact]")
+    } else if message.poll_creation_message.is_set()
+        || message.poll_creation_message_v2.is_set()
+        || message.poll_creation_message_v3.is_set()
+        || message.poll_creation_message_v5.is_set()
+        || message.poll_creation_message_v6.is_set()
+    {
+        return Some(
+            poll_creation_message(message)
+                .and_then(|poll| poll.name.as_deref())
+                .and_then(nonempty)
+                .map_or_else(|| "[Poll]".to_owned(), |name| format!("[Poll] {name}")),
+        );
+    } else if message.event_message.is_set() || message.event_invite_message.is_set() {
+        Some("[Event]")
+    } else if message.group_invite_message.is_set() {
+        Some("[Group invite]")
+    } else if message.product_message.is_set() {
+        Some("[Product]")
+    } else if message.call_log_messsage.is_set() {
+        Some("[Call]")
+    } else {
+        None
+    };
+    if let Some(text) = known {
+        return Some(text.to_owned());
+    }
+    media_placeholder(fallback_type)
+}
+
+pub(crate) fn video_message(message: &wa::Message) -> Option<&wa::message::VideoMessage> {
+    message
+        .video_message
+        .as_option()
+        .or_else(|| message.ptv_message.as_option())
+}
+
+pub(crate) fn sticker_message(
+    message: &wa::Message,
+) -> Option<(&wa::message::StickerMessage, bool)> {
+    if let Some(sticker) = message.sticker_message.as_option() {
+        return Some((sticker, sticker.is_lottie.unwrap_or(false)));
+    }
+    let inner = message
+        .lottie_sticker_message
+        .as_option()?
+        .message
+        .as_option()?;
+    sticker_message(inner).map(|(sticker, _)| (sticker, true))
+}
+
+fn poll_creation_message(message: &wa::Message) -> Option<&wa::message::PollCreationMessage> {
+    message
+        .poll_creation_message_v6
+        .as_option()
+        .or_else(|| message.poll_creation_message_v5.as_option())
+        .or_else(|| message.poll_creation_message_v3.as_option())
+        .or_else(|| message.poll_creation_message_v2.as_option())
+        .or_else(|| message.poll_creation_message.as_option())
+}
+
+pub(crate) fn poll_media(message: &wa::Message) -> Option<MessageMedia> {
+    let poll = poll_creation_message(message)?;
+    let options: Vec<PollOption> = poll
+        .options
+        .iter()
+        .filter_map(|option| option.option_name.as_deref().and_then(nonempty))
+        .map(|name| PollOption {
+            name,
+            votes: 0,
+            selected_by_me: false,
+            voter_jids: Vec::new(),
+        })
+        .collect();
+    if options.len() < 2 {
+        return None;
+    }
+    let correct_option_index = poll.correct_answer.as_option().and_then(|correct| {
+        let name = correct.option_name.as_deref()?;
+        options
+            .iter()
+            .position(|option| option.name == name)
+            .and_then(|index| u32::try_from(index).ok())
+    });
+    let mut end_timestamp = poll.end_time.unwrap_or(0);
+    if end_timestamp > 10_000_000_000 {
+        end_timestamp = end_timestamp.div_euclid(1_000);
+    }
+    let maximum_selectable = u32::try_from(options.len()).unwrap_or(u32::MAX);
+    // WhatsApp clients encode multiple-answer polls either with the explicit
+    // limit or with zero, including v3 messages produced outside WA Web.
+    // A missing count remains the backwards-compatible single-answer default.
+    let selectable_count = match poll.selectable_options_count {
+        Some(0) => maximum_selectable,
+        None => 1,
+        Some(count) => count.clamp(1, maximum_selectable),
+    };
+    Some(MessageMedia::Poll {
+        question: poll
+            .name
+            .as_deref()
+            .and_then(nonempty)
+            .unwrap_or_else(|| "Poll".to_owned()),
+        selectable_count,
+        options,
+        total_voters: 0,
+        quiz: poll.poll_type == Some(wa::message::PollType::QUIZ),
+        correct_option_index,
+        end_timestamp,
+    })
+}
+
+pub(crate) fn message_secret<'a>(
+    outer: &'a wa::Message,
+    base: &'a wa::Message,
+) -> Option<&'a [u8]> {
+    base.message_context_info
+        .as_option()
+        .and_then(|context| context.message_secret.as_deref())
+        .or_else(|| {
+            outer
+                .message_context_info
+                .as_option()
+                .and_then(|context| context.message_secret.as_deref())
+        })
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn coordinate_e7(value: Option<f64>) -> i64 {
+    let value = value.unwrap_or_default();
+    if value.is_finite() {
+        (value.clamp(-180.0, 180.0) * 10_000_000.0).round() as i64
+    } else {
+        0
+    }
+}
+
+fn cache_location_thumbnail(
+    directory: &Path,
+    chat_jid: &str,
+    message_id: &str,
+    bytes: Option<&Vec<u8>>,
+) -> Option<String> {
+    let bytes = bytes.filter(|bytes| bytes.starts_with(&[0xff, 0xd8, 0xff]))?;
+    let path = assets::location_thumbnail_path(directory, chat_jid, message_id);
+    let unchanged = std::fs::read(&path).is_ok_and(|existing| existing == **bytes);
+    if !unchanged {
+        if let Err(error) = assets::write_private_bytes(&path, bytes) {
+            warn!(%error, "could not cache WhatsApp location thumbnail");
+            return None;
+        }
+        // Only a real write may pay for a full cache scan.
+        assets::prune_media_cache(directory, &path);
+    }
+    Some(path.to_string_lossy().into_owned())
+}
+
+pub(crate) fn message_media(
+    message: &wa::Message,
+    directory: &Path,
+    chat_jid: &str,
+    message_id: &str,
+    timestamp: i64,
+    live_duration_seconds: u32,
+) -> Option<MessageMedia> {
+    if let Some(poll) = poll_media(message) {
+        return Some(poll);
+    }
+    if let Some(image) = message.image_message.as_option() {
+        let path = assets::message_image_path(directory, chat_jid, message_id);
+        let thumbnail_path = assets::cache_message_image_thumbnail(
+            directory,
+            chat_jid,
+            message_id,
+            image.jpeg_thumbnail.as_ref(),
+            image.file_length,
+        )
+        .unwrap_or_else(|error| {
+            warn!(%error, "could not cache WhatsApp image thumbnail");
+            assets::message_image_thumbnail_path(directory, chat_jid, message_id)
+        });
+        return Some(MessageMedia::Image {
+            path: path.to_string_lossy().into_owned(),
+            thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+            downloaded: path.exists(),
+            mime_type: image
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/jpeg".to_owned()),
+            width: image.width.unwrap_or(0),
+            height: image.height.unwrap_or(0),
+        });
+    }
+    if let Some((sticker, lottie)) = sticker_message(message) {
+        let path = assets::message_sticker_path(directory, chat_jid, message_id);
+        let thumbnail_path = assets::cache_message_sticker_thumbnail(
+            directory,
+            chat_jid,
+            message_id,
+            sticker.png_thumbnail.as_ref(),
+        )
+        .unwrap_or_else(|error| {
+            warn!(%error, "could not cache WhatsApp sticker thumbnail");
+            assets::message_sticker_thumbnail_path(directory, chat_jid, message_id)
+        });
+        return Some(MessageMedia::Sticker {
+            path: path.to_string_lossy().into_owned(),
+            thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+            downloaded: !lottie && path.exists(),
+            mime_type: sticker.mimetype.clone().unwrap_or_else(|| {
+                if lottie {
+                    "application/json".to_owned()
+                } else {
+                    "image/webp".to_owned()
+                }
+            }),
+            width: sticker.width.unwrap_or(0),
+            height: sticker.height.unwrap_or(0),
+            animated: sticker.is_animated.unwrap_or(false) || lottie,
+            lottie,
+            accessibility_label: sticker.accessibility_label.clone().unwrap_or_default(),
+        });
+    }
+    if let Some(video) = video_message(message) {
+        let path =
+            assets::message_video_path(directory, chat_jid, message_id, video.mimetype.as_deref());
+        let thumbnail_path = assets::cache_message_video_thumbnail(
+            directory,
+            chat_jid,
+            message_id,
+            video.mimetype.as_deref(),
+            video.jpeg_thumbnail.as_ref(),
+            video.file_length,
+        )
+        .unwrap_or_else(|error| {
+            warn!(%error, "could not cache WhatsApp video thumbnail");
+            assets::message_video_thumbnail_path(directory, chat_jid, message_id)
+        });
+        return Some(MessageMedia::Video {
+            path: path.to_string_lossy().into_owned(),
+            thumbnail_path: thumbnail_path.to_string_lossy().into_owned(),
+            downloaded: path.exists(),
+            mime_type: video
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "video/mp4".to_owned()),
+            width: video.width.unwrap_or(0),
+            height: video.height.unwrap_or(0),
+            duration_seconds: video.seconds.unwrap_or(0),
+            gif_playback: video.gif_playback.unwrap_or(false),
+        });
+    }
+    if let Some(audio) = message.audio_message.as_option() {
+        let path =
+            assets::message_audio_path(directory, chat_jid, message_id, audio.mimetype.as_deref());
+        return Some(MessageMedia::Audio {
+            path: path.to_string_lossy().into_owned(),
+            downloaded: path.exists(),
+            mime_type: audio
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "audio/ogg; codecs=opus".to_owned()),
+            duration_seconds: audio.seconds.unwrap_or(0),
+            voice_message: audio.ptt.unwrap_or(false),
+        });
+    }
+    if let Some(document) = message.document_message.as_option() {
+        let file_name = document
+            .file_name
+            .as_deref()
+            .and_then(nonempty)
+            .or_else(|| document.title.as_deref().and_then(nonempty))
+            .unwrap_or_else(|| "Document".to_owned());
+        let path = assets::message_document_path(directory, chat_jid, message_id, &file_name);
+        return Some(MessageMedia::Document {
+            path: path.to_string_lossy().into_owned(),
+            file_name,
+            mime_type: document
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_owned()),
+            file_size: document.file_length.unwrap_or(0),
+            page_count: document.page_count.unwrap_or(0),
+        });
+    }
+    if let Some(location) = message.location_message.as_option() {
+        return Some(MessageMedia::Location {
+            latitude_e7: coordinate_e7(location.degrees_latitude),
+            longitude_e7: coordinate_e7(location.degrees_longitude),
+            accuracy_m: location.accuracy_in_meters.unwrap_or(0),
+            name: location.name.clone().unwrap_or_default(),
+            address: location.address.clone().unwrap_or_default(),
+            thumbnail_path: cache_location_thumbnail(
+                directory,
+                chat_jid,
+                message_id,
+                location.jpeg_thumbnail.as_ref(),
+            ),
+            live: location.is_live.unwrap_or(false),
+            updated_at: timestamp,
+            duration_seconds: live_duration_seconds,
+        });
+    }
+    if let Some(location) = message.live_location_message.as_option() {
+        return Some(MessageMedia::Location {
+            latitude_e7: coordinate_e7(location.degrees_latitude),
+            longitude_e7: coordinate_e7(location.degrees_longitude),
+            accuracy_m: location.accuracy_in_meters.unwrap_or(0),
+            name: location.caption.clone().unwrap_or_default(),
+            address: String::new(),
+            thumbnail_path: cache_location_thumbnail(
+                directory,
+                chat_jid,
+                message_id,
+                location.jpeg_thumbnail.as_ref(),
+            ),
+            live: true,
+            updated_at: timestamp,
+            duration_seconds: live_duration_seconds,
+        });
+    }
+    None
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(clippy::default_trait_access)] // Generated protobuf fixture types are inferred by MessageField.
+mod tests {
+    use super::*;
+    use buffa::MessageField;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn poll_creation_payload_becomes_interactive_ui_media() {
+        let message = wa::Message {
+            poll_creation_message_v3: MessageField::some(wa::message::PollCreationMessage {
+                name: Some("Lunch?".into()),
+                options: vec![
+                    wa::message::poll_creation_message::Option {
+                        option_name: Some("Soup".into()),
+                        ..Default::default()
+                    },
+                    wa::message::poll_creation_message::Option {
+                        option_name: Some("Salad".into()),
+                        ..Default::default()
+                    },
+                ],
+                selectable_options_count: Some(1),
+                poll_type: Some(wa::message::PollType::QUIZ),
+                correct_answer: MessageField::some(wa::message::poll_creation_message::Option {
+                    option_name: Some("Soup".into()),
+                    ..Default::default()
+                }),
+                end_time: Some(1_700_000_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            media_text(&message, "poll").as_deref(),
+            Some("[Poll] Lunch?")
+        );
+        let Some(MessageMedia::Poll {
+            question,
+            options,
+            selectable_count,
+            quiz,
+            correct_option_index,
+            end_timestamp,
+            ..
+        }) = poll_media(&message)
+        else {
+            panic!("expected poll media");
+        };
+        assert_eq!(question, "Lunch?");
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Soup", "Salad"]
+        );
+        assert_eq!(selectable_count, 1);
+        assert!(quiz);
+        assert_eq!(correct_option_index, Some(0));
+        assert_eq!(end_timestamp, 1_700_000_000);
+        assert!(matches!(
+            message_media(
+                &message,
+                tempfile::tempdir().unwrap().path(),
+                "chat",
+                "poll",
+                1,
+                0,
+            ),
+            Some(MessageMedia::Poll { .. })
+        ));
+    }
+
+    #[test]
+    fn poll_selectable_count_respects_multiple_answer_envelopes() {
+        let poll = wa::message::PollCreationMessage {
+            name: Some("Choose".into()),
+            options: ["One", "Two", "Three"]
+                .into_iter()
+                .map(|name| wa::message::poll_creation_message::Option {
+                    option_name: Some(name.into()),
+                    ..Default::default()
+                })
+                .collect(),
+            selectable_options_count: Some(0),
+            ..Default::default()
+        };
+        let multiple = wa::Message {
+            poll_creation_message: MessageField::some(poll.clone()),
+            ..Default::default()
+        };
+        let multiple_v3 = wa::Message {
+            poll_creation_message_v3: MessageField::some(poll.clone()),
+            ..Default::default()
+        };
+        let default_single = wa::Message {
+            poll_creation_message_v3: MessageField::some(wa::message::PollCreationMessage {
+                selectable_options_count: None,
+                ..poll.clone()
+            }),
+            ..Default::default()
+        };
+        let capped = wa::Message {
+            poll_creation_message: MessageField::some(wa::message::PollCreationMessage {
+                selectable_options_count: Some(99),
+                ..poll
+            }),
+            ..Default::default()
+        };
+
+        let selectable = |message: &wa::Message| match poll_media(message) {
+            Some(MessageMedia::Poll {
+                selectable_count, ..
+            }) => selectable_count,
+            _ => panic!("expected poll media"),
+        };
+        assert_eq!(selectable(&multiple), 3);
+        assert_eq!(selectable(&multiple_v3), 3);
+        assert_eq!(selectable(&default_single), 1);
+        assert_eq!(selectable(&capped), 3);
+    }
+
+    #[test]
+    fn message_secret_prefers_the_base_envelope_and_falls_back_to_outer() {
+        let outer = wa::Message {
+            message_context_info: MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![1, 2, 3]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let base = wa::Message {
+            message_context_info: MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(vec![4, 5, 6]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(message_secret(&outer, &base), Some([4, 5, 6].as_slice()));
+        assert_eq!(
+            message_secret(&outer, &wa::Message::default()),
+            Some([1, 2, 3].as_slice())
+        );
+        assert_eq!(
+            message_secret(&wa::Message::default(), &wa::Message::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn protocol_control_messages_have_no_user_visible_fallback() {
+        let control = wa::Message {
+            protocol_message: MessageField::some(wa::message::ProtocolMessage::default()),
+            ..Default::default()
+        };
+        assert_eq!(media_text(&control, ""), None);
+        assert_eq!(media_placeholder("unknown"), None);
+        assert!(find_reaction_message_at_depth(&wa::Message::default(), 16).is_none());
+    }
+
+    #[test]
+    fn media_fallback_matrix_and_invalid_poll_are_explicit() {
+        let location = |name: Option<&str>, address: Option<&str>, live| wa::Message {
+            location_message: MessageField::some(wa::message::LocationMessage {
+                name: name.map(str::to_owned),
+                address: address.map(str::to_owned),
+                is_live: Some(live),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            media_text(&location(Some("Place"), None, false), ""),
+            Some("Place".into())
+        );
+        assert_eq!(
+            media_text(&location(None, Some("Street"), false), ""),
+            Some("Street".into())
+        );
+        assert_eq!(
+            media_text(&location(None, None, false), ""),
+            Some("[Location]".into())
+        );
+        assert_eq!(
+            media_text(&location(None, None, true), ""),
+            Some("[Live location]".into())
+        );
+        assert_eq!(
+            media_text(
+                &wa::Message {
+                    live_location_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                ""
+            ),
+            Some("[Live location]".into())
+        );
+
+        let cases = [
+            (
+                wa::Message {
+                    image_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Image]",
+            ),
+            (
+                wa::Message {
+                    video_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Video]",
+            ),
+            (
+                wa::Message {
+                    document_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Document]",
+            ),
+            (
+                wa::Message {
+                    contact_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Contact]",
+            ),
+            (
+                wa::Message {
+                    event_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Event]",
+            ),
+            (
+                wa::Message {
+                    group_invite_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Group invite]",
+            ),
+            (
+                wa::Message {
+                    product_message: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Product]",
+            ),
+            (
+                wa::Message {
+                    call_log_messsage: MessageField::some(Default::default()),
+                    ..Default::default()
+                },
+                "[Call]",
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(media_text(&message, ""), Some(expected.into()));
+        }
+        for kind in [
+            "image",
+            "video",
+            "ptv",
+            "audio",
+            "ptt",
+            "document",
+            "sticker",
+            "contact",
+            "location",
+            "live_location",
+            "poll",
+        ] {
+            assert!(media_placeholder(kind).is_some());
+        }
+
+        let invalid_poll = wa::Message {
+            poll_creation_message: MessageField::some(wa::message::PollCreationMessage {
+                options: vec![wa::message::poll_creation_message::Option {
+                    option_name: Some("Only".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(poll_media(&invalid_poll), None);
+        assert_eq!(media_text(&invalid_poll, "poll"), Some("[Poll]".into()));
+        assert_eq!(coordinate_e7(Some(f64::NAN)), 0);
+    }
+
+    #[test]
+    fn static_animated_and_lottie_stickers_become_structured_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_dir = directory.path().join("media");
+        assets::private_dir(&media_dir).unwrap();
+        let sticker = wa::message::StickerMessage {
+            mimetype: Some("image/webp".into()),
+            file_length: Some(1_024),
+            width: Some(512),
+            height: Some(384),
+            is_animated: Some(true),
+            png_thumbnail: Some(b"\x89PNG\r\n\x1a\nthumbnail".to_vec()),
+            accessibility_label: Some("Dancing parrot".into()),
+            ..Default::default()
+        };
+        let direct = wa::Message {
+            sticker_message: MessageField::some(sticker.clone()),
+            ..Default::default()
+        };
+        let direct_media =
+            message_media(&direct, &media_dir, "1@s.whatsapp.net", "sticker", 10, 0).unwrap();
+        let MessageMedia::Sticker {
+            path,
+            thumbnail_path,
+            downloaded,
+            animated,
+            lottie,
+            accessibility_label,
+            width,
+            height,
+            ..
+        } = direct_media
+        else {
+            panic!("expected sticker media")
+        };
+        assert!(path.ends_with(".sticker.webp"));
+        assert_eq!(
+            std::fs::read(thumbnail_path).unwrap(),
+            b"\x89PNG\r\n\x1a\nthumbnail"
+        );
+        assert!(!downloaded);
+        assert!(animated);
+        assert!(!lottie);
+        assert_eq!((width, height), (512, 384));
+        assert_eq!(accessibility_label, "Dancing parrot");
+
+        let lottie_message = wa::Message {
+            lottie_sticker_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message {
+                    sticker_message: MessageField::some(wa::message::StickerMessage {
+                        mimetype: None,
+                        ..sticker
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let MessageMedia::Sticker {
+            downloaded,
+            animated,
+            lottie,
+            mime_type,
+            ..
+        } = message_media(
+            &lottie_message,
+            &media_dir,
+            "1@s.whatsapp.net",
+            "lottie",
+            11,
+            0,
+        )
+        .unwrap()
+        else {
+            panic!("expected Lottie sticker media")
+        };
+        assert!(!downloaded);
+        assert!(animated);
+        assert!(lottie);
+        assert_eq!(mime_type, "application/json");
+        assert_eq!(
+            media_text(&lottie_message, "sticker"),
+            Some("[Sticker]".into())
+        );
+    }
+
+    #[test]
+    fn visual_audio_document_and_live_location_payloads_become_private_ui_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_dir = directory.path().join("media");
+        assets::private_dir(&media_dir).unwrap();
+        let image = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                mimetype: Some("image/jpeg".into()),
+                width: Some(640),
+                height: Some(480),
+                jpeg_thumbnail: Some(b"\xff\xd8\xffthumbnail".to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let image_media = message_media(&image, &media_dir, "1@s.whatsapp.net", "photo", 10, 0)
+            .expect("image media");
+        let MessageMedia::Image {
+            path,
+            thumbnail_path,
+            downloaded,
+            mime_type,
+            width,
+            height,
+        } = image_media
+        else {
+            panic!("expected image media")
+        };
+        assert_eq!(
+            (mime_type.as_str(), width, height),
+            ("image/jpeg", 640, 480)
+        );
+        assert!(!downloaded);
+        assert!(!Path::new(&path).exists());
+        assert_eq!(
+            std::fs::read(&thumbnail_path).unwrap(),
+            b"\xff\xd8\xffthumbnail"
+        );
+        assert_eq!(
+            std::fs::metadata(thumbnail_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let video = wa::Message {
+            video_message: MessageField::some(wa::message::VideoMessage {
+                mimetype: Some("video/mp4".into()),
+                file_length: Some(2_000_000),
+                seconds: Some(12),
+                width: Some(1920),
+                height: Some(1080),
+                gif_playback: Some(true),
+                jpeg_thumbnail: Some(b"\xff\xd8\xffvideo-thumbnail".to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let video_media = message_media(&video, &media_dir, "1@s.whatsapp.net", "clip", 15, 0)
+            .expect("video media");
+        let MessageMedia::Video {
+            path,
+            thumbnail_path,
+            downloaded,
+            mime_type,
+            width,
+            height,
+            duration_seconds,
+            gif_playback,
+        } = video_media
+        else {
+            panic!("expected video media")
+        };
+        assert_eq!(
+            (mime_type.as_str(), width, height, duration_seconds),
+            ("video/mp4", 1920, 1080, 12)
+        );
+        assert!(!downloaded);
+        assert!(gif_playback);
+        assert_eq!(media_text(&video, ""), Some("[GIF]".to_owned()));
+        assert!(!Path::new(&path).exists());
+        assert_eq!(
+            std::fs::read(thumbnail_path).unwrap(),
+            b"\xff\xd8\xffvideo-thumbnail"
+        );
+
+        let audio = wa::Message {
+            audio_message: MessageField::some(wa::message::AudioMessage {
+                mimetype: Some("audio/ogg; codecs=opus".into()),
+                file_length: Some(120_000),
+                seconds: Some(18),
+                ptt: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let audio_media = message_media(&audio, &media_dir, "1@s.whatsapp.net", "note", 18, 0)
+            .expect("audio media");
+        let MessageMedia::Audio {
+            path,
+            downloaded,
+            mime_type,
+            duration_seconds,
+            voice_message,
+        } = audio_media
+        else {
+            panic!("expected audio media")
+        };
+        assert_eq!(mime_type, "audio/ogg; codecs=opus");
+        assert_eq!(duration_seconds, 18);
+        assert!(voice_message);
+        assert!(!downloaded);
+        assert!(path.ends_with(".audio.ogg"));
+        assert_eq!(media_text(&audio, ""), Some("[Voice message]".to_owned()));
+
+        let document = wa::Message {
+            document_message: MessageField::some(wa::message::DocumentMessage {
+                mimetype: Some("application/pdf".into()),
+                file_name: Some("Garden quote.pdf".into()),
+                file_length: Some(42_000),
+                page_count: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            message_media(&document, &media_dir, "1@s.whatsapp.net", "quote", 20, 0,),
+            Some(MessageMedia::Document {
+                path: assets::message_document_path(
+                    &media_dir,
+                    "1@s.whatsapp.net",
+                    "quote",
+                    "Garden quote.pdf"
+                )
+                .to_string_lossy()
+                .into_owned(),
+                file_name: "Garden quote.pdf".into(),
+                mime_type: "application/pdf".into(),
+                file_size: 42_000,
+                page_count: 3,
+            })
+        );
+
+        let live = wa::Message {
+            live_location_message: MessageField::some(wa::message::LiveLocationMessage {
+                degrees_latitude: Some(52.370_16),
+                degrees_longitude: Some(4.895_168),
+                accuracy_in_meters: Some(7),
+                caption: Some("On my way".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            message_media(&live, &media_dir, "1@s.whatsapp.net", "live", 42, 3_600,),
+            Some(MessageMedia::Location {
+                latitude_e7: 523_701_600,
+                longitude_e7: 48_951_680,
+                accuracy_m: 7,
+                name: "On my way".into(),
+                address: String::new(),
+                thumbnail_path: None,
+                live: true,
+                updated_at: 42,
+                duration_seconds: 3_600,
+            })
+        );
+    }
+
+    #[test]
+    fn live_location_thumbnail_is_refreshed_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_dir = directory.path().join("media");
+        assets::private_dir(&media_dir).unwrap();
+        let live = |thumbnail: &[u8]| wa::Message {
+            live_location_message: MessageField::some(wa::message::LiveLocationMessage {
+                degrees_latitude: Some(52.37),
+                degrees_longitude: Some(4.89),
+                jpeg_thumbnail: Some(thumbnail.to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let first = b"\xff\xd8\xfffirst";
+        let second = b"\xff\xd8\xffsecond";
+        let first_media = message_media(
+            &live(first),
+            &media_dir,
+            "1@s.whatsapp.net",
+            "live",
+            10,
+            3_600,
+        )
+        .unwrap();
+        let Some(path) = (match first_media {
+            MessageMedia::Location { thumbnail_path, .. } => thumbnail_path,
+            _ => None,
+        }) else {
+            panic!("expected live-location thumbnail")
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+
+        message_media(
+            &live(second),
+            &media_dir,
+            "1@s.whatsapp.net",
+            "live",
+            20,
+            3_600,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), second);
+    }
+
+    #[test]
+    fn existing_media_files_and_cache_failures_are_reflected_in_models() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_dir = directory.path().join("media");
+        assets::private_dir(&media_dir).unwrap();
+        let chat = "1@s.whatsapp.net";
+
+        std::fs::write(
+            assets::message_image_path(&media_dir, chat, "image"),
+            b"image",
+        )
+        .unwrap();
+        let image = wa::Message {
+            image_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&image, &media_dir, chat, "image", 1, 0),
+            Some(MessageMedia::Image { downloaded: true, ref mime_type, .. })
+                if mime_type == "image/jpeg"
+        ));
+
+        std::fs::write(
+            assets::message_video_path(&media_dir, chat, "video", None),
+            b"video",
+        )
+        .unwrap();
+        let video = wa::Message {
+            ptv_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&video, &media_dir, chat, "video", 1, 0),
+            Some(MessageMedia::Video { downloaded: true, ref mime_type, .. })
+                if mime_type == "video/mp4"
+        ));
+
+        std::fs::write(
+            assets::message_audio_path(&media_dir, chat, "audio", None),
+            b"audio",
+        )
+        .unwrap();
+        let audio = wa::Message {
+            audio_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&audio, &media_dir, chat, "audio", 1, 0),
+            Some(MessageMedia::Audio { downloaded: true, ref mime_type, .. })
+                if mime_type == "audio/ogg; codecs=opus"
+        ));
+
+        std::fs::write(
+            assets::message_sticker_path(&media_dir, chat, "sticker"),
+            b"sticker",
+        )
+        .unwrap();
+        let sticker = wa::Message {
+            sticker_message: MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&sticker, &media_dir, chat, "sticker", 1, 0),
+            Some(MessageMedia::Sticker { downloaded: true, ref mime_type, .. })
+                if mime_type == "image/webp"
+        ));
+
+        let document = wa::Message {
+            document_message: MessageField::some(wa::message::DocumentMessage {
+                title: Some("Title fallback".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&document, &media_dir, chat, "document", 1, 0),
+            Some(MessageMedia::Document { ref file_name, ref mime_type, .. })
+                if file_name == "Title fallback" && mime_type == "application/octet-stream"
+        ));
+
+        let location = wa::Message {
+            location_message: MessageField::some(wa::message::LocationMessage {
+                degrees_latitude: Some(f64::INFINITY),
+                degrees_longitude: Some(-181.0),
+                is_live: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            message_media(&location, &media_dir, chat, "location", 2, 0),
+            Some(MessageMedia::Location {
+                latitude_e7: 0,
+                longitude_e7: -1_800_000_000,
+                live: false,
+                ..
+            })
+        ));
+
+        let missing_dir = directory.path().join("missing");
+        let with_thumbnail = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                jpeg_thumbnail: Some(b"\xff\xd8\xffpreview".to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(message_media(&with_thumbnail, &missing_dir, chat, "error", 1, 0).is_some());
+        let sticker_with_thumbnail = wa::Message {
+            sticker_message: MessageField::some(wa::message::StickerMessage {
+                png_thumbnail: Some(b"\x89PNG\r\n\x1a\npreview".to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            message_media(
+                &sticker_with_thumbnail,
+                &missing_dir,
+                chat,
+                "sticker-error",
+                1,
+                0,
+            )
+            .is_some()
+        );
+        let video_with_thumbnail = wa::Message {
+            video_message: MessageField::some(wa::message::VideoMessage {
+                jpeg_thumbnail: Some(b"\xff\xd8\xffpreview".to_vec()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            message_media(
+                &video_with_thumbnail,
+                &missing_dir,
+                chat,
+                "video-error",
+                1,
+                0,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            cache_location_thumbnail(
+                &missing_dir,
+                chat,
+                "location-error",
+                Some(&b"\xff\xd8\xffpreview".to_vec()),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unchanged_location_thumbnail_is_reused_without_rewriting_the_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let media_dir = directory.path().join("media");
+        assets::private_dir(&media_dir).unwrap();
+        let thumbnail = b"\xff\xd8\xffstatic".to_vec();
+        let first =
+            cache_location_thumbnail(&media_dir, "1@s.whatsapp.net", "here", Some(&thumbnail))
+                .unwrap();
+        let written = std::fs::metadata(&first).unwrap().modified().unwrap();
+        assert_eq!(
+            cache_location_thumbnail(&media_dir, "1@s.whatsapp.net", "here", Some(&thumbnail)),
+            Some(first.clone())
+        );
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().modified().unwrap(),
+            written
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), thumbnail);
+        // A payload without a JPEG signature is never cached.
+        assert_eq!(
+            cache_location_thumbnail(
+                &media_dir,
+                "1@s.whatsapp.net",
+                "here",
+                Some(&b"not a jpeg".to_vec()),
+            ),
+            None
+        );
+    }
+}
