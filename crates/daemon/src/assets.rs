@@ -1,3 +1,4 @@
+use crate::transport::{MediaSource, Transport};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -12,7 +13,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tracing::warn;
-use whatsapp_rust::prelude::{Client, Jid, wa};
+use whatsapp_rust::prelude::{Jid, wa};
 
 pub const MAX_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_STICKER_BYTES: u64 = 25 * 1024 * 1024;
@@ -748,16 +749,16 @@ async fn download_url(url: String) -> Result<Vec<u8>> {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn fetch_avatar(client: Arc<Client>, directory: PathBuf, jid: Jid) -> Result<bool> {
+pub(crate) async fn fetch_avatar(
+    transport: Arc<dyn Transport>,
+    directory: PathBuf,
+    jid: Jid,
+) -> Result<bool> {
     let raw_jid = jid.to_non_ad_string();
     let path = avatar_path(&directory, &raw_jid);
     let missing = avatar_missing_path(&directory, &raw_jid);
-    // The generic picture IQ accepts both contact and group JIDs and supports
-    // a short timeout. The dedicated group batch IQ can wait for the global IQ
-    // timeout when even one stale group is included, delaying every avatar.
-    let url = client
-        .contacts()
-        .get_profile_picture_with_timeout(&jid, true, Some(Duration::from_secs(6)))
+    let url = transport
+        .profile_picture(&jid)
         .await?
         .map(|picture| picture.url);
 
@@ -775,8 +776,8 @@ pub async fn fetch_avatar(client: Arc<Client>, directory: PathBuf, jid: Jid) -> 
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn download_message_image(
-    client: Arc<Client>,
+pub(crate) async fn download_message_image(
+    transport: Arc<dyn Transport>,
     image: wa::message::ImageMessage,
     path: PathBuf,
 ) -> Result<bool> {
@@ -788,7 +789,7 @@ pub async fn download_message_image(
         return Ok(false);
     }
     let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
-    let result = client.download_to_writer(&image, file).await;
+    let result = transport.download(&MediaSource::Image(image), file).await;
     match result {
         Ok(mut file) => {
             let length = file.metadata()?.len();
@@ -812,8 +813,8 @@ pub async fn download_message_image(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn download_message_sticker(
-    client: Arc<Client>,
+pub(crate) async fn download_message_sticker(
+    transport: Arc<dyn Transport>,
     sticker: wa::message::StickerMessage,
     path: PathBuf,
 ) -> Result<bool> {
@@ -828,7 +829,9 @@ pub async fn download_message_sticker(
         return Ok(false);
     }
     let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
-    let result = client.download_to_writer(&sticker, file).await;
+    let result = transport
+        .download(&MediaSource::Sticker(sticker), file)
+        .await;
     match result {
         Ok(mut file) => {
             let length = file.metadata()?.len();
@@ -852,8 +855,8 @@ pub async fn download_message_sticker(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn download_message_video(
-    client: Arc<Client>,
+pub(crate) async fn download_message_video(
+    transport: Arc<dyn Transport>,
     video: wa::message::VideoMessage,
     path: PathBuf,
 ) -> Result<bool> {
@@ -865,7 +868,7 @@ pub async fn download_message_video(
         return Ok(false);
     }
     let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
-    let result = client.download_to_writer(&video, file).await;
+    let result = transport.download(&MediaSource::Video(video), file).await;
     match result {
         Ok(mut file) => {
             let length = file.metadata()?.len();
@@ -889,8 +892,8 @@ pub async fn download_message_video(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn download_message_audio(
-    client: Arc<Client>,
+pub(crate) async fn download_message_audio(
+    transport: Arc<dyn Transport>,
     audio: wa::message::AudioMessage,
     path: PathBuf,
 ) -> Result<bool> {
@@ -902,7 +905,7 @@ pub async fn download_message_audio(
         return Ok(false);
     }
     let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
-    let result = client.download_to_writer(&audio, file).await;
+    let result = transport.download(&MediaSource::Audio(audio), file).await;
     match result {
         Ok(mut file) => {
             let length = file.metadata()?.len();
@@ -926,8 +929,8 @@ pub async fn download_message_audio(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn download_message_document(
-    client: Arc<Client>,
+pub(crate) async fn download_message_document(
+    transport: Arc<dyn Transport>,
     document: wa::message::DocumentMessage,
     path: PathBuf,
 ) -> Result<bool> {
@@ -939,7 +942,9 @@ pub async fn download_message_document(
         bail!("document declares an invalid size of {declared} bytes");
     }
     let (temporary, file) = PrivateTemporaryFile::create(&path, "part")?;
-    let result = client.download_to_writer(&document, file).await;
+    let result = transport
+        .download(&MediaSource::Document(document), file)
+        .await;
     match result {
         Ok(file) => {
             let length = file.metadata()?.len();

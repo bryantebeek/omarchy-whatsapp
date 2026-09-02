@@ -3,6 +3,7 @@
 use crate::database;
 use crate::identity::canonical_contact_jid;
 use crate::state::{Shared, broadcast_chats, broadcast_text_outbox};
+use crate::transport::Transport;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use omarchy_whatsapp_protocol::{Message, ServerEvent, TextOutboxStatus};
@@ -14,7 +15,10 @@ use whatsapp_rust::prelude::*;
 use whatsapp_rust::wacore_binary::JidExt;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn deliver_pending_text(shared: &Arc<Shared>, client: &Arc<Client>) -> Result<bool> {
+async fn deliver_pending_text(
+    shared: &Arc<Shared>,
+    transport: &Arc<dyn Transport>,
+) -> Result<bool> {
     // The claim is the atomic transition, so the gate only has to cover it and
     // the resulting snapshot. Holding it across the send would make every
     // enqueue wait for the network and time the shell's request out.
@@ -27,7 +31,7 @@ async fn deliver_pending_text(shared: &Arc<Shared>, client: &Arc<Client>) -> Res
         pending
     };
     let delivery_id = pending.delivery_id.clone();
-    match send_claimed_text(shared, client, pending).await {
+    match send_claimed_text(shared, transport, pending).await {
         Ok(message) => {
             shared.database.complete_text_message(&delivery_id)?;
             shared.publish(ServerEvent::Sent {
@@ -58,19 +62,19 @@ async fn deliver_pending_text(shared: &Arc<Shared>, client: &Arc<Client>) -> Res
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn send_claimed_text(
     shared: &Arc<Shared>,
-    client: &Arc<Client>,
+    transport: &Arc<dyn Transport>,
     pending: database::PendingTextMessage,
 ) -> Result<Message> {
     let requested: Jid = pending
         .chat_jid
         .parse()
         .context("invalid queued text chat JID")?;
-    let canonical = canonical_contact_jid(shared, client, &requested).await;
+    let canonical = canonical_contact_jid(shared, transport.as_ref(), &requested).await;
     let jid: Jid = canonical
         .parse()
         .context("invalid canonical text chat JID")?;
-    let result = client
-        .send_message_with_options(
+    let result = transport
+        .send_message(
             &jid,
             wa::Message::text(pending.text.clone()),
             SendOptions::default().with_message_id(pending.message_id),
@@ -112,8 +116,8 @@ async fn send_claimed_text(
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn run_text_outbox(shared: Arc<Shared>) {
     loop {
-        while let Some(client) = shared.client.read().await.clone() {
-            match deliver_pending_text(&shared, &client).await {
+        while let Some(transport) = shared.client.read().await.clone() {
+            match deliver_pending_text(&shared, &transport).await {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => {
@@ -127,7 +131,10 @@ pub(crate) async fn run_text_outbox(shared: Arc<Shared>) {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn deliver_pending_read(shared: &Arc<Shared>, client: &Arc<Client>) -> Result<bool> {
+async fn deliver_pending_read(
+    shared: &Arc<Shared>,
+    transport: &Arc<dyn Transport>,
+) -> Result<bool> {
     // `MarkRead` runs on every chat selection and focus change, so the gate is
     // only held while the batch is selected. `finish_read_batch` deletes just
     // the receipts in this batch, leaving anything queued during the send for
@@ -158,7 +165,7 @@ async fn deliver_pending_read(shared: &Arc<Shared>, client: &Arc<Client>) -> Res
         for (sender, ids) in grouped {
             let sender: Jid = sender.parse().context("invalid queued read sender JID")?;
             let refs = ids.iter().map(String::as_str).collect::<Vec<_>>();
-            client.mark_as_read(&chat, Some(&sender), &refs).await?;
+            transport.mark_as_read(&chat, Some(&sender), &refs).await?;
         }
     } else {
         let ids = batch
@@ -167,13 +174,10 @@ async fn deliver_pending_read(shared: &Arc<Shared>, client: &Arc<Client>) -> Res
             .map(|receipt| receipt.message_id.as_str())
             .collect::<Vec<_>>();
         if !ids.is_empty() {
-            client.mark_as_read(&chat, None, &ids).await?;
+            transport.mark_as_read(&chat, None, &ids).await?;
         }
     }
-    client
-        .chat_actions()
-        .mark_chat_as_read(&chat, true, None)
-        .await?;
+    transport.mark_chat_as_read(&chat).await?;
     shared.database.finish_read_batch(&batch)?;
     Ok(true)
 }
@@ -181,8 +185,8 @@ async fn deliver_pending_read(shared: &Arc<Shared>, client: &Arc<Client>) -> Res
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn run_read_outbox(shared: Arc<Shared>) {
     loop {
-        while let Some(client) = shared.client.read().await.clone() {
-            match deliver_pending_read(&shared, &client).await {
+        while let Some(transport) = shared.client.read().await.clone() {
+            match deliver_pending_read(&shared, &transport).await {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(error) => {

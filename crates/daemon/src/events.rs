@@ -15,6 +15,7 @@ use crate::sync::{
     refresh_avatar, request_missing_contact_history, sync_avatars, sync_group_names,
     sync_missing_contact_names,
 };
+use crate::transport::Transport;
 use crate::{assets, connections, inbound, notification};
 use chrono::Utc;
 use omarchy_whatsapp_protocol::{ChatState, ChatStateResyncStatus, ConnectionStatus, ServerEvent};
@@ -37,7 +38,9 @@ const APP_STATE_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_s
 async fn reduce_message(
     shared: &Arc<Shared>,
     generation: u64,
-    context: MessageContext,
+    message: Arc<wa::Message>,
+    info: MessageInfo,
+    transport: Arc<dyn Transport>,
     key: &inbound::InboundKey,
 ) {
     if !shared.clock.is_current(generation) {
@@ -47,7 +50,9 @@ async fn reduce_message(
         );
         return;
     }
-    let accepted = shared.receive_message(generation, context).await;
+    let accepted = shared
+        .receive_message(generation, message, info, transport)
+        .await;
     finish_inbound_reduction(shared, key, accepted);
 }
 
@@ -69,7 +74,10 @@ pub(crate) async fn run_message_reducer(
 ) {
     while let Some(work) = queue.recv().await {
         match work {
-            MessageWork::Drain { generation, client } => {
+            MessageWork::Drain {
+                generation,
+                transport,
+            } => {
                 if !shared.clock.is_current(generation) {
                     continue;
                 }
@@ -84,21 +92,31 @@ pub(crate) async fn run_message_reducer(
                     if !shared.clock.is_current(generation) {
                         break;
                     }
-                    let context = match record.rehydrate_context(Arc::clone(&client)) {
-                        Ok(context) => context,
+                    let (message, info) = match record.decode_parts() {
+                        Ok(parts) => parts,
                         Err(error) => {
                             error!(%error, "durable inbound message requires manual recovery");
                             continue;
                         }
                     };
-                    reduce_message(&shared, generation, context, &record.key).await;
+                    reduce_message(
+                        &shared,
+                        generation,
+                        message,
+                        info,
+                        Arc::clone(&transport),
+                        &record.key,
+                    )
+                    .await;
                 }
             }
             MessageWork::Live {
                 generation,
-                context,
+                message,
+                info,
+                transport,
                 key,
-            } => reduce_message(&shared, generation, *context, &key).await,
+            } => reduce_message(&shared, generation, message, *info, transport, &key).await,
             MessageWork::Barrier(completed) => {
                 let _ = completed.send(());
             }
@@ -118,7 +136,7 @@ pub(crate) async fn run_app_event_reducer(
                 Arc::clone(&shared),
                 work.generation,
                 work.event,
-                work.client,
+                work.transport,
                 Arc::clone(&work.jobs),
             ));
             let _ = task.await;
@@ -131,7 +149,7 @@ pub(crate) async fn process_history_event(
     shared: Arc<Shared>,
     generation: u64,
     event: Arc<Event>,
-    client: Arc<Client>,
+    transport: Arc<dyn Transport>,
     jobs: Arc<GenerationJobs>,
 ) {
     let Event::HistorySync(history) = &*event else {
@@ -164,13 +182,13 @@ pub(crate) async fn process_history_event(
         let Ok(jid) = raw.parse::<Jid>() else {
             continue;
         };
-        let canonical = canonical_contact_jid(&shared, &client, &jid).await;
+        let canonical = canonical_contact_jid(&shared, transport.as_ref(), &jid).await;
         if canonical != raw {
             aliases.insert(raw, canonical);
         }
     }
     let ingest_shared = Arc::clone(&shared);
-    let own_pn = client.pn().map(|jid| jid.to_non_ad_string());
+    let own_pn = transport.pn().map(|jid| jid.to_non_ad_string());
     let result = tokio::task::spawn_blocking(move || {
         ingest_shared.ingest_history(&history, own_pn.as_deref(), &aliases)
     })
@@ -187,19 +205,19 @@ pub(crate) async fn process_history_event(
             shared.publish(ServerEvent::Unread {
                 total: shared.unread_total_or_zero(),
             });
-            sync_avatars(Arc::clone(&shared), Arc::clone(&client)).await;
+            sync_avatars(Arc::clone(&shared), Arc::clone(&transport)).await;
             if !shared.clock.is_current(generation) {
                 return;
             }
             let names_shared = Arc::clone(&shared);
-            let names_client = Arc::clone(&client);
+            let names_transport = Arc::clone(&transport);
             jobs.spawn(async move {
-                sync_missing_contact_names(Arc::clone(&names_shared), Arc::clone(&names_client))
+                sync_missing_contact_names(Arc::clone(&names_shared), Arc::clone(&names_transport))
                     .await;
-                request_missing_contact_history(names_shared, names_client).await;
+                request_missing_contact_history(names_shared, names_transport).await;
             });
             if !pending_media.is_empty() {
-                jobs.spawn(download_pending_media(shared, client, pending_media));
+                jobs.spawn(download_pending_media(shared, transport, pending_media));
             }
         }
         Ok(Err(error)) => error!(%error, "could not ingest history sync"),
@@ -212,7 +230,7 @@ pub(crate) async fn process_contact_event(
     shared: Arc<Shared>,
     generation: u64,
     event: Arc<Event>,
-    client: Arc<Client>,
+    transport: Arc<dyn Transport>,
 ) {
     let Event::ContactUpdate(update) = &*event else {
         return;
@@ -221,7 +239,7 @@ pub(crate) async fn process_contact_event(
         return;
     }
     ingest_contact_name(&shared, update);
-    canonical_contact_jid(&shared, &client, &update.jid).await;
+    canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -229,12 +247,12 @@ pub(crate) async fn process_group_event(
     shared: Arc<Shared>,
     generation: u64,
     event: Arc<Event>,
-    client: Arc<Client>,
+    transport: Arc<dyn Transport>,
 ) {
     let Event::GroupUpdate(update) = &*event else {
         return;
     };
-    let metadata = match client.groups().get_metadata(&update.group_jid).await {
+    let metadata = match transport.group_metadata(&update.group_jid).await {
         Ok(metadata) => metadata,
         Err(error) => {
             warn!(%error, "could not refresh WhatsApp group metadata");
@@ -258,7 +276,8 @@ pub(crate) async fn process_group_event(
         Err(error) => warn!(%error, "could not update WhatsApp group subject"),
     }
     let chat_jid = update.group_jid.to_non_ad_string();
-    let participants = resolve_group_participants(&shared, &client, participant_identities).await;
+    let participants =
+        resolve_group_participants(&shared, transport.as_ref(), participant_identities).await;
     if shared.clock.is_current(generation) {
         shared.publish(ServerEvent::GroupParticipants {
             chat_jid,
@@ -478,7 +497,7 @@ async fn handle_app_event(
     shared: Arc<Shared>,
     generation: u64,
     event: Arc<Event>,
-    client: Arc<Client>,
+    transport: Arc<dyn Transport>,
     jobs: Arc<GenerationJobs>,
 ) {
     if !shared.clock.is_current(generation) {
@@ -493,7 +512,8 @@ async fn handle_app_event(
         Event::Receipt(receipt) => {
             let receipt_type = receipt.r#type.as_wire_str();
             if matches!(receipt_type, "read-self" | "played-self") {
-                let jid = canonical_contact_jid(&shared, &client, &receipt.source.chat).await;
+                let jid =
+                    canonical_contact_jid(&shared, transport.as_ref(), &receipt.source.chat).await;
                 match shared.database.apply_self_read_receipt(
                     &jid,
                     &receipt.message_ids,
@@ -525,12 +545,16 @@ async fn handle_app_event(
                 _ => 0,
             };
             if state > 0 {
-                let chat_jid = canonical_contact_jid(&shared, &client, &receipt.source.chat).await;
+                let chat_jid =
+                    canonical_contact_jid(&shared, transport.as_ref(), &receipt.source.chat).await;
                 let recipient_jid = if state >= 2
                     && (!receipt.source.chat.is_group()
                         || receipt.source.sender != receipt.source.chat)
                 {
-                    Some(canonical_contact_jid(&shared, &client, &receipt.source.sender).await)
+                    Some(
+                        canonical_contact_jid(&shared, transport.as_ref(), &receipt.source.sender)
+                            .await,
+                    )
                 } else {
                     None
                 };
@@ -556,8 +580,10 @@ async fn handle_app_event(
         }
         Event::ChatPresence(update) => {
             let state = protocol_chat_state(update.state, update.media);
-            let chat_jid = canonical_contact_jid(&shared, &client, &update.source.chat).await;
-            let sender_jid = canonical_contact_jid(&shared, &client, &update.source.sender).await;
+            let chat_jid =
+                canonical_contact_jid(&shared, transport.as_ref(), &update.source.chat).await;
+            let sender_jid =
+                canonical_contact_jid(&shared, transport.as_ref(), &update.source.sender).await;
             let sender_name = shared
                 .database
                 .contact_name(&sender_jid)
@@ -574,7 +600,7 @@ async fn handle_app_event(
             });
         }
         Event::Presence(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.from).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.from).await;
             shared.publish(ServerEvent::Presence {
                 jid,
                 available: !update.unavailable,
@@ -582,7 +608,7 @@ async fn handle_app_event(
             });
         }
         Event::PictureUpdate(update) => {
-            let raw = canonical_contact_jid(&shared, &client, &update.jid).await;
+            let raw = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
             let jid = raw.parse::<Jid>().unwrap_or_else(|_| update.jid.clone());
             assets::remove_avatar(&shared.avatar_dir, &raw);
             if update.removed {
@@ -592,17 +618,17 @@ async fn handle_app_event(
                 }
                 shared.avatars_changed();
             } else {
-                jobs.spawn(refresh_avatar(shared, client, jid, true));
+                jobs.spawn(refresh_avatar(shared, transport, jid, true));
             }
         }
         Event::ContactUpdated(update) => {
             jobs.spawn(refresh_avatar(
                 Arc::clone(&shared),
-                Arc::clone(&client),
+                Arc::clone(&transport),
                 update.jid.clone(),
                 true,
             ));
-            jobs.spawn(sync_missing_contact_names(shared, client));
+            jobs.spawn(sync_missing_contact_names(shared, transport));
         }
         Event::ContactNumberChanged(update) => {
             let old = update.old_jid.to_non_ad_string();
@@ -623,14 +649,14 @@ async fn handle_app_event(
             assets::remove_avatar(&shared.avatar_dir, &old);
             jobs.spawn(refresh_avatar(
                 Arc::clone(&shared),
-                client,
+                transport,
                 update.new_jid.clone(),
                 true,
             ));
             broadcast_snapshot(&shared);
         }
         Event::ContactSyncRequested(_) => {
-            jobs.spawn(sync_missing_contact_names(shared, client));
+            jobs.spawn(sync_missing_contact_names(shared, transport));
         }
         Event::IncomingCall(call) => {
             let action = call.action.wire_tag();
@@ -657,7 +683,7 @@ async fn handle_app_event(
             info!(from = %call.from, outcome = ?call.outcome, "WhatsApp call ended on another device");
         }
         Event::PushNameUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
             if let Err(error) = shared
                 .database
                 .update_contact_name(&jid, &update.new_push_name)
@@ -672,13 +698,13 @@ async fn handle_app_event(
                 shared.connection_state().available,
                 shared.presence_sync_pending(),
             ) && !update.new_name.is_empty()
-                && let Err(error) = client.presence().set_available().await
+                && let Err(error) = transport.set_available().await
             {
                 warn!(%error, "could not restore deferred available WhatsApp presence");
             }
         }
         Event::PinUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
             if let Some(pinned) = update.action.pinned
                 && let Err(error) =
                     shared
@@ -690,7 +716,7 @@ async fn handle_app_event(
             broadcast_chats(&shared);
         }
         Event::MuteUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
             if let Some(muted) = update.action.muted
                 && let Err(error) = shared.database.apply_mute_at(
                     &jid,
@@ -703,7 +729,7 @@ async fn handle_app_event(
             }
         }
         Event::ArchiveUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
             if let Some(archived) = update.action.archived
                 && let Err(error) =
                     shared
@@ -715,7 +741,7 @@ async fn handle_app_event(
             broadcast_snapshot(&shared);
         }
         Event::MarkChatAsReadUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
             if let Some(read) = update.action.read {
                 let range = update.action.message_range.as_option();
                 let (boundary_timestamp, boundary_ids) = read_action_boundary(&update.action);
@@ -742,7 +768,7 @@ async fn handle_app_event(
             broadcast_snapshot(&shared);
         }
         Event::DeleteChatUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
             if let Err(error) = shared
                 .database
                 .delete_chat(&jid, update.timestamp.timestamp())
@@ -755,7 +781,7 @@ async fn handle_app_event(
             broadcast_snapshot(&shared);
         }
         Event::ClearChatUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
             if let Err(error) = shared
                 .database
                 .clear_chat(&jid, update.timestamp.timestamp())
@@ -769,7 +795,7 @@ async fn handle_app_event(
             broadcast_messages(&shared, &jid);
         }
         Event::DeleteMessageForMeUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.chat_jid).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.chat_jid).await;
             if let Err(error) = shared.database.delete_message(&jid, &update.message_id) {
                 warn!(%error, "could not apply WhatsApp message deletion");
             }
@@ -789,16 +815,22 @@ async fn handle_app_event(
                 )
                 .await;
             }
-            jobs.spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
+            jobs.spawn(sync_group_names(
+                Arc::clone(&shared),
+                Arc::clone(&transport),
+            ));
         }
         Event::DirtyState(details) => {
             info!(kind = ?details.dirty_type, "WhatsApp requested derived-state refresh");
-            jobs.spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
+            jobs.spawn(sync_group_names(
+                Arc::clone(&shared),
+                Arc::clone(&transport),
+            ));
             jobs.spawn(sync_missing_contact_names(
                 Arc::clone(&shared),
-                Arc::clone(&client),
+                Arc::clone(&transport),
             ));
-            jobs.spawn(sync_avatars(shared, client));
+            jobs.spawn(sync_avatars(shared, transport));
         }
         Event::IdentityChange(change) => {
             notification::send_event(
@@ -811,14 +843,14 @@ async fn handle_app_event(
             );
         }
         Event::BusinessStatusUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
+            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
             if let Some(name) = update.verified_name.as_deref()
                 && let Err(error) = shared.database.update_contact_name(&jid, name)
             {
                 warn!(%error, "could not update WhatsApp business name");
             }
             broadcast_chats(&shared);
-            jobs.spawn(refresh_avatar(shared, client, update.jid.clone(), true));
+            jobs.spawn(refresh_avatar(shared, transport, update.jid.clone(), true));
         }
         Event::StreamReplaced(_) => {
             *shared.client.write().await = None;
@@ -918,6 +950,7 @@ mod tests {
         seed_completed_app_state, synthetic_client, test_shared, test_shared_with_reducers,
         unread_message,
     };
+    use crate::transport::ClientTransport;
     use buffa::MessageField;
     use tokio::sync::{broadcast, oneshot};
     use whatsapp_rust::wacore::types::{
@@ -1033,7 +1066,8 @@ mod tests {
     #[tokio::test]
     async fn ordered_reducers_honor_stale_work_and_barriers() {
         let directory = tempfile::tempdir().unwrap();
-        let client = synthetic_client(&directory).await;
+        let transport: Arc<dyn Transport> =
+            Arc::new(ClientTransport(synthetic_client(&directory).await));
         let (events, _) = broadcast::channel(8);
         let (message_sender, message_queue) = mpsc::channel(8);
         let (app_sender, app_queue) = mpsc::channel(8);
@@ -1053,7 +1087,7 @@ mod tests {
             },
             false,
         );
-        *shared.client.write().await = Some(Arc::clone(&client));
+        *shared.client.write().await = Some(Arc::clone(&transport));
         assert_eq!(
             canonical_requested_jid(&shared, "1:2@s.whatsapp.net").await,
             "1@s.whatsapp.net"
@@ -1061,97 +1095,64 @@ mod tests {
         let message_task = tokio::spawn(run_message_reducer(Arc::clone(&shared), message_queue));
         let app_task = tokio::spawn(run_app_event_reducer(Arc::clone(&shared), app_queue));
 
+        let info = |chat: &str, id: &str, push_name: &str| MessageInfo {
+            source: whatsapp_rust::wacore::types::message::MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: chat.parse().unwrap(),
+                ..Default::default()
+            },
+            id: id.into(),
+            push_name: push_name.into(),
+            timestamp: Utc::now(),
+            ..Default::default()
+        };
+        let key = |chat: &str, id: &str| inbound::InboundKey {
+            chat_jid: chat.into(),
+            sender_jid: chat.into(),
+            message_id: id.into(),
+        };
+
         message_sender
             .send(MessageWork::Drain {
                 generation: generation.saturating_add(1),
-                client: Arc::clone(&client),
+                transport: Arc::clone(&transport),
             })
             .await
             .unwrap();
         message_sender
             .send(MessageWork::Drain {
                 generation,
-                client: Arc::clone(&client),
+                transport: Arc::clone(&transport),
             })
             .await
             .unwrap();
-        let context = MessageContext::from_parts(
-            &wa::Message::text("stale"),
-            &MessageInfo {
-                source: whatsapp_rust::wacore::types::message::MessageSource {
-                    chat: "1@s.whatsapp.net".parse().unwrap(),
-                    sender: "1@s.whatsapp.net".parse().unwrap(),
-                    ..Default::default()
-                },
-                id: "stale".into(),
-                timestamp: Utc::now(),
-                ..Default::default()
-            },
-            Arc::clone(&client),
-        );
         message_sender
             .send(MessageWork::Live {
                 generation: generation.saturating_add(1),
-                context: Box::new(context),
-                key: inbound::InboundKey {
-                    chat_jid: "1@s.whatsapp.net".into(),
-                    sender_jid: "1@s.whatsapp.net".into(),
-                    message_id: "stale".into(),
-                },
+                message: Arc::new(wa::Message::text("stale")),
+                info: Box::new(info("1@s.whatsapp.net", "stale", "")),
+                transport: Arc::clone(&transport),
+                key: key("1@s.whatsapp.net", "stale"),
             })
             .await
             .unwrap();
 
-        let current_context = MessageContext::from_parts(
-            &wa::Message::text("current"),
-            &MessageInfo {
-                source: whatsapp_rust::wacore::types::message::MessageSource {
-                    chat: "2@s.whatsapp.net".parse().unwrap(),
-                    sender: "2@s.whatsapp.net".parse().unwrap(),
-                    ..Default::default()
-                },
-                id: "current".into(),
-                push_name: "Synthetic".into(),
-                timestamp: Utc::now(),
-                ..Default::default()
-            },
-            Arc::clone(&client),
-        );
         reduce_message(
             &shared,
             generation,
-            current_context,
-            &inbound::InboundKey {
-                chat_jid: "2@s.whatsapp.net".into(),
-                sender_jid: "2@s.whatsapp.net".into(),
-                message_id: "current".into(),
-            },
+            Arc::new(wa::Message::text("current")),
+            info("2@s.whatsapp.net", "current", "Synthetic"),
+            Arc::clone(&transport),
+            &key("2@s.whatsapp.net", "current"),
         )
         .await;
-        let duplicate_context = MessageContext::from_parts(
-            &wa::Message::text("current"),
-            &MessageInfo {
-                source: whatsapp_rust::wacore::types::message::MessageSource {
-                    chat: "2@s.whatsapp.net".parse().unwrap(),
-                    sender: "2@s.whatsapp.net".parse().unwrap(),
-                    ..Default::default()
-                },
-                id: "current".into(),
-                push_name: "Synthetic".into(),
-                timestamp: Utc::now(),
-                ..Default::default()
-            },
-            Arc::clone(&client),
-        );
         reduce_message(
             &shared,
             generation,
-            duplicate_context,
-            &inbound::InboundKey {
-                chat_jid: "2@s.whatsapp.net".into(),
-                sender_jid: "2@s.whatsapp.net".into(),
-                message_id: "current".into(),
-            },
+            Arc::new(wa::Message::text("current")),
+            info("2@s.whatsapp.net", "current", "Synthetic"),
+            Arc::clone(&transport),
+            &key("2@s.whatsapp.net", "current"),
         )
         .await;
 
@@ -1159,30 +1160,13 @@ mod tests {
             .database
             .execute_test_sql("DROP TABLE inbound_inbox")
             .unwrap();
-        let no_inbox_context = MessageContext::from_parts(
-            &wa::Message::text("still durable locally"),
-            &MessageInfo {
-                source: whatsapp_rust::wacore::types::message::MessageSource {
-                    chat: "2@s.whatsapp.net".parse().unwrap(),
-                    sender: "2@s.whatsapp.net".parse().unwrap(),
-                    ..Default::default()
-                },
-                id: "no-inbox".into(),
-                push_name: "Synthetic".into(),
-                timestamp: Utc::now(),
-                ..Default::default()
-            },
-            Arc::clone(&client),
-        );
         reduce_message(
             &shared,
             generation,
-            no_inbox_context,
-            &inbound::InboundKey {
-                chat_jid: "2@s.whatsapp.net".into(),
-                sender_jid: "2@s.whatsapp.net".into(),
-                message_id: "no-inbox".into(),
-            },
+            Arc::new(wa::Message::text("still durable locally")),
+            info("2@s.whatsapp.net", "no-inbox", "Synthetic"),
+            Arc::clone(&transport),
+            &key("2@s.whatsapp.net", "no-inbox"),
         )
         .await;
         let (barrier, drained) = oneshot::channel();
@@ -1208,7 +1192,7 @@ mod tests {
                         .offline(false)
                         .build(),
                 )),
-                client: Arc::clone(&client),
+                transport: Arc::clone(&transport),
                 jobs: Arc::new(GenerationJobs::default()),
             })
             .await

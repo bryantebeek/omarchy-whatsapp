@@ -19,6 +19,7 @@ mod revisions;
 mod state;
 mod sync;
 mod text_outbox;
+mod transport;
 mod util;
 mod voice_outbox;
 
@@ -39,6 +40,7 @@ use crate::sync::{
     backfill_video_previews, prepare_contact_name_resync, prepare_event_state_resync,
     request_missing_contact_history, sync_avatars, sync_group_names, sync_missing_contact_names,
 };
+use crate::transport::{ClientTransport, Transport};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Parser;
@@ -333,7 +335,8 @@ async fn run_daemon() -> Result<()> {
                     if !shared.clock.is_current(generation) {
                         return;
                     }
-                    *shared.client.write().await = Some(Arc::clone(&client));
+                    let transport: Arc<dyn Transport> = Arc::new(ClientTransport(client));
+                    *shared.client.write().await = Some(Arc::clone(&transport));
                     shared.set_status(ConnectionStatus::Connected).await;
                     info!("connected to WhatsApp");
                     if let Err(error) = shared.database.retry_all_text_messages() {
@@ -345,7 +348,7 @@ async fn run_daemon() -> Result<()> {
                         .message_reducer
                         .send(MessageWork::Drain {
                             generation,
-                            client: Arc::clone(&client),
+                            transport: Arc::clone(&transport),
                         })
                         .await;
                     let connected_shared = Arc::clone(&shared);
@@ -359,20 +362,24 @@ async fn run_daemon() -> Result<()> {
                         .await;
                     });
                     let alias_shared = Arc::clone(&shared);
-                    let alias_client = Arc::clone(&client);
+                    let alias_transport = Arc::clone(&transport);
                     connected_jobs.spawn(async move {
-                        reconcile_direct_chat_aliases(&alias_shared, &alias_client).await;
+                        reconcile_direct_chat_aliases(&alias_shared, alias_transport.as_ref())
+                            .await;
                         broadcast_snapshot(&alias_shared);
                     });
                     if !shared.event_sync_marker.exists() {
                         connected_jobs.spawn(await_app_state_sync(Arc::clone(&shared), generation));
                     }
-                    connected_jobs
-                        .spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
-                    connected_jobs.spawn(sync_avatars(Arc::clone(&shared), Arc::clone(&client)));
+                    connected_jobs.spawn(sync_group_names(
+                        Arc::clone(&shared),
+                        Arc::clone(&transport),
+                    ));
+                    connected_jobs.spawn(sync_avatars(Arc::clone(&shared), Arc::clone(&transport)));
                     connected_jobs.spawn(async move {
-                        sync_missing_contact_names(Arc::clone(&shared), Arc::clone(&client)).await;
-                        request_missing_contact_history(shared, client).await;
+                        sync_missing_contact_names(Arc::clone(&shared), Arc::clone(&transport))
+                            .await;
+                        request_missing_contact_history(shared, transport).await;
                     });
                 }
             })
@@ -423,7 +430,7 @@ async fn run_daemon() -> Result<()> {
                         shared,
                         generation,
                         event,
-                        client,
+                        Arc::new(ClientTransport(client)),
                         Arc::clone(&history_jobs),
                     ));
                 }
@@ -435,7 +442,12 @@ async fn run_daemon() -> Result<()> {
                     if !shared.clock.is_current(generation) {
                         return;
                     }
-                    contact_jobs.spawn(process_contact_event(shared, generation, event, client));
+                    contact_jobs.spawn(process_contact_event(
+                        shared,
+                        generation,
+                        event,
+                        Arc::new(ClientTransport(client)),
+                    ));
                 }
             })
             .on_event_for(&[EventKind::GroupUpdate], move |event, client| {
@@ -445,7 +457,12 @@ async fn run_daemon() -> Result<()> {
                     if !shared.clock.is_current(generation) {
                         return;
                     }
-                    group_jobs.spawn(process_group_event(shared, generation, event, client));
+                    group_jobs.spawn(process_group_event(
+                        shared,
+                        generation,
+                        event,
+                        Arc::new(ClientTransport(client)),
+                    ));
                 }
             })
             .on_event_for(APP_EVENT_KINDS, move |event, client| {
@@ -460,7 +477,7 @@ async fn run_daemon() -> Result<()> {
                         .send(AppEventWork {
                             generation,
                             event,
-                            client,
+                            transport: Arc::new(ClientTransport(client)),
                             jobs: Arc::clone(&app_event_jobs),
                         })
                         .await
@@ -475,16 +492,21 @@ async fn run_daemon() -> Result<()> {
                     if !shared.clock.is_current(generation) {
                         return;
                     }
+                    let message = context.message;
+                    let info = context.info;
+                    let transport: Arc<dyn Transport> = Arc::new(ClientTransport(context.client));
                     let key = inbound::InboundKey {
-                        chat_jid: context.info.source.chat.to_string(),
-                        sender_jid: context.info.source.sender.to_string(),
-                        message_id: context.info.id.clone(),
+                        chat_jid: info.source.chat.to_string(),
+                        sender_jid: info.source.sender.to_string(),
+                        message_id: info.id.clone(),
                     };
                     if let Err(error) = shared
                         .message_reducer
                         .send(MessageWork::Live {
                             generation,
-                            context: Box::new(context),
+                            message,
+                            info: Box::new(info),
+                            transport,
                             key,
                         })
                         .await

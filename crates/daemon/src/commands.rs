@@ -11,6 +11,7 @@ use crate::state::{
     voice_outbox_event,
 };
 use crate::sync::refresh_avatar;
+use crate::transport::Transport;
 use crate::{assets, database, jobs, text_outbox, voice_outbox};
 use anyhow::{Context, Result, anyhow, bail};
 use buffa::Message as _;
@@ -24,9 +25,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::warn;
 use whatsapp_rust::prelude::*;
-use whatsapp_rust::wacore::download::MediaType;
 use whatsapp_rust::wacore_binary::JidExt;
-use whatsapp_rust::{SendOptions, UploadOptions, media};
+use whatsapp_rust::{SendOptions, media};
 
 pub(crate) async fn canonical_requested_jid(shared: &Shared, raw: &str) -> String {
     let Ok(jid) = raw.parse::<Jid>() else {
@@ -34,7 +34,7 @@ pub(crate) async fn canonical_requested_jid(shared: &Shared, raw: &str) -> Strin
     };
     let client = shared.client.read().await.clone();
     match client {
-        Some(client) => canonical_contact_jid(shared, &client, &jid).await,
+        Some(client) => canonical_contact_jid(shared, client.as_ref(), &jid).await,
         None => jid.to_non_ad_string(),
     }
 }
@@ -42,7 +42,7 @@ pub(crate) async fn canonical_requested_jid(shared: &Shared, raw: &str) -> Strin
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn media_download_payload(
     shared: &Arc<Shared>,
-    client: &Arc<Client>,
+    transport: &Arc<dyn Transport>,
     chat_jid: &str,
     message_id: &str,
     media_label: &str,
@@ -56,10 +56,10 @@ async fn media_download_payload(
         .message_history_cursor(chat_jid, message_id)?
         .ok_or_else(|| anyhow!("{media_label} message is no longer in local history"))?;
     let jid: Jid = chat_jid.parse().context("invalid media chat JID")?;
-    request_exact_message(client, &cursor)
+    request_exact_message(transport.as_ref(), &cursor)
         .await
         .with_context(|| format!("requesting exact {media_label} message"))?;
-    client
+    transport
         .fetch_message_history(
             &jid,
             &cursor.message_id,
@@ -124,7 +124,7 @@ async fn start_media_download(
     if message_id.is_empty() || message_id.len() > 512 {
         bail!("invalid media message ID");
     }
-    let client = shared
+    let transport = shared
         .client
         .read()
         .await
@@ -160,7 +160,7 @@ async fn start_media_download(
                 .context("media download queue is closed")?;
             tokio::time::timeout(
                 jobs::MEDIA_DOWNLOAD_TIMEOUT,
-                perform_media_download(&shared, client, &chat_jid, &message_id, kind),
+                perform_media_download(&shared, transport, &chat_jid, &message_id, kind),
             )
             .await
             .map_err(|_| anyhow!("{label} download timed out"))?
@@ -189,13 +189,13 @@ async fn start_media_download(
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn perform_media_download(
     shared: &Arc<Shared>,
-    client: Arc<Client>,
+    transport: Arc<dyn Transport>,
     chat_jid: &str,
     message_id: &str,
     kind: MediaDownloadKind,
 ) -> Result<MessageMedia> {
     let payload =
-        media_download_payload(shared, &client, chat_jid, message_id, kind.label()).await?;
+        media_download_payload(shared, &transport, chat_jid, message_id, kind.label()).await?;
     match kind {
         MediaDownloadKind::Image => {
             let image = wa::message::ImageMessage::decode_from_slice(&payload)
@@ -222,7 +222,7 @@ async fn perform_media_download(
             shared
                 .database
                 .update_message_media(chat_jid, message_id, &media)?;
-            assets::download_message_image(client, image, path).await?;
+            assets::download_message_image(transport, image, path).await?;
             if let MessageMedia::Image { downloaded, .. } = &mut media {
                 *downloaded = true;
             }
@@ -258,7 +258,7 @@ async fn perform_media_download(
             shared
                 .database
                 .update_message_media(chat_jid, message_id, &media)?;
-            assets::download_message_sticker(client, sticker, path).await?;
+            assets::download_message_sticker(transport, sticker, path).await?;
             if let MessageMedia::Sticker { downloaded, .. } = &mut media {
                 *downloaded = true;
             }
@@ -297,7 +297,7 @@ async fn perform_media_download(
             shared
                 .database
                 .update_message_media(chat_jid, message_id, &media)?;
-            assets::download_message_video(client, video, path.clone()).await?;
+            assets::download_message_video(transport, video, path.clone()).await?;
             let preview_result = tokio::task::spawn_blocking(move || {
                 assets::ensure_message_video_thumbnail(&path, &thumbnail_path)
             })
@@ -336,7 +336,7 @@ async fn perform_media_download(
             shared
                 .database
                 .update_message_media(chat_jid, message_id, &media)?;
-            assets::download_message_audio(client, audio, path).await?;
+            assets::download_message_audio(transport, audio, path).await?;
             if let MessageMedia::Audio { downloaded, .. } = &mut media {
                 *downloaded = true;
             }
@@ -350,14 +350,18 @@ async fn perform_media_download(
 // identity so the in-flight set already deduplicates a contact's LID and
 // phone-number forms.
 #[cfg_attr(coverage_nightly, coverage(off))]
-async fn fetch_requested_avatar(shared: &Arc<Shared>, client: Arc<Client>, canonical: Jid) {
+async fn fetch_requested_avatar(
+    shared: &Arc<Shared>,
+    transport: Arc<dyn Transport>,
+    canonical: Jid,
+) {
     let Ok(_permit) = shared.avatar_fetch_permits.acquire().await else {
         return;
     };
     let canonical_jid = canonical.to_non_ad_string();
     if tokio::time::timeout(
         jobs::AVATAR_FETCH_TIMEOUT,
-        refresh_avatar(Arc::clone(shared), client, canonical, false),
+        refresh_avatar(Arc::clone(shared), transport, canonical, false),
     )
     .await
     .is_err()
@@ -368,7 +372,7 @@ async fn fetch_requested_avatar(shared: &Arc<Shared>, client: Arc<Client>, canon
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn request_exact_message(
-    client: &Arc<Client>,
+    transport: &dyn Transport,
     cursor: &database::HistoryCursor,
 ) -> Result<()> {
     let chat: Jid = cursor
@@ -397,7 +401,7 @@ async fn request_exact_message(
         timestamp,
         ..Default::default()
     });
-    client.send_pdo_placeholder_resend_request(&info).await
+    transport.request_placeholder_resend(&info).await
 }
 
 async fn finish_recovery_attempt(shared: &Shared, recovery_key: &str, succeeded: bool) -> bool {
@@ -416,7 +420,7 @@ async fn finish_recovery_attempt(shared: &Shared, recovery_key: &str, succeeded:
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn schedule_message_recovery(
     shared: &Arc<Shared>,
-    client: Arc<Client>,
+    transport: Arc<dyn Transport>,
     cursor: database::HistoryCursor,
     recovery_key: String,
     label: &'static str,
@@ -425,10 +429,10 @@ fn schedule_message_recovery(
     let generation = shared.clock.generation();
     tokio::spawn(async move {
         let chat = cursor.chat_jid.parse::<Jid>();
-        let exact_result = request_exact_message(&client, &cursor).await;
+        let exact_result = request_exact_message(transport.as_ref(), &cursor).await;
         let history_result = match chat {
             Ok(chat) => {
-                client
+                transport
                     .fetch_message_history(
                         &chat,
                         &cursor.message_id,
@@ -556,7 +560,7 @@ async fn send_voice_message(
     };
     broadcast_voice_outbox(shared);
     let result: Result<Message> = async {
-        let client = shared
+        let transport = shared
             .client
             .read()
             .await
@@ -567,13 +571,13 @@ async fn send_voice_message(
             .chat_jid
             .parse()
             .context("invalid persisted voice message chat JID")?;
-        let canonical = canonical_contact_jid(shared, &client, &requested).await;
+        let canonical = canonical_contact_jid(shared, transport.as_ref(), &requested).await;
         let jid: Jid = canonical.parse().context("invalid canonical chat JID")?;
         let delivery_id = prepared
             .job
             .message_id
             .clone()
-            .unwrap_or_else(|| client.generate_message_id());
+            .unwrap_or_else(|| transport.generate_message_id());
         let canonical_jid = jid.to_non_ad_string();
         let assigned_jid = canonical_jid.clone();
         let assigned_delivery_id = delivery_id.clone();
@@ -594,27 +598,22 @@ async fn send_voice_message(
         {
             return Ok(message);
         }
-        let upload = client
-            .upload(
+        let duration_seconds =
+            u32::try_from(prepared.job.duration_ms.div_ceil(1_000)).unwrap_or(u32::MAX);
+        let outbound = transport
+            .upload_audio_message(
                 std::mem::take(&mut prepared.bytes),
-                MediaType::Audio,
-                UploadOptions::new(),
+                media::AudioOptions {
+                    mimetype: Some("audio/ogg; codecs=opus".into()),
+                    duration_seconds: Some(duration_seconds),
+                    ptt: Some(true),
+                    ..Default::default()
+                },
             )
             .await
             .context("uploading voice message")?;
-        let duration_seconds =
-            u32::try_from(prepared.job.duration_ms.div_ceil(1_000)).unwrap_or(u32::MAX);
-        let outbound = media::audio_message(
-            upload,
-            media::AudioOptions {
-                mimetype: Some("audio/ogg; codecs=opus".into()),
-                duration_seconds: Some(duration_seconds),
-                ptt: Some(true),
-                ..Default::default()
-            },
-        );
-        let sent = client
-            .send_message_with_options(
+        let sent = transport
+            .send_message(
                 &jid,
                 outbound,
                 SendOptions::default().with_message_id(&delivery_id),
@@ -771,15 +770,14 @@ pub(crate) async fn handle_command(
                 .clone()
                 .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
             let info = client
-                .groups()
-                .get_metadata(&jid)
+                .group_metadata(&jid)
                 .await
                 .context("loading WhatsApp group participants")?;
             Ok(ServerEvent::GroupParticipants {
                 chat_jid: jid.to_non_ad_string(),
                 participants: resolve_group_participants(
                     shared,
-                    &client,
+                    client.as_ref(),
                     info.participants
                         .into_iter()
                         .map(group_participant_identity)
@@ -909,12 +907,11 @@ pub(crate) async fn handle_command(
                 .clone()
                 .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
             let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
-            let canonical = canonical_contact_jid(shared, &client, &requested).await;
+            let canonical = canonical_contact_jid(shared, client.as_ref(), &requested).await;
             let jid: Jid = canonical.parse().context("invalid canonical chat JID")?;
-            let creator_jid = own_poll_creator_jid(&client, &jid).await?;
+            let creator_jid = own_poll_creator_jid(client.as_ref(), &jid).await?;
             let (result, message_secret) = if let Some(correct_index) = correct_option_index {
                 client
-                    .polls()
                     .create_quiz(
                         jid.clone(),
                         &question,
@@ -924,8 +921,7 @@ pub(crate) async fn handle_command(
                     .await?
             } else {
                 client
-                    .polls()
-                    .create(jid.clone(), &question, &options, selectable_count)
+                    .create_poll(jid.clone(), &question, &options, selectable_count)
                     .await?
             };
             let message = Message {
@@ -1029,8 +1025,7 @@ pub(crate) async fn handle_command(
                 .parse()
                 .context("stored poll creator JID is invalid")?;
             client
-                .polls()
-                .vote(
+                .vote_poll(
                     jid,
                     &message_id,
                     &creator_jid,
@@ -1074,7 +1069,7 @@ pub(crate) async fn handle_command(
                 .clone()
                 .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
             let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
-            let chat_jid = canonical_contact_jid(shared, &client, &requested).await;
+            let chat_jid = canonical_contact_jid(shared, client.as_ref(), &requested).await;
             let chat: Jid = chat_jid.parse().context("invalid canonical chat JID")?;
             let participant = if chat.is_group() {
                 if target_from_me {
@@ -1136,12 +1131,12 @@ pub(crate) async fn handle_command(
                 .clone()
                 .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
             let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
-            let chat_jid = canonical_contact_jid(shared, &client, &requested).await;
+            let chat_jid = canonical_contact_jid(shared, client.as_ref(), &requested).await;
             let chat: Jid = chat_jid.parse().context("invalid canonical chat JID")?;
             if pinned {
-                client.chat_actions().pin_chat(&chat).await?;
+                client.pin_chat(&chat).await?;
             } else {
-                client.chat_actions().unpin_chat(&chat).await?;
+                client.unpin_chat(&chat).await?;
             }
             shared
                 .database
@@ -1160,7 +1155,7 @@ pub(crate) async fn handle_command(
             // Resolve the alias first: the shell renders the same contact under
             // its LID and its phone number, and deduplicating the raw string
             // would fetch that one avatar twice.
-            let canonical = canonical_contact_jid(shared, &client, &requested).await;
+            let canonical = canonical_contact_jid(shared, client.as_ref(), &requested).await;
             let target: Jid = canonical.parse().context("invalid canonical avatar JID")?;
             {
                 // Avatar requests are advisory: a queued or dropped one is
@@ -1187,7 +1182,9 @@ pub(crate) async fn handle_command(
                 Some(chat_jid) => {
                     let requested: Jid = chat_jid.parse().context("invalid active chat JID")?;
                     Some(match client.as_ref() {
-                        Some(client) => canonical_contact_jid(shared, client, &requested).await,
+                        Some(client) => {
+                            canonical_contact_jid(shared, client.as_ref(), &requested).await
+                        }
                         None => requested.to_non_ad_string(),
                     })
                 }
@@ -1210,14 +1207,14 @@ pub(crate) async fn handle_command(
                 .clone()
                 .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
             let requested: Jid = chat_jid.parse().context("invalid chat-state JID")?;
-            let canonical = canonical_contact_jid(shared, &client, &requested).await;
+            let canonical = canonical_contact_jid(shared, client.as_ref(), &requested).await;
             let jid: Jid = canonical
                 .parse()
                 .context("invalid canonical chat-state JID")?;
             match state {
-                ChatState::Typing => client.chatstate().send_composing(&jid).await?,
-                ChatState::Recording => client.chatstate().send_recording(&jid).await?,
-                ChatState::Paused => client.chatstate().send_paused(&jid).await?,
+                ChatState::Typing => client.send_composing(&jid).await?,
+                ChatState::Recording => client.send_recording(&jid).await?,
+                ChatState::Paused => client.send_paused(&jid).await?,
             }
             Ok(ServerEvent::Ack)
         }

@@ -5,7 +5,7 @@ use buffa::Message as _;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use whatsapp_rust::InboundDurabilityHook;
-use whatsapp_rust::prelude::{Client, InboundMessage, MessageContext};
+use whatsapp_rust::prelude::{Client, InboundMessage};
 use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
 use whatsapp_rust::waproto::whatsapp as wa;
 
@@ -49,7 +49,10 @@ impl DurableInbound {
         }
     }
 
-    fn decode(&self) -> Result<(Arc<wa::Message>, MessageInfo)> {
+    /// Rebuilds the protobuf payload and its envelope from the durable row.
+    /// The reducer pairs them with the current generation's transport instead
+    /// of storing a client handle in the inbox.
+    pub fn decode_parts(&self) -> Result<(Arc<wa::Message>, MessageInfo)> {
         let chat = self
             .key
             .chat_jid
@@ -82,11 +85,6 @@ impl DurableInbound {
             ..MessageInfo::default()
         };
         Ok((message, info))
-    }
-
-    pub fn rehydrate_context(&self, client: Arc<Client>) -> Result<MessageContext> {
-        let (message, info) = self.decode()?;
-        Ok(MessageContext::from_arc(message, &info, client))
     }
 }
 
@@ -186,22 +184,22 @@ mod tests {
     fn malformed_durable_records_are_rejected_before_reduction() {
         let mut record = DurableInbound::from_inbound(&synthetic_inbound(), 50);
         record.key.chat_jid = "not a jid".into();
-        let error = record.decode().unwrap_err();
+        let error = record.decode_parts().unwrap_err();
         assert!(!error.to_string().is_empty());
 
         let mut record = DurableInbound::from_inbound(&synthetic_inbound(), 50);
         record.key.sender_jid = "not a jid".into();
-        assert!(record.decode().is_err());
+        assert!(record.decode_parts().is_err());
 
         let mut record = DurableInbound::from_inbound(&synthetic_inbound(), 50);
         record.timestamp = i64::MAX;
-        assert!(record.decode().is_err());
+        assert!(record.decode_parts().is_err());
         let mut record = DurableInbound::from_inbound(&synthetic_inbound(), 50);
         record.message = vec![0xff];
-        assert!(record.decode().is_err());
+        assert!(record.decode_parts().is_err());
 
         let record = DurableInbound::from_inbound(&synthetic_inbound(), 50);
-        let (decoded, info) = record.decode().unwrap();
+        let (decoded, info) = record.decode_parts().unwrap();
         assert_eq!(decoded.text_content(), Some("synthetic"));
         assert_eq!(info.id, "same-id");
     }
@@ -228,13 +226,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_record_reconstructs_context_and_trait_hook_commits() {
+    async fn durable_record_decodes_its_parts_and_the_trait_hook_commits() {
         let directory = tempdir().unwrap();
         let client = synthetic_client(&directory).await;
         let record = DurableInbound::from_inbound(&synthetic_inbound(), 80);
-        let context = record.rehydrate_context(Arc::clone(&client)).unwrap();
-        assert_eq!(context.info.id, "same-id");
-        assert_eq!(context.message.text_content(), Some("synthetic"));
+        let (message, info) = record.decode_parts().unwrap();
+        assert_eq!(info.id, "same-id");
+        assert_eq!(message.text_content(), Some("synthetic"));
 
         let database = Arc::new(Database::open(&directory.path().join("history.db")).unwrap());
         let hook = DurableInboundHook::new(Arc::clone(&database));

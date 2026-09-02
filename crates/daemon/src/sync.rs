@@ -3,6 +3,7 @@
 
 use crate::assets;
 use crate::state::{Shared, broadcast_chats, broadcast_messages, write_private_marker};
+use crate::transport::Transport;
 use crate::util::nonempty;
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -15,9 +16,9 @@ use whatsapp_rust::wacore_binary::JidExt;
 const AVATAR_SYNC_LIMIT: u32 = 1_000;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub(crate) async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
+pub(crate) async fn sync_group_names(shared: Arc<Shared>, transport: Arc<dyn Transport>) {
     let _guard = shared.group_name_sync.lock().await;
-    match client.groups().get_participating().await {
+    match transport.participating_groups().await {
         Ok(groups) => {
             let mut updated = 0usize;
             for (jid, metadata) in groups {
@@ -45,7 +46,7 @@ pub(crate) async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
                 let Ok(jid) = raw_jid.parse::<Jid>() else {
                     continue;
                 };
-                match client.groups().get_metadata(&jid).await {
+                match transport.group_metadata(&jid).await {
                     Ok(metadata) => {
                         if nonempty(&metadata.subject).is_none() {
                             warn!(%jid, "WhatsApp returned an empty group subject");
@@ -77,7 +78,7 @@ pub(crate) async fn sync_group_names(shared: Arc<Shared>, client: Arc<Client>) {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub(crate) async fn sync_missing_contact_names(shared: Arc<Shared>, client: Arc<Client>) {
+pub(crate) async fn sync_missing_contact_names(shared: Arc<Shared>, transport: Arc<dyn Transport>) {
     let unresolved = match shared.database.unresolved_chat_jids(false, 100) {
         Ok(unresolved) => unresolved,
         Err(error) => {
@@ -94,16 +95,11 @@ pub(crate) async fn sync_missing_contact_names(shared: Arc<Shared>, client: Arc<
         return;
     }
 
-    match client.contacts().get_user_info(&jids).await {
+    match transport.user_info(&jids).await {
         Ok(infos) => {
             let mut updated = 0usize;
             for info in infos.into_values() {
-                let Some(name) = info
-                    .verified_name
-                    .as_ref()
-                    .and_then(|verified| verified.name.as_deref())
-                    .and_then(nonempty)
-                else {
+                let Some(name) = info.verified_name.as_deref().and_then(nonempty) else {
                     continue;
                 };
                 let mut candidates = vec![info.jid.to_non_ad_string()];
@@ -132,7 +128,7 @@ pub(crate) async fn sync_missing_contact_names(shared: Arc<Shared>, client: Arc<
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn refresh_avatar(
     shared: Arc<Shared>,
-    client: Arc<Client>,
+    transport: Arc<dyn Transport>,
     jid: Jid,
     force: bool,
 ) {
@@ -144,7 +140,7 @@ pub(crate) async fn refresh_avatar(
     {
         return;
     }
-    match assets::fetch_avatar(client, shared.avatar_dir.clone(), jid).await {
+    match assets::fetch_avatar(transport, shared.avatar_dir.clone(), jid).await {
         Ok(changed) => {
             if changed || force {
                 shared.avatars_changed();
@@ -155,7 +151,7 @@ pub(crate) async fn refresh_avatar(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub(crate) async fn sync_avatars(shared: Arc<Shared>, client: Arc<Client>) {
+pub(crate) async fn sync_avatars(shared: Arc<Shared>, transport: Arc<dyn Transport>) {
     // Connected can precede the initial history import on a fresh link. Keep
     // sync passes serialized so a pass queued by each history chunk observes
     // the chats imported by the preceding pass without fetching duplicates.
@@ -180,8 +176,8 @@ pub(crate) async fn sync_avatars(shared: Arc<Shared>, client: Arc<Client>) {
     let total = jids.len();
     futures::stream::iter(jids.into_iter().map(|jid| {
         let shared = Arc::clone(&shared);
-        let client = Arc::clone(&client);
-        async move { refresh_avatar(shared, client, jid, false).await }
+        let transport = Arc::clone(&transport);
+        async move { refresh_avatar(shared, transport, jid, false).await }
     }))
     .buffer_unordered(4)
     .collect::<Vec<_>>()
@@ -209,7 +205,10 @@ pub(crate) async fn backfill_video_previews(shared: Arc<Shared>) {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub(crate) async fn request_missing_contact_history(shared: Arc<Shared>, client: Arc<Client>) {
+pub(crate) async fn request_missing_contact_history(
+    shared: Arc<Shared>,
+    transport: Arc<dyn Transport>,
+) {
     if shared.contact_history_marker.exists() {
         return;
     }
@@ -245,7 +244,7 @@ pub(crate) async fn request_missing_contact_history(shared: Arc<Shared>, client:
             warn!(jid = %cursor.chat_jid, "could not parse chat for history recovery");
             continue;
         };
-        match client
+        match transport
             .fetch_message_history(
                 &jid,
                 &cursor.message_id,

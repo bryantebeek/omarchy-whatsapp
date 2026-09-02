@@ -1,9 +1,10 @@
-// Inbound message modelling: the live `MessageContext` adapter and the pure
-// decoders that turn WhatsApp protobuf payloads into the local UI model.
+// Inbound message modelling: the live reduction adapter and the pure decoders
+// that turn WhatsApp protobuf payloads into the local UI model.
 
 use crate::history::option_names_for_hashes;
 use crate::identity::canonical_contact_jid;
 use crate::state::{Shared, broadcast_messages};
+use crate::transport::Transport;
 use crate::util::nonempty;
 use crate::{assets, database, notification};
 use buffa::Message as _;
@@ -23,14 +24,16 @@ impl Shared {
     pub(crate) async fn receive_message(
         self: &Arc<Self>,
         generation: u64,
-        context: MessageContext,
+        message: Arc<wa::Message>,
+        info: MessageInfo,
+        transport: Arc<dyn Transport>,
     ) -> bool {
-        let info = &context.info;
+        let info = &info;
         if info.source.chat.is_status_broadcast() || info.source.chat.is_newsletter() {
             return true;
         }
-        let chat_jid = canonical_contact_jid(self, &context.client, &info.source.chat).await;
-        let sender_jid = canonical_contact_jid(self, &context.client, &info.source.sender).await;
+        let chat_jid = canonical_contact_jid(self, transport.as_ref(), &info.source.chat).await;
+        let sender_jid = canonical_contact_jid(self, transport.as_ref(), &info.source.sender).await;
         let push_name = nonempty(&info.push_name).unwrap_or_else(|| sender_jid.clone());
         if push_name != sender_jid
             && let Err(error) = self.database.update_contact_name(&sender_jid, &push_name)
@@ -47,10 +50,8 @@ impl Shared {
         let chat_name = if info.source.is_group {
             match existing_name {
                 Some(name) if name != chat_jid => name,
-                _ => context
-                    .client
-                    .groups()
-                    .get_metadata(&info.source.chat)
+                _ => transport
+                    .group_metadata(&info.source.chat)
                     .await
                     .ok()
                     .and_then(|metadata| nonempty(&metadata.subject))
@@ -64,7 +65,7 @@ impl Shared {
         if !self.clock.is_current(generation) {
             return false;
         }
-        if let Some(reaction) = find_reaction_message(&context.message)
+        if let Some(reaction) = find_reaction_message(&message)
             && let Some(target) = reaction.key.as_option()
             && let Some(message_id) = target.id.as_deref()
         {
@@ -98,7 +99,7 @@ impl Shared {
             };
             return persisted;
         }
-        let base = context.message.get_base_message();
+        let base = message.get_base_message();
         if let Some(update) = base.poll_update_message.as_option() {
             let Some(target_id) = update
                 .poll_creation_message_key
@@ -140,10 +141,8 @@ impl Shared {
                 }
             };
             let raw_voter = info.source.sender.to_non_ad();
-            let hashes = match context
-                .client
-                .polls()
-                .decrypt_vote(
+            let hashes = match transport
+                .decrypt_poll_vote(
                     whatsapp_rust::PollVoteCiphertext {
                         enc_payload,
                         enc_iv,
@@ -217,7 +216,7 @@ impl Shared {
                 "ignored non-renderable WhatsApp control message");
             return true;
         };
-        let message = Message {
+        let persisted_message = Message {
             id: info.id.clone(),
             chat_jid: chat_jid.clone(),
             sender_jid,
@@ -237,28 +236,32 @@ impl Shared {
             return false;
         }
         let focused = self.chat_is_focused(&chat_jid);
-        let unread = !message.from_me && !focused;
-        let insert_result = if focused && !message.from_me {
+        let unread = !persisted_message.from_me && !focused;
+        let insert_result = if focused && !persisted_message.from_me {
             self.database.insert_message_with_read_intent(
-                &message,
+                &persisted_message,
                 &chat_name,
                 info.source.is_group,
                 &database::UnreadReceipt {
-                    message_id: message.id.clone(),
-                    sender_jid: message.sender_jid.clone(),
+                    message_id: persisted_message.id.clone(),
+                    sender_jid: persisted_message.sender_jid.clone(),
                     is_group: info.source.is_group,
                 },
             )
         } else {
-            self.database
-                .insert_message(&message, &chat_name, info.source.is_group, unread)
+            self.database.insert_message(
+                &persisted_message,
+                &chat_name,
+                info.source.is_group,
+                unread,
+            )
         };
-        if insert_result.is_ok() && focused && !message.from_me {
+        if insert_result.is_ok() && focused && !persisted_message.from_me {
             self.read_outbox_notify.notify_one();
         }
         if insert_result.is_ok()
-            && matches!(message.media, Some(MessageMedia::Poll { .. }))
-            && let Some(secret) = message_secret(&context.message, base)
+            && matches!(persisted_message.media, Some(MessageMedia::Poll { .. }))
+            && let Some(secret) = message_secret(&message, base)
             && let Err(error) = self.database.store_poll_secret(
                 &chat_jid,
                 &info.id,
@@ -316,7 +319,7 @@ impl Shared {
         match insert_result {
             Ok(true) => {
                 self.publish(ServerEvent::Message {
-                    message: message.clone(),
+                    message: persisted_message.clone(),
                 });
                 let total = self.unread_total_or_zero();
                 self.publish(ServerEvent::Unread { total });
@@ -327,11 +330,11 @@ impl Shared {
                         .is_muted(&chat_jid, Utc::now().timestamp())
                         .unwrap_or(false)
                 {
-                    notification::send(&message, &chat_name, info.source.is_group);
+                    notification::send(&persisted_message, &chat_name, info.source.is_group);
                 }
                 if let Some(document) = base.document_message.as_option().cloned() {
                     let shared = Arc::clone(self);
-                    let client = Arc::clone(&context.client);
+                    let transport = Arc::clone(&transport);
                     let path = assets::message_document_path(
                         &self.media_dir,
                         &chat_jid,
@@ -340,7 +343,7 @@ impl Shared {
                     );
                     let media_chat_jid = chat_jid.clone();
                     tokio::spawn(async move {
-                        match assets::download_message_document(client, document, path).await {
+                        match assets::download_message_document(transport, document, path).await {
                             Ok(true) if shared.clock.is_current(generation) => {
                                 broadcast_messages(&shared, &media_chat_jid);
                             }
@@ -354,10 +357,10 @@ impl Shared {
                 true
             }
             Ok(false) => {
-                if let Some(media) = &message.media
+                if let Some(media) = &persisted_message.media
                     && self
                         .database
-                        .update_message_media(&chat_jid, &message.id, media)
+                        .update_message_media(&chat_jid, &persisted_message.id, media)
                         .unwrap_or(false)
                 {
                     broadcast_messages(self, &chat_jid);
