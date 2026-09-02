@@ -50,15 +50,15 @@ TestCase {
     compare(panel.sidebarChatActivity(service.selectedChat), "")
     service.groupParticipantsError = "failed"
     compare(panel.groupConversationSubtitle(), "Participants unavailable")
-    compare(panel.licenseKindLabel("project"), "Application")
-    compare(panel.licenseKindLabel("asset"), "Bundled asset")
-    compare(panel.licenseKindLabel("crate"), "Rust package")
-    panel.licenseEntries = [
+    compare(panel.licenseViewer.kindLabel("project"), "Application")
+    compare(panel.licenseViewer.kindLabel("asset"), "Bundled asset")
+    compare(panel.licenseViewer.kindLabel("crate"), "Rust package")
+    panel.licenseViewer.entries = [
       { name: "Alpha", version: "1.0", license: "MIT" },
       { name: "Beta", version: "2.0", license: "Apache-2.0" }
     ]
-    compare(panel.filteredLicenses("").length, 2)
-    compare(panel.filteredLicenses("apache")[0].name, "Beta")
+    compare(panel.licenseViewer.filtered("").length, 2)
+    compare(panel.licenseViewer.filtered("apache")[0].name, "Beta")
     compare(panel.chatShortcutSlot(Qt.Key_1), 0)
     compare(panel.chatShortcutSlot(Qt.Key_0), 9)
     compare(panel.chatShortcutSlot(Qt.Key_A), -1)

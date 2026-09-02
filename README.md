@@ -43,8 +43,8 @@ mind.
   vote totals, and cast or revise a vote. Record Ogg Opus voice notes and retry
   interrupted sends; received voice notes download on demand and play inline.
 - **Media:** render encrypted images and videos with in-app preview or playback,
-  voice and regular audio, documents with open/save actions, static and live
-  locations, and static or animated WebP stickers. Sticker downloads start when
+  voice and regular audio, documents with open/save actions, static locations
+  and final snapshots of live-location shares, and static or animated WebP stickers. Sticker downloads start when
   their conversation loads. Lottie stickers use only their embedded static
   preview, so sender-controlled animation JSON is not loaded into Qt's
   in-process Lottie renderer.
@@ -124,8 +124,8 @@ live-deployment work required by this repository's quality gates.
   in the interface.
 - [ ] Configure the account-default disappearing-message duration.
 - [ ] Configure disappearing messages for direct chats and groups.
-- [ ] Apply message-expiry behavior in local history rather than only storing
-  synchronized disappearing-mode metadata.
+- [ ] Apply disappearing-message settings and expiry to local history end to
+  end.
 
 ### Contacts, profiles, safety, and privacy
 
@@ -366,8 +366,6 @@ state as built-in panels and widgets. The Rust daemon remains appearance-free.
 ```bash
 ./scripts/check.sh
 ./scripts/coverage.sh
-./scripts/qml-coverage.sh
-./scripts/qml-mutation.sh
 ./scripts/cargo.sh deny check
 ./scripts/cargo.sh build --release --locked --workspace
 ./tests/smoke.sh
@@ -377,19 +375,19 @@ state as built-in panels and widgets. The Rust daemon remains appearance-free.
 not touch the installed service or paired account.
 
 The local checks are mirrored by required GitHub Actions jobs for formatting,
-strict Clippy linting, Rust unit tests and coverage, each of the four QML test
-suites, QML behavioral-contract coverage, QML mutation testing, release smoke
-testing, dependency policy, dependency review, and CodeQL. See
+strict Clippy linting, Rust unit tests and coverage, the four QML test suites,
+targeted QML mutation testing, release smoke testing, dependency policy,
+dependency review, and CodeQL. See
 [QUALITY.md](QUALITY.md) for the exact coverage contract and merge-policy setup.
 
 `scripts/check.sh` validates the root marketplace manifest and entry points. It
 also runs portable Qt Quick unit, component, service-state, and UI workflow
-tests against side-effect-free Quickshell and Omarchy test doubles. The QML
-behavioral contract requires every `Model.js` helper, every `Service.qml` event,
-every production entry point, and every required workflow to be covered. A
-semantic mutation suite must kill every checked-in mutant. On Omarchy, the same
-check additionally runs strict `qmllint` against the installed shell modules;
-hosted CI uses the portable test doubles where those modules are unavailable.
+tests against side-effect-free Quickshell and Omarchy test doubles, including
+date behavior in two time zones. A small semantic mutation set guards high-risk
+validation, request-ordering, connection, and workflow behavior. On Omarchy,
+the same check additionally runs strict `qmllint` against the installed shell
+modules; hosted CI uses the portable test doubles where those modules are
+unavailable.
 
 The IPC protocol is newline-delimited JSON. Every request may carry an `id`; a
 matching response carries the same value, while broadcasts omit it. For example:

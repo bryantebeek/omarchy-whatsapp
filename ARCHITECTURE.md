@@ -106,7 +106,9 @@ appearance-agnostic.
 - A connection executes a bounded number of commands in parallel and queues the
   rest; only a client that exceeds the much larger queue bound is rejected with
   `too many active requests`. Each command's deadline covers the queue wait, so
-  a queued request fails visibly instead of stalling behind stuck work.
+  a queued request fails visibly instead of stalling behind stuck work. Clients
+  use one generous safety watchdog rather than duplicating the daemon's
+  per-command timeout table.
 - Media downloads and avatar requests never run on the command path. They
   validate, ack, and hand the transfer to a deduplicated background queue with
   its own parallelism limit, so slow network work cannot starve cheap commands.
@@ -136,12 +138,11 @@ full VoIP surface.
 
 ## Event and asset policy
 
-All 61 events exposed by the pinned `whatsapp-rust` release have an explicit
-policy. Product-relevant events are consumed by the daemon; internal routing
-and device-cache events remain library-owned; newsletters, pair-code/passkey
-linking, and profile-about events are explicitly excluded.
-An ordered compile-time test fails when upstream appends a new event kind until
-it is classified.
+The daemon subscribes only to upstream events with production behavior in this
+app. Internal routing, device-cache maintenance, and unsupported product areas
+remain owned by `whatsapp-rust` or are ignored. Adding a feature means adding
+its event subscription and behavioral test at the same time; there is no second
+catalog of every upstream enum variant to keep synchronized.
 
 Presence and chat state are intentionally ephemeral. The daemon configures
 `whatsapp-rust` for manual global-presence ownership, so library reconnect and
@@ -171,12 +172,12 @@ Recordings that never reached the daemon are removed after 24 hours. Interrupted
 same delivery ID completes recovery without another network send.
 
 Cross-device regular app-state is replayed once when upgrading to the event-aware
-database. Read/unread, pin, mute, archive, star, deletion/clearing, labels,
-receipts, contact changes, disappearing defaults, and business names are then
-applied incrementally. Reactions embedded in live and history message streams
-are stored as per-sender updates and exposed as aggregated chips; an empty
-reaction removes that sender's prior choice. Local mark-read also writes the
-app-state action back to WhatsApp so other devices converge.
+database. Read/unread, pin, mute, archive, deletion/clearing, receipts, contact
+changes, and business names are then applied incrementally. Reactions embedded
+in live and history message streams are stored as per-sender updates and
+exposed as aggregated chips; an empty reaction removes that sender's prior
+choice. Local mark-read also writes the app-state action back to WhatsApp so
+other devices converge.
 
 Unread state is an event-sourced projection rather than a phone poll. Incoming
 messages increment the materialized count; cross-device self-read receipts and
@@ -220,8 +221,11 @@ uncounted partial downloads or make concurrent writers share a temporary path.
 
 ## Deliberate exclusions
 
-Lottie sticker JSON, newsletters, embedded maps, and a full VoIP stack are not
-hosted by the UI. Lottie stickers use their embedded PNG preview because Qt
+Continuous encrypted live-location updates, Lottie sticker JSON, newsletters,
+embedded maps, and a full VoIP stack are not hosted by the app. Static
+locations and final live-location snapshots from normal message history still
+render, without a second application-owned cryptographic ratchet. Lottie
+stickers use their embedded PNG preview because Qt
 Lottie explicitly treats its input as trusted, while WhatsApp message content
 is sender-controlled. This keeps the always-on process small and avoids pulling
 Chromium/WebEngine into Omarchy Shell.

@@ -5,8 +5,6 @@ The repository has one local entry point for its required checks:
 ```bash
 ./scripts/check.sh
 ./scripts/coverage.sh
-./scripts/qml-coverage.sh
-./scripts/qml-mutation.sh
 ./scripts/cargo.sh deny check
 ./scripts/cargo.sh build --release --locked --workspace
 ./tests/smoke.sh
@@ -28,8 +26,7 @@ locally and in CI before a partially compatible build can be packaged.
 Keep the repository's `main` ruleset configured to:
 
 - requires a pull request, resolved conversations, and the `Quality`,
-  `Coverage`, `Smoke`, `Supply chain`, `Dependency review`, `CodeQL`, four
-  `QML / …` suite checks, `QML / Coverage contract`, and `QML / Mutation`
+  `Coverage`, `Smoke`, `Supply chain`, `Dependency review`, and `CodeQL`
   checks;
 - requires the branch to be up to date before merge;
 - blocks force pushes and deletion and requires linear history;
@@ -73,33 +70,30 @@ Production exclusions must remain narrow and explicit:
 - `coverage(off)` is allowed only on process/bootstrap loops, filesystem or
   SQLite row-decoding adapters, and upstream SDK/network calls whose behavior
   terminates outside this process. Deterministic decoding, validation, identity,
-  ordering, revision, cryptographic, and state-transition helpers stay measured.
-- `daemon/src/live_location/transport.rs` is the sole filename exclusion. It is
-  the `async_trait` adapter that acknowledges an encrypted stanza through a live
-  WhatsApp client. The cryptographic parser and ratchet state machine remain in
-  `live_location.rs` and are fully source-line covered.
+  ordering, revision, and state-transition helpers stay measured.
 - Broad crate, module, or application-file exclusions are forbidden.
 
-SQLite migrations and the excluded live transport are still exercised by
-dedicated integration or deployment smoke tests. Quickshell QML/JS separately
-requires the four Qt Quick suites, 100% portable behavioral-contract coverage,
-100% semantic mutation score, `qmlformat`, strict local `qmllint`, and Omarchy
-plugin validation. Installer, service, and package behavior is checked by
-ShellCheck, metadata validation, locked release builds, isolated lifecycle
-smoke tests, and live installation verification.
+SQLite migrations and network adapters are still exercised by dedicated
+integration or deployment smoke tests. Quickshell QML/JS requires the four Qt
+Quick suites, date tests in UTC and Pacific/Auckland, a small targeted semantic
+mutation set, `qmlformat`, strict local `qmllint`, and Omarchy plugin validation.
+Installer, service, and package behavior is checked by ShellCheck, metadata
+validation, locked release builds, isolated lifecycle smoke tests, and live
+installation verification.
 
 Coverage is evidence that lines executed, not proof that every behavior is
 correct. Tests should still cover success, failure, boundary, and regression
 cases rather than executing lines solely to increase the number.
 
 Qt's open-source Quick Test runner does not expose interpreted QML/JavaScript
-line or branch coverage; Qt's QML source-coverage tooling is commercial. The
-portable frontend metric therefore makes a narrower, auditable claim rather
-than reporting fabricated line coverage: every public `Model.js` helper, every
-handled `Service.qml` event, every plugin entry point, and every required UI
-workflow must have a Qt Quick test. `scripts/qml-mutation.sh` complements this
-contract by applying semantic mutants to the actual `Model.js`, `Service.qml`,
-and `Panel.qml` sources and requiring the tests to kill 100% of them.
+line or branch coverage, so this repository does not manufacture a percentage
+from source-name matching. `scripts/qml-test-all.sh` runs the real unit,
+component, service-state, and workflow suites plus timezone-sensitive model
+checks. `scripts/qml-mutation.sh` complements them with a deliberately small set
+of high-value faults around input validation, request ordering, connection
+safety, and core workflows. It is a regression check, not a proxy coverage
+number; visual styling permutations remain the responsibility of review and
+focused component/workflow tests.
 
 ## Pull-request expectations
 

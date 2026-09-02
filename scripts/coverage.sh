@@ -2,11 +2,6 @@
 set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-# async_trait expands the live encrypted-stanza adapter into synthetic source
-# locations that cannot be driven without a connected upstream client. It is
-# isolated in one exact file; all deterministic crypto/state logic remains in
-# live_location.rs and in the measured source-line denominator.
-coverage_adapter='daemon/src/live_location/transport\.rs$'
 lcov_report="$repo_dir/target/llvm-cov/lcov.info"
 
 if command -v mise >/dev/null 2>&1; then
@@ -16,10 +11,10 @@ else
 fi
 
 cd "$repo_dir"
+"${cargo_command[@]}" llvm-cov clean --workspace
 "${cargo_command[@]}" llvm-cov --workspace --all-features --locked --no-report
 mkdir -p -- "$(dirname -- "$lcov_report")"
 "${cargo_command[@]}" llvm-cov report \
-  --ignore-filename-regex "$coverage_adapter" \
   --lcov \
   --output-path "$lcov_report"
 

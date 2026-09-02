@@ -4,7 +4,6 @@ import QtQuick.Effects
 import QtMultimedia
 import QtQml.Models
 import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -42,10 +41,9 @@ Item {
   property string voiceRecordingChatJid: ""
   property string voiceRecordingStopAction: ""
   property real currentTimestamp: Date.now() / 1000
-  property var licenseEntries: []
-  property string licenseLoadError: ""
   property alias appMenu: headerMenu
   property alias appMenuFirstAction: headerLicenseAction
+  property alias licenseViewer: licensesPopup
   property alias chatStateResyncAction: headerResyncAction
   property alias chatStateResyncConfirmation: resyncConfirmation
   readonly property bool unreadOnly: service && service.unreadOnly === true
@@ -80,11 +78,6 @@ Item {
   readonly property int messageMetaFontSize: Math.max(8, Style.font.caption - 1)
   readonly property url whatsappIcon: Qt.resolvedUrl("icons/brand-whatsapp-filled.svg")
   readonly property string messageTimeFormat: Model.timeFormat(root.clockFormats())
-  readonly property string licenseReportPath: {
-    var value = String(Qt.resolvedUrl("licenses.json"))
-    return value.indexOf("file://") === 0
-      ? decodeURIComponent(value.substring(7)) : value
-  }
   readonly property bool paired: service && service.connectionState === "connected"
   readonly property bool pairing: service && service.connectionState === "pairing"
   readonly property bool daemonSetupRequired: service
@@ -265,43 +258,6 @@ Item {
     }
   }
 
-  FileView {
-    id: licenseReportFile
-
-    path: root.licenseReportPath
-    printErrors: false
-    watchChanges: true
-    onLoaded: {
-      try {
-        var report = JSON.parse(text())
-        root.licenseEntries = report && Array.isArray(report.entries)
-          ? report.entries : []
-        root.licenseLoadError = ""
-      } catch (error) {
-        root.licenseEntries = []
-        root.licenseLoadError = "The bundled license report could not be read."
-      }
-    }
-    onLoadFailed: {
-      root.licenseEntries = []
-      root.licenseLoadError = "The bundled license report is unavailable."
-    }
-  }
-
-  function filteredLicenses(query) {
-    var needle = String(query || "").trim().toLowerCase()
-    if (!needle) return licenseEntries
-    var matches = []
-    for (var i = 0; i < licenseEntries.length; i++) {
-      var entry = licenseEntries[i] || {}
-      var haystack = (String(entry.name || "") + "\n"
-        + String(entry.version || "") + "\n"
-        + String(entry.license || "")).toLowerCase()
-      if (haystack.indexOf(needle) >= 0) matches.push(entry)
-    }
-    return matches
-  }
-
   function groupConversationSubtitle() {
     if (!service || !service.selectedChat
         || service.selectedChat.is_group !== true) return ""
@@ -360,12 +316,6 @@ Item {
     var activity = service.chatStateLabel(chat.jid, chat.is_group === true)
     if (!activity || chat.is_group === true) return String(activity || "")
     return activity.charAt(0).toUpperCase() + activity.slice(1)
-  }
-
-  function licenseKindLabel(kind) {
-    if (kind === "project") return "Application"
-    if (kind === "asset") return "Bundled asset"
-    return "Rust package"
   }
 
   function open(payloadJson) {
@@ -1569,198 +1519,11 @@ Item {
         }
       }
 
-      QQC.Popup {
+      LicensesPopup {
         id: licensesPopup
-
-        readonly property var popupBorderSpec:
-          Border.localOrSurfaceSpec("popups", "border",
-            Color.popups.border, Color.popups.border,
-            Math.max(1, Style.normalBorderWidth))
-
         parent: focusScope
-        x: Math.round((parent.width - width) / 2)
-        y: Math.round((parent.height - height) / 2)
-        width: Math.min(Style.space(760), parent.width - Style.space(48))
-        height: Math.min(Style.space(620), parent.height - Style.space(48))
-        padding: 0
-        leftPadding: Border.left(popupBorderSpec)
-        rightPadding: Border.right(popupBorderSpec)
-        topPadding: Border.top(popupBorderSpec)
-        bottomPadding: Border.bottom(popupBorderSpec)
-        modal: true
-        focus: true
-        closePolicy: QQC.Popup.CloseOnEscape
-          | QQC.Popup.CloseOnPressOutside
-
-        onOpened: {
-          licenseSearch.text = ""
-          Qt.callLater(function() { licenseSearch.forceActiveFocus() })
-        }
-
-        background: CrispBorderSurface {
-          color: Color.popups.background
-          sourceBorderSpec: licensesPopup.popupBorderSpec
-          radius: Style.cornerRadius + Style.space(4)
-        }
-
-        contentItem: Column {
-          spacing: 0
-
-          Item {
-            id: licensesHeader
-
-            width: parent.width
-            height: Style.space(68)
-
-            Column {
-              anchors.left: parent.left
-              anchors.leftMargin: Style.space(18)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(2)
-
-              Text {
-                text: "Open-source licenses"
-                color: Color.popups.text
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
-                font.bold: true
-              }
-              Text {
-                text: root.licenseEntries.length + " licensed components"
-                color: Qt.rgba(Color.popups.text.r, Color.popups.text.g,
-                  Color.popups.text.b, Color.popups.text.a * 0.72)
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-
-            CrispButton {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(10)
-              anchors.verticalCenter: parent.verticalCenter
-              iconText: "󰅖"
-              foreground: Color.popups.text
-              accent: root.accent
-              tooltipText: "Close licenses"
-              focusable: true
-              onClicked: licensesPopup.close()
-            }
-          }
-
-          Rectangle {
-            width: parent.width
-            height: Math.max(1, Style.normalBorderWidth)
-            color: Color.popups.border
-          }
-
-          Item {
-            id: licenseSearchRow
-
-            width: parent.width
-            height: Style.space(58)
-
-            CrispTextField {
-              id: licenseSearch
-
-              anchors.fill: parent
-              anchors.margins: Style.space(10)
-              placeholderText: "Search packages or licenses"
-              foreground: Color.popups.text
-              accent: root.accent
-            }
-          }
-
-          Rectangle {
-            width: parent.width
-            height: Math.max(1, Style.normalBorderWidth)
-            color: Color.popups.border
-          }
-
-          Item {
-            width: parent.width
-            height: parent.height - licensesHeader.height
-              - licenseSearchRow.height - Style.normalBorderWidth * 2
-
-            ListView {
-              id: licenseList
-
-              anchors.fill: parent
-              anchors.margins: Style.space(6)
-              clip: true
-              spacing: Style.space(2)
-              model: root.filteredLicenses(licenseSearch.text)
-
-              delegate: Rectangle {
-                required property var modelData
-                required property int index
-
-                width: licenseList.width
-                height: Style.space(56)
-                radius: Style.cornerRadius
-                color: index % 2 === 0
-                  ? Style.hoverFillFor(Color.popups.text, root.accent)
-                  : "transparent"
-
-                Column {
-                  anchors.left: parent.left
-                  anchors.leftMargin: Style.space(10)
-                  anchors.right: licenseValue.left
-                  anchors.rightMargin: Style.space(16)
-                  anchors.verticalCenter: parent.verticalCenter
-                  spacing: Style.space(2)
-
-                  Text {
-                    width: parent.width
-                    text: String(modelData.name || "")
-                      + (modelData.version ? " " + modelData.version : "")
-                    color: Color.popups.text
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
-                    font.bold: modelData.kind !== "rust"
-                    elide: Text.ElideRight
-                  }
-                  Text {
-                    width: parent.width
-                    text: root.licenseKindLabel(String(modelData.kind || ""))
-                    color: Qt.rgba(Color.popups.text.r, Color.popups.text.g,
-                      Color.popups.text.b, Color.popups.text.a * 0.68)
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                  }
-                }
-
-                Text {
-                  id: licenseValue
-
-                  anchors.right: parent.right
-                  anchors.rightMargin: Style.space(10)
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Math.min(parent.width * 0.46, implicitWidth)
-                  text: String(modelData.license || "Not declared")
-                  color: root.accent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  horizontalAlignment: Text.AlignRight
-                  elide: Text.ElideRight
-                }
-              }
-            }
-
-            Text {
-              anchors.centerIn: parent
-              visible: licenseList.count === 0
-              text: root.licenseLoadError !== ""
-                ? root.licenseLoadError : "No matching licenses"
-              color: Qt.rgba(Color.popups.text.r, Color.popups.text.g,
-                Color.popups.text.b, Color.popups.text.a * 0.72)
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-            }
-          }
-        }
+        devicePixelRatio: root.devicePixelRatio
       }
-
       Rectangle { anchors.fill: parent; color: root.background }
 
       Column {

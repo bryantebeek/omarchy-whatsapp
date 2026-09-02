@@ -39,7 +39,7 @@ install -Dm644 "$repo_dir/packaging/icons/com.omarchy.WhatsApp.svg" \
 
 install -Dm644 "$repo_dir/manifest.json" \
   "$package_root/usr/share/omarchy/shell/plugins/whatsapp/manifest.json"
-for plugin_file in BarWidget.qml Service.qml Panel.qml Model.js licenses.json; do
+for plugin_file in BarWidget.qml Service.qml Panel.qml LicensesPopup.qml Model.js licenses.json; do
   install -Dm644 "$repo_dir/quickshell/$plugin_file" \
     "$package_root/usr/share/omarchy/shell/plugins/whatsapp/quickshell/$plugin_file"
 done

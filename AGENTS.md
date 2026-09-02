@@ -34,13 +34,12 @@ or update tests in the appropriate suite:
   the panel, selecting chats, composing and sending, loading history, opening
   media, and recovering from connection changes.
 
-When adding a service event, production entry point, public `Model.js` helper,
-or required workflow, update `scripts/qml-coverage.py` when necessary so the
-portable behavioral-contract gate continues to report 100%. Add meaningful
-semantic mutants for new deterministic frontend logic in
-`scripts/qml-mutation.py`, and require a 100% mutation score. Do not delete or
-weaken a valid mutant merely to make the gate pass; strengthen the test. Replace
-genuinely equivalent mutants with observable ones.
+Add direct behavioral tests for new service events, production entry points,
+public `Model.js` helpers, and user workflows. Add a targeted mutant to
+`scripts/qml-mutation.py` only when it represents a high-risk semantic fault in
+validation, ordering, connection safety, or a core workflow. Mutation testing
+is not a coverage metric; do not add source-text permutations for styling,
+spacing, or every branch merely to increase a score.
 
 Keep test doubles and fixtures synthetic and side-effect-free. QML tests must
 never connect to the real daemon, read or write paired account state, start user
@@ -52,15 +51,13 @@ directly in a way that creates visible windows.
 Before declaring any QML or frontend-related change complete, run:
 
 ```bash
-./scripts/qml-coverage.sh
+./scripts/qml-test-all.sh
 ./scripts/qml-mutation.sh
 ```
 
 Both commands must pass. Also run the formatting, linting, validation,
 deployment, reload, and live-log checks required by the relevant section below.
-Keep the four-suite matrix and the dedicated QML coverage and mutation jobs in
-`.github/workflows/ci.yml` synchronized with these local gates so every pull
-request and `main` push reports each frontend layer independently.
+The CI `Quality` job runs all four suites and the targeted mutation set once.
 
 ### Quickshell-only changes
 

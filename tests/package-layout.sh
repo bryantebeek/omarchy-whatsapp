@@ -17,7 +17,7 @@ contents="$test_dir/archive-contents.txt"
 tar -tzf "$archive" >"$contents"
 
 grep -Fx "$plugin_root/manifest.json" "$contents" >/dev/null
-for plugin_file in BarWidget.qml Service.qml Panel.qml Model.js licenses.json; do
+for plugin_file in BarWidget.qml Service.qml Panel.qml LicensesPopup.qml Model.js licenses.json; do
   grep -Fx "$plugin_root/quickshell/$plugin_file" "$contents" >/dev/null
 done
 grep -Fx "$plugin_root/quickshell/icons/brand-whatsapp-filled.svg" "$contents" >/dev/null

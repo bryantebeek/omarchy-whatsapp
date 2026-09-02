@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 28;
+pub const PROTOCOL_VERSION: u16 = 29;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -173,10 +173,6 @@ pub struct TextOutboxEntry {
 pub enum Resource {
     Chats,
     Messages,
-    Unread,
-    Avatars,
-    TextOutbox,
-    VoiceOutbox,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,19 +305,7 @@ pub enum Command {
         message_id: String,
         selected_options: Vec<String>,
     },
-    DownloadImage {
-        chat_jid: String,
-        message_id: String,
-    },
-    DownloadSticker {
-        chat_jid: String,
-        message_id: String,
-    },
-    DownloadVideo {
-        chat_jid: String,
-        message_id: String,
-    },
-    DownloadAudio {
+    DownloadMedia {
         chat_jid: String,
         message_id: String,
     },
@@ -428,16 +412,6 @@ pub enum ServerEvent {
         resource: Resource,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<String>,
-    },
-    Receipts {
-        message_ids: Vec<String>,
-        receipt: u8,
-        #[serde(default)]
-        timestamp: i64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        delivery: Option<MessageDelivery>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reader: Option<MessageReader>,
     },
     Presence {
         jid: String,
@@ -615,10 +589,10 @@ mod tests {
     }
 
     #[test]
-    fn sticker_command_and_media_round_trip_are_stable() {
+    fn media_download_command_and_sticker_payload_round_trip_are_stable() {
         let frame = ClientFrame::new(
             Some(8),
-            Command::DownloadSticker {
+            Command::DownloadMedia {
                 chat_jid: "1@s.whatsapp.net".into(),
                 message_id: "sticker-1".into(),
             },
@@ -981,40 +955,6 @@ mod tests {
         assert_eq!(message.read_at, None);
         assert!(message.delivered_to.is_empty());
         assert!(message.read_by.is_empty());
-    }
-
-    #[test]
-    fn receipt_event_round_trip_is_stable() {
-        let frame = ServerFrame::event(ServerEvent::Receipts {
-            message_ids: vec!["message-1".into(), "message-2".into()],
-            receipt: 3,
-            timestamp: 42,
-            delivery: None,
-            reader: Some(MessageReader {
-                jid: "1@s.whatsapp.net".into(),
-                name: "Ada".into(),
-                read_at: Some(42),
-            }),
-        });
-        let json = serde_json::to_string(&frame).unwrap();
-        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
-    }
-
-    #[test]
-    fn delivery_event_round_trip_includes_the_recipient() {
-        let frame = ServerFrame::event(ServerEvent::Receipts {
-            message_ids: vec!["message-1".into()],
-            receipt: 2,
-            timestamp: 40,
-            delivery: Some(MessageDelivery {
-                jid: "1@s.whatsapp.net".into(),
-                name: "Ada".into(),
-                delivered_at: Some(40),
-            }),
-            reader: None,
-        });
-        let json = serde_json::to_string(&frame).unwrap();
-        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
     }
 
     #[test]

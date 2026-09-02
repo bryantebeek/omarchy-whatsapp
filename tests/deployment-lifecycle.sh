@@ -19,6 +19,7 @@ release_ctl="$repo_dir/target/release/omarchy-whatsappctl"
 test_home="$test_dir/home"
 shim_dir="$test_dir/bin"
 systemctl_log="$test_dir/systemctl.log"
+mise_log="$test_dir/mise.log"
 real_install=$(command -v install)
 test_state_home="$test_dir/xdg-state"
 mkdir -p -- "$test_state_home/omarchy-whatsapp" "$shim_dir"
@@ -42,13 +43,29 @@ printf '%s\n' \
   'fi' \
   'exec "${REAL_INSTALL:?}" "$@"' \
   >"$shim_dir/install"
-chmod 755 "$shim_dir/systemctl" "$shim_dir/install"
+# Release compilation and binary behavior have dedicated gates. Here the mise
+# shim verifies setup's build command and supplies those already-tested inputs.
+# shellcheck disable=SC2016
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '[[ $# -ge 5 && $1 == exec && $3 == -- && $4 == cargo && $5 == build ]] || exit 71' \
+  'shift 4' \
+  'printf "%s\n" "$*" >>"${MISE_LOG:?}"' \
+  '"${REAL_INSTALL:?}" -d -m 700 -- "${CARGO_TARGET_DIR:?}/release"' \
+  '"$REAL_INSTALL" -m 755 "${TEST_RELEASE_DAEMON:?}" "$CARGO_TARGET_DIR/release/omarchy-whatsappd"' \
+  '"$REAL_INSTALL" -m 755 "${TEST_RELEASE_CTL:?}" "$CARGO_TARGET_DIR/release/omarchy-whatsappctl"' \
+  >"$shim_dir/mise"
+chmod 755 "$shim_dir/systemctl" "$shim_dir/install" "$shim_dir/mise"
 
 export HOME="$test_home"
 export XDG_STATE_HOME="$test_state_home"
 export PATH="$shim_dir:/usr/bin:/bin"
 export REAL_INSTALL="$real_install"
 export SYSTEMCTL_LOG="$systemctl_log"
+export MISE_LOG="$mise_log"
+export TEST_RELEASE_DAEMON="$release_daemon"
+export TEST_RELEASE_CTL="$release_ctl"
 
 state_dir="$XDG_STATE_HOME/omarchy-whatsapp"
 printf '%s\n' 'fictional linked-device test state' >"$state_dir/session.db"
@@ -86,21 +103,14 @@ cmp "$release_ctl" "$HOME/.local/bin/omarchy-whatsappctl"
 assert_state_preserved
 "$repo_dir/install.sh" --no-build >/dev/null
 assert_state_preserved
-OMARCHY_WHATSAPP_BUILD_DIR="$repo_dir/target" \
-  "$repo_dir/scripts/setup-daemon.sh" setup >/dev/null
-"$repo_dir/scripts/setup-daemon.sh" check
-assert_state_preserved
-
-# The in-plugin setup path builds outside the watched plugin checkout and then
-# installs only runtime files, leaving the already-enabled plugin tree alone.
-external_target="$test_dir/external-target"
-mkdir -p -- "$external_target/release"
-install -m 755 "$release_daemon" "$external_target/release/omarchy-whatsappd"
-install -m 755 "$release_ctl" "$external_target/release/omarchy-whatsappctl"
 plugin_manifest="$HOME/.config/omarchy/plugins/io.github.bryantebeek.whatsapp/manifest.json"
 plugin_manifest_digest=$(sha256sum "$plugin_manifest" | cut -d' ' -f1)
-CARGO_TARGET_DIR="$external_target" \
-  "$repo_dir/install.sh" --no-build --runtime-only >/dev/null
+setup_build_dir="$test_dir/setup-build"
+OMARCHY_WHATSAPP_BUILD_DIR="$setup_build_dir" \
+  "$repo_dir/scripts/setup-daemon.sh" setup >/dev/null
+grep -Fx 'build --release --locked --workspace' "$mise_log" >/dev/null
+[[ -x $setup_build_dir/release/omarchy-whatsappd ]]
+[[ -x $setup_build_dir/release/omarchy-whatsappctl ]]
 [[ $(sha256sum "$plugin_manifest" | cut -d' ' -f1) == "$plugin_manifest_digest" ]]
 "$repo_dir/scripts/setup-daemon.sh" check
 assert_state_preserved

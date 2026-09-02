@@ -2,12 +2,10 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod assets;
+mod connections;
 mod database;
-mod event_coverage;
 mod inbound;
 mod jobs;
-mod leases;
-mod live_location;
 mod notification;
 mod revisions;
 mod text_outbox;
@@ -21,8 +19,8 @@ use database::Database;
 use futures::StreamExt;
 use omarchy_whatsapp_protocol::{
     AppPaths, Chat, ChatParticipant, ChatState, ChatStateResyncStatus, ClientFrame, Command,
-    ConnectionStatus, Message, MessageDelivery, MessageMedia, MessageReader, PROTOCOL_VERSION,
-    PollOption, Resource, ServerEvent, ServerFrame, TextOutboxStatus,
+    ConnectionStatus, Message, MessageMedia, PROTOCOL_VERSION, PollOption, Resource, ServerEvent,
+    ServerFrame, TextOutboxStatus,
 };
 use qrcode::{QrCode, render::svg};
 use std::collections::{HashMap, HashSet};
@@ -40,11 +38,9 @@ use tokio::task::JoinSet;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tracing::{debug, error, info, warn};
 use whatsapp_rust::prelude::*;
-use whatsapp_rust::types::jid::JidExt as SignalJidExt;
 use whatsapp_rust::wacore::download::MediaType;
-use whatsapp_rust::wacore::request::InfoQuery;
 use whatsapp_rust::wacore::store::DevicePropsOverride;
-use whatsapp_rust::wacore_binary::{JidExt, NodeContent, SERVER_JID, builder::NodeBuilder};
+use whatsapp_rust::wacore_binary::JidExt;
 use whatsapp_rust::{PresencePolicy, SendOptions, UploadOptions, media};
 
 const CHAT_LIST_LIMIT: u32 = 500;
@@ -127,7 +123,7 @@ struct Shared {
     client: RwLock<Option<Arc<Client>>>,
     events: broadcast::Sender<ServerFrame>,
     clock: revisions::RevisionClock,
-    leases: StdMutex<leases::LeaseBook>,
+    connection_intents: StdMutex<connections::ConnectionIntents>,
     pairing_qr: PathBuf,
     contact_sync_marker: PathBuf,
     contact_history_marker: PathBuf,
@@ -212,11 +208,6 @@ async fn clear_local_account_data(paths: &AppPaths, shared: &Shared) -> Result<(
             }
         }
     }
-    shared
-        .leases
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
     shared.media_recovery_requested.write().await.clear();
     shared.media_downloads.lock().await.clear();
     broadcast_chats(shared);
@@ -266,39 +257,31 @@ impl Shared {
         self.publish(ServerEvent::Invalidated { resource, key });
     }
 
-    fn open_connection_lease(&self) -> u64 {
-        self.leases
+    fn open_connection(&self) -> u64 {
+        self.connection_intents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .connect(Utc::now().timestamp())
+            .connect()
     }
 
-    fn touch_connection_lease(&self, connection_id: u64) {
-        self.leases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .touch(connection_id, Utc::now().timestamp());
-    }
-
-    fn close_connection_lease(
+    fn close_connection(
         &self,
         connection_id: u64,
-    ) -> (leases::LeaseState, leases::LeaseState) {
-        let now = Utc::now().timestamp();
-        let mut leases = self
-            .leases
+    ) -> (connections::ConnectionState, connections::ConnectionState) {
+        let mut connections = self
+            .connection_intents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = leases.state(now);
-        leases.disconnect(connection_id);
-        (before, leases.state(now))
+        let before = connections.state();
+        connections.disconnect(connection_id);
+        (before, connections.state())
     }
 
-    fn lease_state(&self) -> leases::LeaseState {
-        self.leases
+    fn connection_state(&self) -> connections::ConnectionState {
+        self.connection_intents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .state(Utc::now().timestamp())
+            .state()
     }
 
     fn begin_presence_sync(&self, generation: u64) {
@@ -317,45 +300,43 @@ impl Shared {
         self.clock.is_current(generation)
     }
 
-    fn set_lease_active_chat(
+    fn set_connection_active_chat(
         &self,
         connection_id: u64,
         chat_jid: Option<String>,
-    ) -> Result<(leases::LeaseState, leases::LeaseState)> {
-        let now = Utc::now().timestamp();
-        let mut leases = self
-            .leases
+    ) -> Result<(connections::ConnectionState, connections::ConnectionState)> {
+        let mut connections = self
+            .connection_intents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = leases.state(now);
-        if !leases.set_active_chat(connection_id, chat_jid, now) {
-            bail!("IPC connection lease expired");
+        let before = connections.state();
+        if !connections.set_active_chat(connection_id, chat_jid) {
+            bail!("IPC connection closed");
         }
-        Ok((before, leases.state(now)))
+        Ok((before, connections.state()))
     }
 
-    fn set_lease_available(
+    fn set_connection_available(
         &self,
         connection_id: u64,
         available: bool,
-    ) -> Result<(leases::LeaseState, leases::LeaseState)> {
-        let now = Utc::now().timestamp();
-        let mut leases = self
-            .leases
+    ) -> Result<(connections::ConnectionState, connections::ConnectionState)> {
+        let mut connections = self
+            .connection_intents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = leases.state(now);
-        if !leases.set_available(connection_id, available, now) {
-            bail!("IPC connection lease expired");
+        let before = connections.state();
+        if !connections.set_available(connection_id, available) {
+            bail!("IPC connection closed");
         }
-        Ok((before, leases.state(now)))
+        Ok((before, connections.state()))
     }
 
     fn chat_is_focused(&self, chat_jid: &str) -> bool {
-        self.leases
+        self.connection_intents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_focused(chat_jid, Utc::now().timestamp())
+            .is_focused(chat_jid)
     }
 
     async fn command_gate(&self, key: &str) -> Arc<Mutex<()>> {
@@ -676,26 +657,6 @@ impl Shared {
             };
             return persisted;
         }
-        if let Some(distribution) = base
-            .fast_ratchet_key_sender_key_distribution_message
-            .as_option()
-            && let Some(payload) = distribution
-                .axolotl_sender_key_distribution_message
-                .as_deref()
-        {
-            match live_location::FastRatchetState::from_distribution(payload) {
-                Ok(state) => {
-                    let signal_address = info.source.sender.to_signal_address_string();
-                    if let Err(error) = self
-                        .database
-                        .store_fast_ratchet_state(&signal_address, &state)
-                    {
-                        warn!(%error, "could not persist live-location sender key");
-                    }
-                }
-                Err(error) => warn!(%error, "could not read live-location sender key"),
-            }
-        }
         let media = message_media(
             base,
             &self.media_dir,
@@ -848,20 +809,6 @@ impl Shared {
                         }
                     });
                 }
-                if matches!(
-                    message.media,
-                    Some(MessageMedia::Location { live: true, .. })
-                ) {
-                    let client = Arc::clone(&context.client);
-                    let target = info.source.chat.clone();
-                    let is_group = info.source.is_group;
-                    tokio::spawn(async move {
-                        if let Err(error) = subscribe_live_location(&client, target, is_group).await
-                        {
-                            warn!(%error, "could not subscribe to incoming live location");
-                        }
-                    });
-                }
                 true
             }
             Ok(false) => {
@@ -880,44 +827,6 @@ impl Shared {
                 false
             }
         }
-    }
-
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    async fn receive_live_location_update(self: &Arc<Self>, context: MessageContext) -> Result<()> {
-        let base = context.message.get_base_message();
-        if base.live_location_message.is_unset()
-            && !base
-                .location_message
-                .as_option()
-                .is_some_and(|location| location.is_live.unwrap_or(false))
-        {
-            bail!("fast-ratchet payload does not contain a live location");
-        }
-
-        let sender_jid =
-            canonical_contact_jid(self, &context.client, &context.info.source.sender).await;
-        let targets = self
-            .database
-            .active_live_locations_for_sender(&sender_jid, Utc::now().timestamp())?;
-        for target in targets {
-            let Some(media) = message_media(
-                base,
-                &self.media_dir,
-                &target.chat_jid,
-                &target.message_id,
-                context.info.timestamp.timestamp(),
-                target.duration_seconds,
-            ) else {
-                continue;
-            };
-            if self
-                .database
-                .update_message_media(&target.chat_jid, &target.message_id, &media)?
-            {
-                broadcast_messages(self, &target.chat_jid);
-            }
-        }
-        Ok(())
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -2270,7 +2179,6 @@ async fn process_history_event(
             if !shared.clock.is_current(generation) {
                 return;
             }
-            restore_live_location_subscriptions(Arc::clone(&shared), Arc::clone(&client)).await;
             let names_shared = Arc::clone(&shared);
             let names_client = Arc::clone(&client);
             jobs.spawn(async move {
@@ -2706,7 +2614,7 @@ async fn download_pending_media(
     .count()
     .await;
     if downloaded > 0 {
-        for chat_jid in shared.lease_state().active_chats {
+        for chat_jid in shared.connection_state().active_chats {
             broadcast_messages(&shared, &chat_jid);
         }
     }
@@ -2722,7 +2630,7 @@ async fn backfill_video_previews(shared: Arc<Shared>) {
         Ok(Ok(generated)) => {
             info!(generated, "generated missing video previews");
             if generated > 0 {
-                for chat_jid in shared.lease_state().active_chats {
+                for chat_jid in shared.connection_state().active_chats {
                     broadcast_messages(&shared, &chat_jid);
                 }
             }
@@ -3074,21 +2982,16 @@ const APP_EVENT_KINDS: &[EventKind] = &[
     EventKind::PinUpdate,
     EventKind::MuteUpdate,
     EventKind::ArchiveUpdate,
-    EventKind::StarUpdate,
     EventKind::MarkChatAsReadUpdate,
     EventKind::DeleteChatUpdate,
     EventKind::ClearChatUpdate,
-    EventKind::UserStatusMuteUpdate,
     EventKind::DeleteMessageForMeUpdate,
-    EventKind::LabelEditUpdate,
-    EventKind::LabelAssociationUpdate,
     EventKind::OfflineSyncCompleted,
     EventKind::DirtyState,
     EventKind::IdentityChange,
     EventKind::BusinessStatusUpdate,
     EventKind::StreamReplaced,
     EventKind::TemporaryBan,
-    EventKind::DisappearingModeChanged,
     EventKind::ServerAck,
     EventKind::PairingQrCodesExhausted,
     EventKind::AppStateSyncFailed,
@@ -3187,38 +3090,11 @@ async fn handle_app_event(
             };
             if state > 0 {
                 let chat_jid = canonical_contact_jid(&shared, &client, &receipt.source.chat).await;
-                let recipient = if state >= 2
+                let recipient_jid = if state >= 2
                     && (!receipt.source.chat.is_group()
                         || receipt.source.sender != receipt.source.chat)
                 {
-                    let jid = canonical_contact_jid(&shared, &client, &receipt.source.sender).await;
-                    let name = shared
-                        .database
-                        .contact_name(&jid)
-                        .ok()
-                        .flatten()
-                        .or_else(|| shared.database.chat_name(&jid).ok().flatten())
-                        .filter(|name| name != &jid)
-                        .unwrap_or_default();
-                    Some((jid, name))
-                } else {
-                    None
-                };
-                let delivery = if state == 2 {
-                    recipient.as_ref().map(|(jid, name)| MessageDelivery {
-                        jid: jid.clone(),
-                        name: name.clone(),
-                        delivered_at: Some(receipt.timestamp.timestamp()),
-                    })
-                } else {
-                    None
-                };
-                let reader = if state >= 3 {
-                    recipient.as_ref().map(|(jid, name)| MessageReader {
-                        jid: jid.clone(),
-                        name: name.clone(),
-                        read_at: Some(receipt.timestamp.timestamp()),
-                    })
+                    Some(canonical_contact_jid(&shared, &client, &receipt.source.sender).await)
                 } else {
                     None
                 };
@@ -3226,18 +3102,10 @@ async fn handle_app_event(
                     &chat_jid,
                     &receipt.message_ids,
                     state,
-                    recipient.as_ref().map(|(jid, _)| jid.as_str()),
+                    recipient_jid.as_deref(),
                     receipt.timestamp.timestamp(),
                 ) {
-                    Ok(true) => {
-                        shared.publish(ServerEvent::Receipts {
-                            message_ids: receipt.message_ids.clone(),
-                            receipt: state,
-                            timestamp: receipt.timestamp.timestamp(),
-                            delivery,
-                            reader,
-                        });
-                    }
+                    Ok(true) => broadcast_messages(&shared, &chat_jid),
                     Ok(false) => {}
                     Err(error) => warn!(%error, "could not persist WhatsApp receipts"),
                 }
@@ -3365,7 +3233,7 @@ async fn handle_app_event(
         Event::SelfPushNameUpdated(update) => {
             info!(old = %update.old_name, new = %update.new_name, "own WhatsApp profile name changed");
             if effective_presence_available(
-                shared.lease_state().available,
+                shared.connection_state().available,
                 shared.presence_sync_pending(),
             ) && !update.new_name.is_empty()
                 && let Err(error) = client.presence().set_available().await
@@ -3409,19 +3277,6 @@ async fn handle_app_event(
                 warn!(%error, "could not apply WhatsApp archive state");
             }
             broadcast_snapshot(&shared);
-        }
-        Event::StarUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.chat_jid).await;
-            if let Some(starred) = update.action.starred
-                && let Err(error) = shared.database.star_message_at(
-                    &jid,
-                    &update.message_id,
-                    starred,
-                    update.timestamp.timestamp(),
-                )
-            {
-                warn!(%error, "could not apply WhatsApp star state");
-            }
         }
         Event::MarkChatAsReadUpdate(update) => {
             let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
@@ -3477,16 +3332,6 @@ async fn handle_app_event(
             broadcast_snapshot(&shared);
             broadcast_messages(&shared, &jid);
         }
-        Event::UserStatusMuteUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.jid).await;
-            if let Err(error) = shared.database.apply_status_mute_at(
-                &jid,
-                update.muted,
-                update.timestamp.timestamp(),
-            ) {
-                warn!(%error, "could not apply WhatsApp status mute");
-            }
-        }
         Event::DeleteMessageForMeUpdate(update) => {
             let jid = canonical_contact_jid(&shared, &client, &update.chat_jid).await;
             if let Err(error) = shared.database.delete_message(&jid, &update.message_id) {
@@ -3496,33 +3341,17 @@ async fn handle_app_event(
             broadcast_chats(&shared);
             broadcast_messages(&shared, &jid);
         }
-        Event::LabelEditUpdate(update) => {
-            if let Err(error) = shared.database.update_label(
-                &update.label_id,
-                update.action.name.as_deref(),
-                update.action.color,
-                update.action.deleted.unwrap_or(false),
-            ) {
-                warn!(%error, "could not persist WhatsApp label");
-            }
-        }
-        Event::LabelAssociationUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.chat_jid).await;
-            if let Err(error) = shared.database.associate_label(
-                &jid,
-                &update.label_id,
-                update.action.labeled.unwrap_or(false),
-            ) {
-                warn!(%error, "could not persist WhatsApp label association");
-            }
-        }
         Event::OfflineSyncCompleted(details) => {
             info!(count = details.count, "WhatsApp offline sync completed");
             broadcast_snapshot(&shared);
             if shared.finish_presence_sync(generation) {
-                let intent = shared.lease_state();
-                force_reconcile_connection_intent(&shared, &leases::LeaseState::default(), &intent)
-                    .await;
+                let intent = shared.connection_state();
+                force_reconcile_connection_intent(
+                    &shared,
+                    &connections::ConnectionState::default(),
+                    &intent,
+                )
+                .await;
             }
             jobs.spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
         }
@@ -3570,16 +3399,6 @@ async fn handle_app_event(
                 .unwrap_or_else(|| format!("Temporary WhatsApp restriction: {}", ban.code));
             notification::send_event("WhatsApp temporarily restricted", &message, "critical");
             shared.set_status(ConnectionStatus::Error { message }).await;
-        }
-        Event::DisappearingModeChanged(update) => {
-            let jid = canonical_contact_jid(&shared, &client, &update.from).await;
-            if let Err(error) = shared.database.apply_disappearing_mode(
-                &jid,
-                update.duration,
-                update.setting_timestamp.timestamp(),
-            ) {
-                warn!(%error, "could not persist WhatsApp disappearing-message setting");
-            }
         }
         Event::ServerAck(ack) => {
             if let Some(code) = &ack.error {
@@ -3650,69 +3469,6 @@ async fn handle_app_event(
             }
         }
         _ => {}
-    }
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn subscribe_live_location(client: &Client, target: Jid, is_group: bool) -> Result<()> {
-    let subscribe = if is_group {
-        NodeBuilder::new("subscribe")
-            .attr("participants", "true")
-            .build()
-    } else {
-        NodeBuilder::new("subscribe").build()
-    };
-    let server = SERVER_JID
-        .parse::<Jid>()
-        .context("parsing WhatsApp server JID")?;
-    client
-        .send_iq(
-            InfoQuery::get(
-                "location",
-                server,
-                Some(NodeContent::Nodes(vec![subscribe])),
-            )
-            .with_target(target)
-            .with_timeout(std::time::Duration::from_secs(20)),
-        )
-        .await
-        .context("subscribing to WhatsApp live location")?;
-    Ok(())
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn restore_live_location_subscriptions(shared: Arc<Shared>, client: Arc<Client>) {
-    let targets = match shared
-        .database
-        .active_live_location_targets(Utc::now().timestamp())
-    {
-        Ok(targets) => targets,
-        Err(error) => {
-            warn!(%error, "could not list active live locations");
-            return;
-        }
-    };
-    for (target, is_group) in targets {
-        let Ok(target) = target.parse::<Jid>() else {
-            warn!("could not parse live-location subscription target");
-            continue;
-        };
-        if let Err(error) = subscribe_live_location(&client, target, is_group).await {
-            warn!(%error, "could not restore live-location subscription");
-        }
-    }
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn maintain_live_location_subscriptions(shared: Arc<Shared>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(25));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        let Some(client) = shared.client.read().await.clone() else {
-            continue;
-        };
-        restore_live_location_subscriptions(Arc::clone(&shared), client).await;
     }
 }
 
@@ -3809,12 +3565,6 @@ async fn run_daemon() -> Result<()> {
         Err(error) => warn!(%error, "could not recover the voice message outbox"),
     }
 
-    let (app_events, library_events, excluded_events) = event_coverage::counts();
-    info!(
-        app_events,
-        library_events, excluded_events, "loaded exhaustive WhatsApp event policy"
-    );
-
     let listener = bind_private_listener(&paths.socket).await?;
 
     let (events, _) = broadcast::channel(256);
@@ -3826,7 +3576,7 @@ async fn run_daemon() -> Result<()> {
         client: RwLock::new(None),
         events,
         clock: revisions::RevisionClock::default(),
-        leases: StdMutex::new(leases::LeaseBook::default()),
+        connection_intents: StdMutex::new(connections::ConnectionIntents::default()),
         pairing_qr: paths.runtime_dir.join("pairing.svg"),
         contact_sync_marker: paths.state_dir.join("contact-names-v2"),
         contact_history_marker: paths.state_dir.join("contact-history-names-v1"),
@@ -3860,10 +3610,8 @@ async fn run_daemon() -> Result<()> {
     });
 
     tokio::spawn(backfill_video_previews(Arc::clone(&shared)));
-    tokio::spawn(maintain_live_location_subscriptions(Arc::clone(&shared)));
     tokio::spawn(run_text_outbox(Arc::clone(&shared)));
     tokio::spawn(run_read_outbox(Arc::clone(&shared)));
-    tokio::spawn(maintain_connection_leases(Arc::clone(&shared)));
     tokio::spawn(run_message_reducer(Arc::clone(&shared), message_queue));
     tokio::spawn(run_app_event_reducer(Arc::clone(&shared), app_event_queue));
 
@@ -3912,7 +3660,6 @@ async fn run_daemon() -> Result<()> {
         let group_shared = Arc::clone(&shared);
         let app_event_shared = Arc::clone(&shared);
         let message_shared = Arc::clone(&shared);
-        let fast_ratchet_shared = Arc::clone(&shared);
         let connected_jobs = Arc::clone(&generation_jobs);
         let history_jobs = Arc::clone(&generation_jobs);
         let contact_jobs = Arc::clone(&generation_jobs);
@@ -3930,10 +3677,6 @@ async fn run_daemon() -> Result<()> {
                 DevicePropsOverride::new()
                     .with_os("Linux")
                     .with_platform_type(wa::device_props::PlatformType::DESKTOP),
-            )
-            .with_enc_handler(
-                "frskmsg",
-                live_location::FastRatchetHandler::new(fast_ratchet_shared),
             )
             .on_event(|event, _client| async move {
                 log_whatsapp_event(&event);
@@ -3977,10 +3720,10 @@ async fn run_daemon() -> Result<()> {
                         .await;
                     let connected_shared = Arc::clone(&shared);
                     connected_jobs.spawn(async move {
-                        let intent = connected_shared.lease_state();
+                        let intent = connected_shared.connection_state();
                         force_reconcile_connection_intent(
                             &connected_shared,
-                            &leases::LeaseState::default(),
+                            &connections::ConnectionState::default(),
                             &intent,
                         )
                         .await;
@@ -3997,10 +3740,6 @@ async fn run_daemon() -> Result<()> {
                     connected_jobs
                         .spawn(sync_group_names(Arc::clone(&shared), Arc::clone(&client)));
                     connected_jobs.spawn(sync_avatars(Arc::clone(&shared), Arc::clone(&client)));
-                    connected_jobs.spawn(restore_live_location_subscriptions(
-                        Arc::clone(&shared),
-                        Arc::clone(&client),
-                    ));
                     connected_jobs.spawn(async move {
                         sync_missing_contact_names(Arc::clone(&shared), Arc::clone(&client)).await;
                         request_missing_contact_history(shared, client).await;
@@ -4211,8 +3950,8 @@ async fn serve(listener: UnixListener, shared: Arc<Shared>) -> Result<()> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn reconcile_connection_intent(
     shared: &Shared,
-    before: &leases::LeaseState,
-    after: &leases::LeaseState,
+    before: &connections::ConnectionState,
+    after: &connections::ConnectionState,
 ) {
     reconcile_connection_intent_inner(shared, before, after, false).await;
 }
@@ -4220,8 +3959,8 @@ async fn reconcile_connection_intent(
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn force_reconcile_connection_intent(
     shared: &Shared,
-    before: &leases::LeaseState,
-    after: &leases::LeaseState,
+    before: &connections::ConnectionState,
+    after: &connections::ConnectionState,
 ) {
     reconcile_connection_intent_inner(shared, before, after, true).await;
 }
@@ -4233,8 +3972,8 @@ fn effective_presence_available(requested: bool, sync_pending: bool) -> bool {
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn reconcile_connection_intent_inner(
     shared: &Shared,
-    before: &leases::LeaseState,
-    after: &leases::LeaseState,
+    before: &connections::ConnectionState,
+    after: &connections::ConnectionState,
     force_presence: bool,
 ) {
     let Some(client) = shared.client.read().await.clone() else {
@@ -4253,7 +3992,7 @@ async fn reconcile_connection_intent_inner(
             client.presence().set_unavailable().await
         };
         if let Err(error) = result {
-            warn!(%error, requested = after.available, available, "could not reconcile leased WhatsApp presence");
+            warn!(%error, requested = after.available, available, "could not reconcile WhatsApp presence");
         }
     }
     for raw in before.active_chats.difference(&after.active_chats) {
@@ -4261,7 +4000,7 @@ async fn reconcile_connection_intent_inner(
             && !jid.is_group()
             && let Err(error) = client.presence().unsubscribe(&jid).await
         {
-            warn!(%error, %jid, "could not unsubscribe expired active-chat presence");
+            warn!(%error, %jid, "could not unsubscribe inactive-chat presence");
         }
     }
     for raw in after.active_chats.difference(&before.active_chats) {
@@ -4269,30 +4008,7 @@ async fn reconcile_connection_intent_inner(
             && !jid.is_group()
             && let Err(error) = client.presence().subscribe(jid.clone()).await
         {
-            warn!(%error, %jid, "could not subscribe leased active-chat presence");
-        }
-    }
-}
-
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn maintain_connection_leases(shared: Arc<Shared>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        let now = Utc::now().timestamp();
-        let transition = {
-            let mut leases = shared
-                .leases
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let before = leases.state(now);
-            let expired = leases.expire(now);
-            (!expired.is_empty()).then(|| (before, leases.state(now), expired))
-        };
-        if let Some((before, after, expired)) = transition {
-            debug!(?expired, "expired stale IPC connection leases");
-            reconcile_connection_intent(&shared, &before, &after).await;
+            warn!(%error, %jid, "could not subscribe active-chat presence");
         }
     }
 }
@@ -4322,9 +4038,9 @@ async fn write_connection_sync(
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn serve_connection(stream: UnixStream, shared: Arc<Shared>) -> Result<()> {
-    let connection_id = shared.open_connection_lease();
+    let connection_id = shared.open_connection();
     let result = serve_connection_inner(stream, Arc::clone(&shared), connection_id).await;
-    let (before, after) = shared.close_connection_lease(connection_id);
+    let (before, after) = shared.close_connection(connection_id);
     reconcile_connection_intent(&shared, &before, &after).await;
     result
 }
@@ -4360,7 +4076,6 @@ async fn serve_connection_inner(
                         continue;
                     }
                 };
-                shared.touch_connection_lease(connection_id);
                 let id = frame.id;
                 let Ok(queue_slot) = Arc::clone(&queue_slots).try_acquire_owned() else {
                     write_frame(&mut write, &shared.response(id, ServerEvent::Error {
@@ -4506,21 +4221,22 @@ enum MediaDownloadKind {
 }
 
 impl MediaDownloadKind {
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "image" => Some(Self::Image),
+            "sticker" => Some(Self::Sticker),
+            "video" => Some(Self::Video),
+            "audio" => Some(Self::Audio),
+            _ => None,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Image => "image",
             Self::Sticker => "sticker",
             Self::Video => "video",
             Self::Audio => "audio",
-        }
-    }
-
-    fn mismatch_error(self) -> &'static str {
-        match self {
-            Self::Image => "message is not an image",
-            Self::Sticker => "message is not a sticker",
-            Self::Video => "message is not a video",
-            Self::Audio => "message is not audio",
         }
     }
 }
@@ -4534,11 +4250,9 @@ async fn start_media_download(
     shared: &Arc<Shared>,
     chat_jid: String,
     message_id: String,
-    kind: MediaDownloadKind,
 ) -> Result<ServerEvent> {
-    let label = kind.label();
     if message_id.is_empty() || message_id.len() > 512 {
-        bail!("invalid {label} message ID");
+        bail!("invalid media message ID");
     }
     let client = shared
         .client
@@ -4547,14 +4261,13 @@ async fn start_media_download(
         .clone()
         .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
     let chat_jid = canonical_requested_jid(shared, &chat_jid).await;
-    if shared
+    let stored_kind = shared
         .database
         .message_media_kind(&chat_jid, &message_id)?
-        .as_deref()
-        != Some(label)
-    {
-        bail!("{}", kind.mismatch_error());
-    }
+        .ok_or_else(|| anyhow!("message does not contain downloadable media"))?;
+    let kind = MediaDownloadKind::from_label(&stored_kind)
+        .ok_or_else(|| anyhow!("this media type does not require a download"))?;
+    let label = kind.label();
     let key = format!("{chat_jid}\0{message_id}");
     {
         let mut downloads = shared.media_downloads.lock().await;
@@ -5365,22 +5078,10 @@ async fn handle_command(
             }
             Ok(ServerEvent::Ack)
         }
-        Command::DownloadImage {
+        Command::DownloadMedia {
             chat_jid,
             message_id,
-        } => start_media_download(shared, chat_jid, message_id, MediaDownloadKind::Image).await,
-        Command::DownloadSticker {
-            chat_jid,
-            message_id,
-        } => start_media_download(shared, chat_jid, message_id, MediaDownloadKind::Sticker).await,
-        Command::DownloadVideo {
-            chat_jid,
-            message_id,
-        } => start_media_download(shared, chat_jid, message_id, MediaDownloadKind::Video).await,
-        Command::DownloadAudio {
-            chat_jid,
-            message_id,
-        } => start_media_download(shared, chat_jid, message_id, MediaDownloadKind::Audio).await,
+        } => start_media_download(shared, chat_jid, message_id).await,
         Command::React {
             chat_jid,
             message_id,
@@ -5518,12 +5219,12 @@ async fn handle_command(
                 }
                 None => None,
             };
-            let (before, after) = shared.set_lease_active_chat(connection_id, next)?;
+            let (before, after) = shared.set_connection_active_chat(connection_id, next)?;
             reconcile_connection_intent(shared, &before, &after).await;
             Ok(ServerEvent::Ack)
         }
         Command::SetPresence { available } => {
-            let (before, after) = shared.set_lease_available(connection_id, available)?;
+            let (before, after) = shared.set_connection_available(connection_id, available)?;
             reconcile_connection_intent(shared, &before, &after).await;
             Ok(ServerEvent::Ack)
         }
@@ -5608,6 +5309,7 @@ mod tests {
     use whatsapp_rust::wacore::types::{
         events::Receipt, message::MessageSource, presence::ReceiptType,
     };
+    use whatsapp_rust::wacore_binary::builder::NodeBuilder;
 
     pub(crate) fn test_shared(directory: &tempfile::TempDir) -> Shared {
         let (events, _) = broadcast::channel(8);
@@ -5628,7 +5330,7 @@ mod tests {
             client: RwLock::new(None),
             events,
             clock: revisions::RevisionClock::default(),
-            leases: StdMutex::new(leases::LeaseBook::default()),
+            connection_intents: StdMutex::new(connections::ConnectionIntents::default()),
             pairing_qr: directory.path().join("pairing.svg"),
             contact_sync_marker: directory.path().join("contact-names-v2"),
             contact_history_marker: directory.path().join("contact-history-names-v1"),
@@ -5720,29 +5422,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_lease_gates_markers_and_state_are_locally_consistent() {
+    async fn shared_connection_gates_markers_and_state_are_locally_consistent() {
         let directory = tempfile::tempdir().unwrap();
         let mut shared = test_shared(&directory);
         assets::private_dir(&shared.avatar_dir).unwrap();
-        let lease = shared.open_connection_lease();
-        shared.touch_connection_lease(lease);
+        let connection = shared.open_connection();
         assert!(
             shared
-                .set_lease_active_chat(999, Some("ignored".into()))
+                .set_connection_active_chat(999, Some("ignored".into()))
                 .is_err()
         );
-        assert!(shared.set_lease_available(999, true).is_err());
+        assert!(shared.set_connection_available(999, true).is_err());
         let (_, active) = shared
-            .set_lease_active_chat(lease, Some("chat@s.whatsapp.net".into()))
+            .set_connection_active_chat(connection, Some("chat@s.whatsapp.net".into()))
             .unwrap();
         assert!(active.active_chats.contains("chat@s.whatsapp.net"));
         assert!(shared.chat_is_focused("chat@s.whatsapp.net"));
-        let (_, available) = shared.set_lease_available(lease, true).unwrap();
+        let (_, available) = shared.set_connection_available(connection, true).unwrap();
         assert!(available.available);
-        assert_eq!(shared.lease_state(), available);
-        let (before_close, after_close) = shared.close_connection_lease(lease);
+        assert_eq!(shared.connection_state(), available);
+        let (before_close, after_close) = shared.close_connection(connection);
         assert_ne!(before_close, after_close);
-        let (before_second, after_second) = shared.close_connection_lease(lease);
+        let (before_second, after_second) = shared.close_connection(connection);
         assert_eq!(before_second, after_second);
 
         let first = shared.command_gate("chat").await;
@@ -6219,7 +5920,7 @@ mod tests {
     async fn offline_presence_and_active_chat_intent_are_retained() {
         let directory = tempfile::tempdir().unwrap();
         let shared = Arc::new(test_shared(&directory));
-        let connection_id = shared.open_connection_lease();
+        let connection_id = shared.open_connection();
 
         assert_eq!(
             handle_command(
@@ -6231,7 +5932,7 @@ mod tests {
             .unwrap(),
             ServerEvent::Ack
         );
-        assert!(shared.lease_state().available);
+        assert!(shared.connection_state().available);
 
         assert_eq!(
             handle_command(
@@ -6246,7 +5947,7 @@ mod tests {
             ServerEvent::Ack
         );
         assert_eq!(
-            shared.lease_state().active_chats,
+            shared.connection_state().active_chats,
             HashSet::from(["1@s.whatsapp.net".into()])
         );
         assert!(
@@ -7202,20 +6903,17 @@ mod tests {
     }
 
     #[test]
-    fn media_download_kind_labels_and_errors_are_explicit() {
-        for (kind, label, error) in [
-            (MediaDownloadKind::Image, "image", "message is not an image"),
-            (
-                MediaDownloadKind::Sticker,
-                "sticker",
-                "message is not a sticker",
-            ),
-            (MediaDownloadKind::Video, "video", "message is not a video"),
-            (MediaDownloadKind::Audio, "audio", "message is not audio"),
+    fn media_download_kind_is_derived_from_stored_media() {
+        for (kind, label) in [
+            (MediaDownloadKind::Image, "image"),
+            (MediaDownloadKind::Sticker, "sticker"),
+            (MediaDownloadKind::Video, "video"),
+            (MediaDownloadKind::Audio, "audio"),
         ] {
             assert_eq!(kind.label(), label);
-            assert_eq!(kind.mismatch_error(), error);
+            assert_eq!(MediaDownloadKind::from_label(label).unwrap().label(), label);
         }
+        assert!(MediaDownloadKind::from_label("document").is_none());
     }
 
     #[test]

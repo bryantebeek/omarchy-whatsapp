@@ -18,6 +18,7 @@ const MENU_BLOCK_BEGIN: &str = "  // BEGIN omarchy-whatsapp launcher chats (gene
 const MENU_BLOCK_END: &str = "  // END omarchy-whatsapp launcher chats";
 const WHATSAPP_MENU_ICON: &str = "\u{f05a3}";
 const PLUGIN_ID: &str = "io.github.bryantebeek.whatsapp";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(135);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Control and inspect the Omarchy WhatsApp daemon")]
@@ -184,8 +185,7 @@ fn command_for_action(action: Action) -> Result<Command> {
 }
 
 async fn request(socket: &Path, command: Command) -> Result<ServerEvent> {
-    let timeout = request_timeout(&command);
-    request_with_timeout(socket, command, timeout).await
+    request_with_timeout(socket, command, REQUEST_TIMEOUT).await
 }
 
 async fn request_with_timeout(
@@ -201,17 +201,6 @@ async fn request_with_timeout(
                 timeout.as_secs()
             )
         })?
-}
-
-fn request_timeout(command: &Command) -> Duration {
-    match command {
-        Command::CreatePoll { .. } | Command::SendVoiceMessage { .. } => Duration::from_secs(130),
-        Command::DownloadImage { .. }
-        | Command::DownloadSticker { .. }
-        | Command::DownloadVideo { .. }
-        | Command::DownloadAudio { .. } => Duration::from_secs(70),
-        _ => Duration::from_secs(40),
-    }
 }
 
 async fn request_inner(socket: &Path, command: Command) -> Result<ServerEvent> {
@@ -539,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn every_cli_action_maps_to_the_expected_protocol_command_and_timeout() {
+    fn every_cli_action_maps_to_the_expected_protocol_command() {
         assert_eq!(
             command_for_action(Action::Status).unwrap(),
             Command::GetState
@@ -569,7 +558,6 @@ mod tests {
             correct_option_index: Some(1),
         })
         .unwrap();
-        assert_eq!(request_timeout(&poll), Duration::from_secs(130));
         assert!(matches!(
             poll,
             Command::CreatePoll {
@@ -602,42 +590,7 @@ mod tests {
         );
         assert!(command_for_action(Action::LauncherRemove { menu_path: None }).is_err());
 
-        assert_eq!(request_timeout(&Command::Ping), Duration::from_secs(40));
-        assert_eq!(
-            request_timeout(&Command::DownloadImage {
-                chat_jid: "c".into(),
-                message_id: "m".into(),
-            }),
-            Duration::from_secs(70)
-        );
-        assert_eq!(
-            request_timeout(&Command::DownloadSticker {
-                chat_jid: "c".into(),
-                message_id: "m".into(),
-            }),
-            Duration::from_secs(70)
-        );
-        assert_eq!(
-            request_timeout(&Command::DownloadVideo {
-                chat_jid: "c".into(),
-                message_id: "m".into(),
-            }),
-            Duration::from_secs(70)
-        );
-        assert_eq!(
-            request_timeout(&Command::DownloadAudio {
-                chat_jid: "c".into(),
-                message_id: "m".into(),
-            }),
-            Duration::from_secs(70)
-        );
-        assert_eq!(
-            request_timeout(&Command::SendVoiceMessage {
-                chat_jid: "c".into(),
-                recording_id: "r".into(),
-            }),
-            Duration::from_secs(130)
-        );
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(135));
     }
 
     #[tokio::test]

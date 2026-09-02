@@ -33,7 +33,8 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
-  readonly property int protocolVersion: 28
+  readonly property int protocolVersion: 29
+  readonly property int requestTimeoutMs: 135000
 
   property bool connected: false
   property bool protocolCompatible: false
@@ -670,195 +671,9 @@ Item {
     }, null, 2) + "\n")
   }
 
-  function normalizeMessages(value) {
-    var output = copyArray(value)
-    for (var i = 0; i < output.length; i++) {
-      var source = output[i] || {}
-      var receipt = Math.floor(Number(source.receipt || 0))
-      source.receipt = isFinite(receipt) ? Math.max(0, Math.min(4, receipt)) : 0
-      var deliveredAt = Math.floor(Number(source.delivered_at || 0))
-      source.delivered_at = isFinite(deliveredAt) && deliveredAt > 0
-        ? deliveredAt : 0
-      var readAt = Math.floor(Number(source.read_at || 0))
-      source.read_at = isFinite(readAt) && readAt > 0 ? readAt : 0
-      var deliveries = copyArray(source.delivered_to)
-      var normalizedDeliveries = []
-      var seenDeliveries = ({})
-      for (var deliveryIndex = 0;
-          deliveryIndex < deliveries.length; deliveryIndex++) {
-        var delivery = deliveries[deliveryIndex] || {}
-        var deliveryJid = String(delivery.jid || "")
-        if (!deliveryJid || seenDeliveries[deliveryJid] === true) continue
-        seenDeliveries[deliveryJid] = true
-        var recipientDeliveredAt = Math.floor(Number(delivery.delivered_at || 0))
-        normalizedDeliveries.push({
-          jid: deliveryJid,
-          name: String(delivery.name || ""),
-          delivered_at: isFinite(recipientDeliveredAt) && recipientDeliveredAt > 0
-            ? recipientDeliveredAt : 0
-        })
-      }
-      source.delivered_to = normalizedDeliveries
-      var readers = copyArray(source.read_by)
-      var normalizedReaders = []
-      var seenReaders = ({})
-      for (var readerIndex = 0; readerIndex < readers.length; readerIndex++) {
-        var reader = readers[readerIndex] || {}
-        var readerJid = String(reader.jid || "")
-        if (!readerJid || seenReaders[readerJid] === true) continue
-        seenReaders[readerJid] = true
-        var readerReadAt = Math.floor(Number(reader.read_at || 0))
-        normalizedReaders.push({
-          jid: readerJid,
-          name: String(reader.name || ""),
-          read_at: isFinite(readerReadAt) && readerReadAt > 0
-            ? readerReadAt : 0
-        })
-      }
-      source.read_by = normalizedReaders
-      var reactions = source.reactions
-      var normalized = []
-      if (reactions && typeof reactions.length === "number")
-        for (var j = 0; j < reactions.length; j++) normalized.push(reactions[j])
-      source.reactions = normalized
-      output[i] = source
-    }
-    return output
-  }
-
   function replaceMessages(value, preservePosition) {
     messagesWillChange(preservePosition === true)
     messages = copyArray(value)
-  }
-
-  function applyReceipts(frame) {
-    var nextReceipt = Math.floor(Number(frame ? frame.receipt || 0 : 0))
-    if (!isFinite(nextReceipt) || nextReceipt < 1) return false
-    nextReceipt = Math.min(4, nextReceipt)
-    var messageIds = copyArray(frame.message_ids)
-    var wanted = ({})
-    for (var i = 0; i < messageIds.length; i++)
-      wanted[String(messageIds[i] || "")] = true
-    var updated = messages.slice()
-    var changed = false
-    var eventTimestamp = Math.floor(Number(frame ? frame.timestamp || 0 : 0))
-    if (!isFinite(eventTimestamp) || eventTimestamp <= 0) eventTimestamp = 0
-    var eventDelivery = frame && frame.delivery ? frame.delivery : null
-    var eventDeliveryJid = String(eventDelivery ? eventDelivery.jid || "" : "")
-    var eventReader = frame && frame.reader ? frame.reader : null
-    var eventReaderJid = String(eventReader ? eventReader.jid || "" : "")
-    for (var messageIndex = 0; messageIndex < updated.length; messageIndex++) {
-      var message = updated[messageIndex] || {}
-      if (message.from_me !== true || wanted[String(message.id || "")] !== true)
-        continue
-      var replacement = null
-      if (Number(message.receipt || 0) < nextReceipt) {
-        replacement = Object.assign({}, message)
-        replacement.receipt = nextReceipt
-      }
-      var deliveredAt = Math.floor(Number(message.delivered_at || 0))
-      if (nextReceipt === 2 && eventTimestamp
-          && (!deliveredAt || eventTimestamp < deliveredAt)) {
-        if (!replacement) replacement = Object.assign({}, message)
-        replacement.delivered_at = eventTimestamp
-      }
-      var readAt = Math.floor(Number(message.read_at || 0))
-      if (nextReceipt >= 3 && eventTimestamp
-          && (!readAt || eventTimestamp < readAt)) {
-        if (!replacement) replacement = Object.assign({}, message)
-        replacement.read_at = eventTimestamp
-      }
-      if (nextReceipt === 2 && eventDeliveryJid) {
-        var deliveredTo = copyArray(message.delivered_to)
-        var existingDelivery = -1
-        for (var deliveryIndex = 0;
-            deliveryIndex < deliveredTo.length; deliveryIndex++) {
-          if (String((deliveredTo[deliveryIndex] || {}).jid || "")
-              === eventDeliveryJid) {
-            existingDelivery = deliveryIndex
-            break
-          }
-        }
-        var nextDeliveredAt = Math.floor(Number(
-          eventDelivery.delivered_at || eventTimestamp || 0))
-        if (!isFinite(nextDeliveredAt) || nextDeliveredAt <= 0)
-          nextDeliveredAt = 0
-        var nextDelivery = {
-          jid: eventDeliveryJid,
-          name: String(eventDelivery.name || ""),
-          delivered_at: nextDeliveredAt
-        }
-        if (existingDelivery < 0) {
-          deliveredTo.push(nextDelivery)
-          if (!replacement) replacement = Object.assign({}, message)
-          replacement.delivered_to = deliveredTo
-        } else {
-          var currentDelivery = deliveredTo[existingDelivery] || {}
-          var currentDeliveredAt = Math.floor(Number(
-            currentDelivery.delivered_at || 0))
-          var deliveryNameChanged = nextDelivery.name
-            && String(currentDelivery.name || "") !== nextDelivery.name
-          var deliveryTimeChanged = nextDelivery.delivered_at
-            && (!currentDeliveredAt
-              || nextDelivery.delivered_at < currentDeliveredAt)
-          if (deliveryNameChanged || deliveryTimeChanged) {
-            deliveredTo[existingDelivery] = {
-              jid: eventDeliveryJid,
-              name: deliveryNameChanged ? nextDelivery.name
-                : String(currentDelivery.name || ""),
-              delivered_at: deliveryTimeChanged
-                ? nextDelivery.delivered_at : currentDeliveredAt
-            }
-            if (!replacement) replacement = Object.assign({}, message)
-            replacement.delivered_to = deliveredTo
-          }
-        }
-      }
-      if (nextReceipt >= 3 && eventReaderJid) {
-        var readBy = copyArray(message.read_by)
-        var existingReader = -1
-        for (var readIndex = 0; readIndex < readBy.length; readIndex++)
-          if (String((readBy[readIndex] || {}).jid || "") === eventReaderJid) {
-            existingReader = readIndex
-            break
-          }
-        var nextReaderAt = Math.floor(Number(
-          eventReader.read_at || eventTimestamp || 0))
-        if (!isFinite(nextReaderAt) || nextReaderAt <= 0) nextReaderAt = 0
-        var nextReader = {
-          jid: eventReaderJid,
-          name: String(eventReader.name || ""),
-          read_at: nextReaderAt
-        }
-        if (existingReader < 0) {
-          readBy.push(nextReader)
-          if (!replacement) replacement = Object.assign({}, message)
-          replacement.read_by = readBy
-        } else {
-          var currentReader = readBy[existingReader] || {}
-          var currentReaderAt = Math.floor(Number(currentReader.read_at || 0))
-          var readerNameChanged = nextReader.name
-            && String(currentReader.name || "") !== nextReader.name
-          var readerTimeChanged = nextReader.read_at
-            && (!currentReaderAt || nextReader.read_at < currentReaderAt)
-          if (readerNameChanged || readerTimeChanged) {
-            readBy[existingReader] = {
-              jid: eventReaderJid,
-              name: readerNameChanged ? nextReader.name
-                : String(currentReader.name || ""),
-              read_at: readerTimeChanged ? nextReader.read_at : currentReaderAt
-            }
-            if (!replacement) replacement = Object.assign({}, message)
-            replacement.read_by = readBy
-          }
-        }
-      }
-      if (!replacement) continue
-      updated[messageIndex] = replacement
-      changed = true
-    }
-    if (changed) replaceMessages(updated, true)
-    return changed
   }
 
   function hexKey(value) {
@@ -965,17 +780,10 @@ Item {
     var commands = Object.assign({}, requestCommands)
     var deadlines = Object.assign({}, requestDeadlines)
     commands[String(payload.id)] = payload.command
-    deadlines[String(payload.id)] = Date.now() + commandTimeoutMs(payload.command)
+    deadlines[String(payload.id)] = Date.now() + requestTimeoutMs
     requestCommands = commands
     requestDeadlines = deadlines
     return payload.id
-  }
-
-  function commandTimeoutMs(command) {
-    var value = String(command || "")
-    if (value === "send_voice_message") return 120000
-    if (["resync_chat_state", "logout"].indexOf(value) >= 0) return 60000
-    return 30000
   }
 
   function finishRequest(frame) {
@@ -1177,12 +985,8 @@ Item {
       return false
     var kind = String(message.media ? message.media.kind || "" : "")
     if (kind === "sticker" && message.media.lottie === true) return false
-    var command = kind === "image" ? "download_image"
-      : (kind === "sticker" ? "download_sticker"
-        : (kind === "video" ? "download_video"
-          : (kind === "audio" ? "download_audio" : "")))
-    if (!command) return false
-    var requestId = send(command, {
+    if (["image", "sticker", "video", "audio"].indexOf(kind) < 0) return false
+    var requestId = send("download_media", {
       chat_jid: String(message.chat_jid),
       message_id: String(message.id)
     })
@@ -1358,10 +1162,6 @@ Item {
     if (resource === "chats") return send("list_chats", { limit: 500 }) > 0
     if (resource === "messages")
       return key === selectedChatJid && requestMessages(key, true) > 0
-    if (resource === "unread") return send("get_state") > 0
-    if (resource === "avatars") return send("list_avatars") > 0
-    if (resource === "text_outbox") return send("list_text_outbox") > 0
-    if (resource === "voice_outbox") return send("list_voice_outbox") > 0
     return false
   }
 
@@ -1594,8 +1394,6 @@ Item {
       clearMediaDownloadState(frame.chat_jid, frame.message_id)
       lastError = String(frame.message || "WhatsApp media download failed")
       lastErrorRequestId = ""
-    } else if (frame.event === "receipts") {
-      applyReceipts(frame)
     } else if (frame.event === "presence") {
       applyPresence(frame)
     } else if (frame.event === "chat_state") {
@@ -1621,8 +1419,7 @@ Item {
         messagesResponseHasFollowup = queuedMessagesJid === selectedChatJid
         messagesChatJid = String(frame.chat_jid || "")
         messagesFirstUnreadId = String(frame.first_unread_message_id || "")
-        var normalizedMessages = normalizeMessages(frame.messages)
-        replaceMessages(normalizedMessages, preserveMessagePosition)
+        replaceMessages(frame.messages, preserveMessagePosition)
         mediaRevision++
         mediaOverrides = ({})
         mediaOverrideRevisions = ({})
@@ -1790,13 +1587,6 @@ Item {
       root.presenceClock = Date.now() / 1000
       root.expireChatStates(root.presenceClock)
     }
-  }
-
-  Timer {
-    interval: 30000
-    repeat: true
-    running: root.connected
-    onTriggered: root.send("ping")
   }
 
   Timer {

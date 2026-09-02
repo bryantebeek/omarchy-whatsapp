@@ -49,10 +49,7 @@ pub fn conflict_key(command: &Command) -> Option<String> {
         Command::ResyncChatState | Command::Logout => "global-session".into(),
         // Downloads and avatar fetches only enqueue background work; their own
         // in-flight sets already deduplicate per resource.
-        Command::DownloadImage { .. }
-        | Command::DownloadSticker { .. }
-        | Command::DownloadVideo { .. }
-        | Command::DownloadAudio { .. }
+        Command::DownloadMedia { .. }
         | Command::RequestAvatar { .. }
         | Command::GetState
         | Command::ListChats { .. }
@@ -89,26 +86,11 @@ mod tests {
         assert_eq!(timeout(&Command::Ping), Duration::from_secs(30));
         // Media downloads only enqueue a background job, so the command itself
         // keeps the short default deadline.
-        for command in [
-            Command::DownloadImage {
-                chat_jid: "chat".into(),
-                message_id: "m".into(),
-            },
-            Command::DownloadSticker {
-                chat_jid: "chat".into(),
-                message_id: "m".into(),
-            },
-            Command::DownloadVideo {
-                chat_jid: "chat".into(),
-                message_id: "m".into(),
-            },
-            Command::DownloadAudio {
-                chat_jid: "chat".into(),
-                message_id: "m".into(),
-            },
-        ] {
-            assert_eq!(timeout(&command), Duration::from_secs(30));
-        }
+        let command = Command::DownloadMedia {
+            chat_jid: "chat".into(),
+            message_id: "m".into(),
+        };
+        assert_eq!(timeout(&command), Duration::from_secs(30));
         assert_eq!(
             timeout(&Command::CreatePoll {
                 chat_jid: "chat".into(),
@@ -229,19 +211,7 @@ mod tests {
             Command::GetGroupParticipants {
                 chat_jid: "chat".into(),
             },
-            Command::DownloadImage {
-                chat_jid: "chat".into(),
-                message_id: "m".into(),
-            },
-            Command::DownloadSticker {
-                chat_jid: "chat".into(),
-                message_id: "m".into(),
-            },
-            Command::DownloadVideo {
-                chat_jid: "chat".into(),
-                message_id: "m".into(),
-            },
-            Command::DownloadAudio {
+            Command::DownloadMedia {
                 chat_jid: "chat".into(),
                 message_id: "m".into(),
             },

@@ -297,8 +297,6 @@ fn ensure_message_identity_schema(connection: &mut Connection) -> Result<()> {
             timestamp      INTEGER NOT NULL,
             from_me        INTEGER NOT NULL,
             read           INTEGER NOT NULL DEFAULT 0,
-            starred        INTEGER NOT NULL DEFAULT 0,
-            star_updated_at INTEGER NOT NULL DEFAULT 0,
             receipt        INTEGER NOT NULL DEFAULT 0,
             delivered_at   INTEGER,
             receipt_read_at INTEGER,
@@ -309,10 +307,10 @@ fn ensure_message_identity_schema(connection: &mut Connection) -> Result<()> {
          );
          INSERT INTO messages
          (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, read,
-          starred, star_updated_at, receipt, delivered_at, receipt_read_at,
+          receipt, delivered_at, receipt_read_at,
           media_json, media_download)
          SELECT chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, read,
-                starred, star_updated_at, receipt, delivered_at, receipt_read_at,
+                receipt, delivered_at, receipt_read_at,
                 media_json, media_download
          FROM messages_legacy_identity;
          DROP TABLE messages_legacy_identity;
@@ -349,13 +347,6 @@ pub struct HistoryCursor {
     pub sender_jid: String,
     pub from_me: bool,
     pub timestamp_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveLiveLocation {
-    pub chat_jid: String,
-    pub message_id: String,
-    pub duration_seconds: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,8 +415,6 @@ impl Database {
                 timestamp   INTEGER NOT NULL,
                 from_me     INTEGER NOT NULL,
                 read        INTEGER NOT NULL DEFAULT 0,
-                starred     INTEGER NOT NULL DEFAULT 0,
-                star_updated_at INTEGER NOT NULL DEFAULT 0,
                 receipt     INTEGER NOT NULL DEFAULT 0,
                 delivered_at   INTEGER,
                 receipt_read_at INTEGER,
@@ -465,10 +454,6 @@ impl Database {
                 read_state                INTEGER,
                 read_state_updated_at     INTEGER NOT NULL DEFAULT 0,
                 explicit_unread           INTEGER NOT NULL DEFAULT 0,
-                status_muted              INTEGER,
-                status_mute_updated_at    INTEGER NOT NULL DEFAULT 0,
-                disappearing_duration     INTEGER,
-                disappearing_updated_at   INTEGER,
                 deleted                    INTEGER NOT NULL DEFAULT 0,
                 cleared_at                 INTEGER NOT NULL DEFAULT 0,
                 read_boundary              INTEGER NOT NULL DEFAULT 0,
@@ -517,25 +502,6 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS poll_votes_by_message
                 ON poll_votes(chat_jid, message_id);
-            CREATE TABLE IF NOT EXISTS labels (
-                id      TEXT PRIMARY KEY,
-                name    TEXT NOT NULL DEFAULT '',
-                color   INTEGER,
-                deleted INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS chat_labels (
-                chat_jid TEXT NOT NULL,
-                label_id TEXT NOT NULL,
-                PRIMARY KEY (chat_jid, label_id)
-            );
-            CREATE TABLE IF NOT EXISTS fast_ratchet_sender_keys (
-                sender_id   TEXT NOT NULL,
-                key_id      INTEGER NOT NULL,
-                iteration   INTEGER NOT NULL,
-                chain_keys  BLOB NOT NULL,
-                signing_key BLOB NOT NULL,
-                PRIMARY KEY (sender_id, key_id)
-            );
             CREATE TABLE IF NOT EXISTS inbound_inbox (
                 chat_jid     TEXT NOT NULL,
                 sender_jid   TEXT NOT NULL,
@@ -588,12 +554,6 @@ impl Database {
         for (table, column, declaration) in [
             ("messages", "read", "read INTEGER NOT NULL DEFAULT 0"),
             ("contacts", "source", "source INTEGER NOT NULL DEFAULT 0"),
-            ("messages", "starred", "starred INTEGER NOT NULL DEFAULT 0"),
-            (
-                "messages",
-                "star_updated_at",
-                "star_updated_at INTEGER NOT NULL DEFAULT 0",
-            ),
             ("messages", "receipt", "receipt INTEGER NOT NULL DEFAULT 0"),
             ("messages", "delivered_at", "delivered_at INTEGER"),
             ("messages", "receipt_read_at", "receipt_read_at INTEGER"),
@@ -688,11 +648,6 @@ impl Database {
                 "read_state_updated_at",
                 "read_state_updated_at INTEGER NOT NULL DEFAULT 0",
             ),
-            (
-                "chat_settings",
-                "status_mute_updated_at",
-                "status_mute_updated_at INTEGER NOT NULL DEFAULT 0",
-            ),
         ] {
             ensure_column(&connection, table, column, declaration)?;
         }
@@ -777,12 +732,12 @@ impl Database {
             DELETE FROM poll_secrets;
             DELETE FROM message_tombstones;
             DELETE FROM messages;
-            DELETE FROM chat_labels;
+            DROP TABLE IF EXISTS chat_labels;
             DELETE FROM chat_settings;
             DELETE FROM chats;
             DELETE FROM contacts;
-            DELETE FROM labels;
-            DELETE FROM fast_ratchet_sender_keys;
+            DROP TABLE IF EXISTS labels;
+            DROP TABLE IF EXISTS fast_ratchet_sender_keys;
             DELETE FROM inbound_inbox;
             DELETE FROM text_outbox;
             DELETE FROM pending_read_messages;
@@ -2198,51 +2153,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn apply_status_mute_at(&self, jid: &str, muted: bool, updated_at: i64) -> Result<()> {
-        let connection = self.connection();
-        connection.execute(
-            "INSERT INTO chat_settings (jid, status_muted, status_mute_updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(jid) DO UPDATE SET
-                status_muted = excluded.status_muted,
-                status_mute_updated_at = excluded.status_mute_updated_at
-             WHERE excluded.status_mute_updated_at >= chat_settings.status_mute_updated_at",
-            params![jid, muted, updated_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn apply_disappearing_mode(&self, jid: &str, duration: u32, updated_at: i64) -> Result<()> {
-        let connection = self.connection();
-        connection.execute(
-            "INSERT INTO chat_settings
-             (jid, disappearing_duration, disappearing_updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(jid) DO UPDATE SET
-                disappearing_duration = excluded.disappearing_duration,
-                disappearing_updated_at = excluded.disappearing_updated_at
-             WHERE COALESCE(chat_settings.disappearing_updated_at, 0) <= excluded.disappearing_updated_at",
-            params![jid, duration, updated_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn star_message_at(
-        &self,
-        chat_jid: &str,
-        message_id: &str,
-        starred: bool,
-        updated_at: i64,
-    ) -> Result<()> {
-        let connection = self.connection();
-        connection.execute(
-            "UPDATE messages SET starred = ?3, star_updated_at = ?4
-             WHERE chat_jid = ?1 AND id = ?2 AND star_updated_at <= ?4",
-            params![chat_jid, message_id, starred, updated_at],
-        )?;
-        Ok(())
-    }
-
     pub fn update_receipts(
         &self,
         chat_jid: &str,
@@ -2462,7 +2372,6 @@ impl Database {
             Self::refresh_chat_tail(&transaction, chat_jid)?;
         } else {
             transaction.execute("DELETE FROM chats WHERE jid = ?1", [chat_jid])?;
-            transaction.execute("DELETE FROM chat_labels WHERE chat_jid = ?1", [chat_jid])?;
         }
         transaction.execute(
             "INSERT INTO chat_settings (jid, deleted, cleared_at) VALUES (?1, 1, ?2)
@@ -2683,154 +2592,6 @@ impl Database {
         Ok(updated)
     }
 
-    pub fn active_live_locations_for_sender(
-        &self,
-        sender_jid: &str,
-        now: i64,
-    ) -> Result<Vec<ActiveLiveLocation>> {
-        const MAX_LIVE_LOCATION_SECONDS: i64 = 8 * 60 * 60;
-
-        let connection = self.connection();
-        let mut statement = connection.prepare(
-            "SELECT chat_jid, id, timestamp, media_json FROM messages
-             WHERE sender_jid = ?1
-               AND media_json LIKE '%\"kind\":\"location\"%'
-               AND media_json LIKE '%\"live\":true%'",
-        )?;
-        let rows = statement.query_map([sender_jid], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut locations = Vec::new();
-        for row in rows {
-            let (chat_jid, message_id, started_at, json) = row?;
-            let Ok(MessageMedia::Location {
-                live: true,
-                duration_seconds,
-                ..
-            }) = serde_json::from_str(&json)
-            else {
-                continue;
-            };
-            let lifetime = if duration_seconds == 0 {
-                MAX_LIVE_LOCATION_SECONDS
-            } else {
-                i64::from(duration_seconds)
-            };
-            if started_at.saturating_add(lifetime) >= now {
-                locations.push(ActiveLiveLocation {
-                    chat_jid,
-                    message_id,
-                    duration_seconds,
-                });
-            }
-        }
-        Ok(locations)
-    }
-
-    pub fn active_live_location_targets(&self, now: i64) -> Result<Vec<(String, bool)>> {
-        const MAX_LIVE_LOCATION_SECONDS: i64 = 8 * 60 * 60;
-
-        let connection = self.connection();
-        let mut statement = connection.prepare(
-            "SELECT messages.chat_jid, chats.is_group, messages.timestamp, messages.media_json
-             FROM messages JOIN chats ON chats.jid = messages.chat_jid
-             WHERE messages.media_json LIKE '%\"kind\":\"location\"%'
-               AND messages.media_json LIKE '%\"live\":true%'",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, bool>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut targets = std::collections::BTreeSet::new();
-        for row in rows {
-            let (chat_jid, is_group, started_at, json) = row?;
-            let Ok(MessageMedia::Location {
-                live: true,
-                duration_seconds,
-                ..
-            }) = serde_json::from_str(&json)
-            else {
-                continue;
-            };
-            let lifetime = if duration_seconds == 0 {
-                MAX_LIVE_LOCATION_SECONDS
-            } else {
-                i64::from(duration_seconds)
-            };
-            if started_at.saturating_add(lifetime) >= now {
-                targets.insert((chat_jid, is_group));
-            }
-        }
-        Ok(targets.into_iter().collect())
-    }
-
-    pub fn store_fast_ratchet_state(
-        &self,
-        sender_id: &str,
-        state: &crate::live_location::FastRatchetState,
-    ) -> Result<()> {
-        let connection = self.connection();
-        connection.execute(
-            "INSERT INTO fast_ratchet_sender_keys
-                (sender_id, key_id, iteration, chain_keys, signing_key)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(sender_id, key_id) DO UPDATE SET
-                iteration = excluded.iteration,
-                chain_keys = excluded.chain_keys,
-                signing_key = excluded.signing_key
-             WHERE excluded.iteration >= fast_ratchet_sender_keys.iteration",
-            params![
-                sender_id,
-                i64::from(state.sender_key_id),
-                i64::from(state.iteration),
-                state.encode_chain_keys(),
-                &state.signing_key,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn fast_ratchet_state(
-        &self,
-        sender_id: &str,
-        key_id: u32,
-    ) -> Result<Option<crate::live_location::FastRatchetState>> {
-        let connection = self.connection();
-        let row = connection
-            .query_row(
-                "SELECT iteration, chain_keys, signing_key
-                 FROM fast_ratchet_sender_keys
-                 WHERE sender_id = ?1 AND key_id = ?2",
-                params![sender_id, i64::from(key_id)],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(|(iteration, chain_keys, signing_key)| {
-            crate::live_location::FastRatchetState::from_database(
-                key_id,
-                u32::try_from(iteration).context("stored fast-ratchet iteration")?,
-                &chain_keys,
-                signing_key,
-            )
-        })
-        .transpose()
-    }
-
     pub fn store_media_download(
         &self,
         chat_jid: &str,
@@ -2871,46 +2632,6 @@ impl Database {
         Ok(kind.flatten())
     }
 
-    pub fn update_label(
-        &self,
-        id: &str,
-        name: Option<&str>,
-        color: Option<i32>,
-        deleted: bool,
-    ) -> Result<()> {
-        let connection = self.connection();
-        let transaction = connection.unchecked_transaction()?;
-        transaction.execute(
-            "INSERT INTO labels (id, name, color, deleted) VALUES (?1, COALESCE(?2, ''), ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                name = CASE WHEN ?2 IS NULL THEN labels.name ELSE excluded.name END,
-                color = COALESCE(excluded.color, labels.color),
-                deleted = excluded.deleted",
-            params![id, name, color, deleted],
-        )?;
-        if deleted {
-            transaction.execute("DELETE FROM chat_labels WHERE label_id = ?1", [id])?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn associate_label(&self, chat_jid: &str, label_id: &str, labeled: bool) -> Result<()> {
-        let connection = self.connection();
-        if labeled {
-            connection.execute(
-                "INSERT OR IGNORE INTO chat_labels (chat_jid, label_id) VALUES (?1, ?2)",
-                params![chat_jid, label_id],
-            )?;
-        } else {
-            connection.execute(
-                "DELETE FROM chat_labels WHERE chat_jid = ?1 AND label_id = ?2",
-                params![chat_jid, label_id],
-            )?;
-        }
-        Ok(())
-    }
-
     pub fn migrate_contact_jid(&self, old_jid: &str, new_jid: &str) -> Result<bool> {
         if old_jid == new_jid {
             return Ok(false);
@@ -2937,11 +2658,9 @@ impl Database {
         transaction.execute(
             "INSERT INTO messages
              (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me,
-              read, starred, star_updated_at, receipt, delivered_at,
-              receipt_read_at, media_json, media_download)
+              read, receipt, delivered_at, receipt_read_at, media_json, media_download)
              SELECT chat_jid, id, ?2, sender_name, text, timestamp, from_me,
-                    read, starred, star_updated_at, receipt, delivered_at,
-                    receipt_read_at, media_json, media_download
+                    read, receipt, delivered_at, receipt_read_at, media_json, media_download
              FROM messages WHERE sender_jid = ?1
              ON CONFLICT(chat_jid, sender_jid, id) DO UPDATE SET
                 sender_name = CASE
@@ -2952,9 +2671,6 @@ impl Database {
                 timestamp = MAX(messages.timestamp, excluded.timestamp),
                 from_me = MAX(messages.from_me, excluded.from_me),
                 read = MAX(messages.read, excluded.read),
-                starred = CASE WHEN excluded.star_updated_at >= messages.star_updated_at
-                               THEN excluded.starred ELSE messages.starred END,
-                star_updated_at = MAX(messages.star_updated_at, excluded.star_updated_at),
                 receipt = MAX(messages.receipt, excluded.receipt),
                 delivered_at = COALESCE(messages.delivered_at, excluded.delivered_at),
                 receipt_read_at = COALESCE(messages.receipt_read_at, excluded.receipt_read_at),
@@ -3000,17 +2716,12 @@ impl Database {
         transaction.execute(
             "INSERT INTO messages
              (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me,
-              read, starred, star_updated_at, receipt, delivered_at,
-              receipt_read_at, media_json, media_download)
+              read, receipt, delivered_at, receipt_read_at, media_json, media_download)
              SELECT ?2, id, sender_jid, sender_name, text, timestamp, from_me,
-                    read, starred, star_updated_at, receipt, delivered_at,
-                    receipt_read_at, media_json, media_download
+                    read, receipt, delivered_at, receipt_read_at, media_json, media_download
              FROM messages WHERE chat_jid = ?1
              ON CONFLICT(chat_jid, sender_jid, id) DO UPDATE SET
                 read = MAX(messages.read, excluded.read),
-                starred = CASE WHEN excluded.star_updated_at >= messages.star_updated_at
-                               THEN excluded.starred ELSE messages.starred END,
-                star_updated_at = MAX(messages.star_updated_at, excluded.star_updated_at),
                 receipt = MAX(messages.receipt, excluded.receipt),
                 delivered_at = COALESCE(messages.delivered_at, excluded.delivered_at),
                 receipt_read_at = COALESCE(messages.receipt_read_at, excluded.receipt_read_at),
@@ -3075,18 +2786,11 @@ impl Database {
             [old_jid],
         )?;
         transaction.execute(
-            "UPDATE OR IGNORE chat_labels SET chat_jid = ?2 WHERE chat_jid = ?1",
-            params![old_jid, new_jid],
-        )?;
-        transaction.execute("DELETE FROM chat_labels WHERE chat_jid = ?1", [old_jid])?;
-        transaction.execute(
             "INSERT INTO chat_settings
-             (jid, pinned, archived, muted, mute_end, read_state, explicit_unread, status_muted,
-              disappearing_duration, disappearing_updated_at, deleted, cleared_at,
-              read_boundary, read_boundary_ids)
-             SELECT ?2, pinned, archived, muted, mute_end, read_state, explicit_unread, status_muted,
-                    disappearing_duration, disappearing_updated_at, deleted, cleared_at,
-                    read_boundary, read_boundary_ids
+             (jid, pinned, archived, muted, mute_end, read_state, explicit_unread,
+              deleted, cleared_at, read_boundary, read_boundary_ids)
+             SELECT ?2, pinned, archived, muted, mute_end, read_state, explicit_unread,
+                    deleted, cleared_at, read_boundary, read_boundary_ids
              FROM chat_settings WHERE jid = ?1
              ON CONFLICT(jid) DO UPDATE SET
                 pinned = COALESCE(excluded.pinned, chat_settings.pinned),
@@ -3096,15 +2800,6 @@ impl Database {
                 read_state = COALESCE(excluded.read_state, chat_settings.read_state),
                 explicit_unread = MAX(
                     chat_settings.explicit_unread, excluded.explicit_unread),
-                status_muted = COALESCE(excluded.status_muted, chat_settings.status_muted),
-                disappearing_duration = CASE
-                    WHEN COALESCE(excluded.disappearing_updated_at, 0)
-                       >= COALESCE(chat_settings.disappearing_updated_at, 0)
-                    THEN excluded.disappearing_duration
-                    ELSE chat_settings.disappearing_duration END,
-                disappearing_updated_at = MAX(
-                    COALESCE(chat_settings.disappearing_updated_at, 0),
-                    COALESCE(excluded.disappearing_updated_at, 0)),
                 deleted = MAX(chat_settings.deleted, excluded.deleted),
                 cleared_at = MAX(chat_settings.cleared_at, excluded.cleared_at),
                 read_boundary_ids = CASE
@@ -3414,8 +3109,6 @@ mod tests {
                     timestamp INTEGER NOT NULL,
                     from_me INTEGER NOT NULL,
                     read INTEGER NOT NULL DEFAULT 0,
-                    starred INTEGER NOT NULL DEFAULT 0,
-                    star_updated_at INTEGER NOT NULL DEFAULT 0,
                     receipt INTEGER NOT NULL DEFAULT 0,
                     delivered_at INTEGER,
                     receipt_read_at INTEGER,
@@ -4266,7 +3959,7 @@ mod tests {
     }
 
     #[test]
-    fn timestamped_settings_and_stars_ignore_delayed_updates() {
+    fn timestamped_settings_ignore_delayed_updates() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(&directory.path().join("history.db")).unwrap();
         let stored = message("stateful", 1);
@@ -4319,22 +4012,6 @@ mod tests {
             .apply_mute_at(&stored.chat_jid, false, 0, 41)
             .unwrap();
         assert!(!database.is_muted(&stored.chat_jid, 100).unwrap());
-
-        database
-            .star_message_at(&stored.chat_jid, &stored.id, true, 50)
-            .unwrap();
-        database
-            .star_message_at(&stored.chat_jid, &stored.id, false, 49)
-            .unwrap();
-        let starred = database
-            .connection()
-            .query_row(
-                "SELECT starred FROM messages WHERE chat_jid = ?1 AND id = ?2",
-                params![stored.chat_jid, stored.id],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap();
-        assert!(starred);
     }
 
     #[test]
@@ -4787,112 +4464,6 @@ mod tests {
                 timestamp_ms: live.timestamp * 1_000,
             })
         );
-    }
-
-    #[test]
-    fn active_live_locations_are_bounded_and_grouped_by_target() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = Database::open(&directory.path().join("history.db")).unwrap();
-        let mut live = message("live", 100);
-        live.text = "[Live location]".into();
-        live.media = Some(MessageMedia::Location {
-            latitude_e7: 523_701_600,
-            longitude_e7: 48_953_000,
-            accuracy_m: 8,
-            name: String::new(),
-            address: String::new(),
-            thumbnail_path: None,
-            live: true,
-            updated_at: 100,
-            duration_seconds: 3_600,
-        });
-        database.insert_message(&live, "Ada", false, false).unwrap();
-
-        assert_eq!(
-            database
-                .active_live_locations_for_sender(&live.sender_jid, 200)
-                .unwrap(),
-            vec![ActiveLiveLocation {
-                chat_jid: live.chat_jid.clone(),
-                message_id: live.id.clone(),
-                duration_seconds: 3_600,
-            }]
-        );
-        assert_eq!(
-            database.active_live_location_targets(200).unwrap(),
-            vec![(live.chat_jid.clone(), false)]
-        );
-        assert!(
-            database
-                .active_live_locations_for_sender(&live.sender_jid, 3_701)
-                .unwrap()
-                .is_empty()
-        );
-
-        let mut unbounded = live.clone();
-        unbounded.id = "unbounded".into();
-        unbounded.timestamp = 200;
-        if let Some(MessageMedia::Location {
-            duration_seconds, ..
-        }) = &mut unbounded.media
-        {
-            *duration_seconds = 0;
-        }
-        database
-            .insert_message(&unbounded, "Ada", false, false)
-            .unwrap();
-        assert_eq!(
-            database
-                .active_live_locations_for_sender(&unbounded.sender_jid, 201)
-                .unwrap()
-                .iter()
-                .find(|entry| entry.message_id == "unbounded")
-                .map(|entry| entry.duration_seconds),
-            Some(0)
-        );
-        assert!(
-            database
-                .active_live_location_targets(201)
-                .unwrap()
-                .iter()
-                .any(|(jid, _)| jid == &unbounded.chat_jid)
-        );
-
-        database
-            .connection()
-            .execute(
-                "UPDATE messages SET media_json = '{\"kind\":\"location\",\"live\":true}' WHERE id = 'unbounded'",
-                [],
-            )
-            .unwrap();
-        assert!(
-            database
-                .active_live_locations_for_sender(&unbounded.sender_jid, 201)
-                .unwrap()
-                .iter()
-                .all(|entry| entry.message_id != "unbounded")
-        );
-        assert!(
-            database
-                .active_live_location_targets(201)
-                .unwrap()
-                .iter()
-                .all(|(jid, _)| jid == &live.chat_jid)
-        );
-    }
-
-    #[test]
-    fn fast_ratchet_state_round_trips_through_private_history_store() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = Database::open(&directory.path().join("history.db")).unwrap();
-        let state = crate::live_location::FastRatchetState {
-            sender_key_id: 42,
-            iteration: 7,
-            chain_keys: std::array::from_fn(|index| [u8::try_from(index).unwrap(); 32]),
-            signing_key: vec![5; 33],
-        };
-        database.store_fast_ratchet_state("1.0", &state).unwrap();
-        assert_eq!(database.fast_ratchet_state("1.0", 42).unwrap(), Some(state));
     }
 
     #[test]
@@ -5655,22 +5226,6 @@ mod tests {
                 .is_none()
         );
 
-        database
-            .apply_status_mute_at(&direct.chat_jid, true, 5)
-            .unwrap();
-        database
-            .apply_disappearing_mode(&direct.chat_jid, 86_400, 6)
-            .unwrap();
-        database
-            .update_label("work", Some("Work"), Some(3), false)
-            .unwrap();
-        database
-            .associate_label(&direct.chat_jid, "work", true)
-            .unwrap();
-        database
-            .associate_label(&direct.chat_jid, "work", false)
-            .unwrap();
-        database.update_label("work", None, None, true).unwrap();
         assert!(
             !database
                 .migrate_contact_jid("missing@lid", "555@s.whatsapp.net")
@@ -5747,14 +5302,6 @@ mod tests {
                 .update_receipts("chat", &["missing".into()], 1, Some("recipient"), 1)
                 .unwrap()
         );
-        assert!(database.fast_ratchet_state("missing", 1).unwrap().is_none());
-        assert!(
-            database
-                .active_live_locations_for_sender("missing", 10)
-                .unwrap()
-                .is_empty()
-        );
-
         let mut plain = message("plain", 1);
         plain.media = Some(MessageMedia::Image {
             path: "/cache/plain.jpg".into(),

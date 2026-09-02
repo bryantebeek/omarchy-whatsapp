@@ -195,141 +195,13 @@ TestCase {
     verify(frames.some(function(frame) { return frame.command === "list_voice_outbox" }))
   }
 
-  function test_copy_normalize_and_hex_helpers() {
-    var original = [
-      {
-        id: "one",
-        receipt: 9,
-        delivered_at: "123.9",
-        read_at: "invalid",
-        delivered_to: [
-          { jid: "bob@s.whatsapp.net", name: "Bob", delivered_at: "234.9" },
-          { jid: "bob@s.whatsapp.net", name: "Duplicate" },
-          { name: "Missing address" }
-        ],
-        read_by: [
-          { jid: "alice@s.whatsapp.net", name: "Alice", read_at: "456.8" },
-          { jid: "alice@s.whatsapp.net", name: "Duplicate" },
-          { name: "Missing address" }
-        ],
-        reactions: { 0: "👍", length: 1 }
-      }, null
-    ]
+  function test_copy_and_hex_helpers() {
+    var original = [{ id: "one" }, null]
     var copy = service.copyArray(original)
     verify(copy !== original)
+    compare(copy.length, 2)
     compare(service.copyArray("not an array").length, 0)
-    var normalized = service.normalizeMessages(original)
-    compare(normalized[0].reactions.length, 1)
-    compare(normalized[0].reactions[0], "👍")
-    compare(normalized[0].receipt, 4)
-    compare(normalized[0].delivered_at, 123)
-    compare(normalized[0].read_at, 0)
-    compare(normalized[0].delivered_to.length, 1)
-    compare(normalized[0].delivered_to[0].name, "Bob")
-    compare(normalized[0].delivered_to[0].delivered_at, 234)
-    compare(normalized[0].read_by.length, 1)
-    compare(normalized[0].read_by[0].name, "Alice")
-    compare(normalized[0].read_by[0].read_at, 456)
-    compare(normalized[1].reactions.length, 0)
-    compare(normalized[1].receipt, 0)
-    compare(normalized[1].delivered_at, 0)
-    compare(normalized[1].read_at, 0)
-    compare(normalized[1].delivered_to.length, 0)
-    compare(normalized[1].read_by.length, 0)
     compare(service.hexKey("Aé"), "41c3a9")
-  }
-
-  function test_receipt_updates_are_monotonic_and_outgoing_only() {
-    service.messages = [
-      {
-        id: "outgoing", from_me: true, receipt: 1,
-        delivered_at: 0, read_at: 0, delivered_to: [], read_by: []
-      },
-      {
-        id: "direct-read", from_me: true, receipt: 1,
-        delivered_at: 0, read_at: 0, delivered_to: [], read_by: []
-      },
-      {
-        id: "incoming", from_me: false, receipt: 0,
-        delivered_to: [], read_by: []
-      }
-    ]
-    compare(service.applyReceipts(null), false)
-    compare(service.applyReceipts({
-      message_ids: ["outgoing"], receipt: 2, timestamp: 20,
-      delivery: {
-        jid: "alice@s.whatsapp.net", name: "Alice", delivered_at: 19
-      }
-    }), true)
-    compare(messagesWillChangeCount, 1)
-    compare(lastPreservePosition, true)
-    compare(service.messages[0].delivered_at, 20)
-    compare(service.messages[0].delivered_to.length, 1)
-    compare(service.messages[0].delivered_to[0].name, "Alice")
-    compare(service.messages[0].delivered_to[0].delivered_at, 19)
-    compare(service.applyReceipts({
-      message_ids: ["outgoing"], receipt: 2, timestamp: 30,
-      delivery: { jid: "alice@s.whatsapp.net", name: "Alice" }
-    }), false)
-    compare(messagesWillChangeCount, 1)
-    compare(service.applyReceipts({
-      message_ids: ["outgoing"], receipt: 2, timestamp: 10,
-      delivery: {
-        jid: "alice@s.whatsapp.net", name: "Alice Updated", delivered_at: 9
-      }
-    }), true)
-    compare(service.messages[0].delivered_at, 10)
-    compare(service.messages[0].delivered_to[0].name, "Alice Updated")
-    compare(service.messages[0].delivered_to[0].delivered_at, 9)
-    compare(service.applyReceipts({
-      message_ids: ["outgoing"],
-      receipt: 3,
-      timestamp: 40,
-      reader: {
-        jid: "alice@s.whatsapp.net", name: "Alice", read_at: 39
-      }
-    }), true)
-    compare(service.messages[0].receipt, 3)
-    compare(service.messages[0].read_at, 40)
-    compare(service.messages[0].read_by.length, 1)
-    compare(service.messages[0].read_by[0].name, "Alice")
-    compare(service.messages[0].read_by[0].read_at, 39)
-    compare(service.applyReceipts({ message_ids: ["outgoing"], receipt: 2 }), false)
-    compare(service.messages[0].receipt, 3)
-    compare(service.applyReceipts({
-      message_ids: ["outgoing"],
-      receipt: 3,
-      timestamp: 45,
-      reader: { jid: "bob@s.whatsapp.net", name: "Bob" }
-    }), true)
-    compare(service.messages[0].read_by.length, 2)
-    compare(service.messages[0].read_by[1].read_at, 45)
-    compare(service.applyReceipts({
-      message_ids: ["outgoing"],
-      receipt: 3,
-      timestamp: 50,
-      reader: { jid: "bob@s.whatsapp.net", name: "Bob" }
-    }), false)
-    compare(service.applyReceipts({
-      message_ids: ["outgoing"], receipt: 3, timestamp: 30,
-      reader: { jid: "alice@s.whatsapp.net", name: "Alice", read_at: 29 }
-    }), true)
-    compare(service.messages[0].read_at, 30)
-    compare(service.messages[0].read_by[0].read_at, 29)
-    compare(service.applyReceipts({
-      message_ids: ["direct-read"], receipt: 3, timestamp: 60,
-      reader: { jid: "alice@s.whatsapp.net", name: "Alice", read_at: "invalid" }
-    }), true)
-    compare(service.messages[1].delivered_at, 0)
-    compare(service.messages[1].read_at, 60)
-    compare(service.messages[1].read_by[0].read_at, 0)
-    compare(service.applyReceipts({ message_ids: ["incoming"], receipt: 4 }), false)
-    compare(service.messages[2].receipt, 0)
-
-    service.replaceMessages([{ id: "replacement" }], false)
-    compare(messagesWillChangeCount, 7)
-    compare(lastPreservePosition, false)
-    compare(service.messages[0].id, "replacement")
   }
 
   function test_ui_preferences() {
@@ -437,7 +309,7 @@ TestCase {
     compare(service.downloadMedia(null), false)
     compare(service.downloadMedia({ id: "m", chat_jid: "c", media: { kind: "document" } }), false)
     compare(service.downloadMedia(message), true)
-    compare(lastFrame().command, "download_image")
+    compare(lastFrame().command, "download_media")
     compare(service.mediaDownloading(message), true)
     compare(service.downloadMedia(message), false)
     var requestId = Number(Object.keys(service.mediaDownloadRequestIds)[0])
@@ -463,7 +335,7 @@ TestCase {
       kind: "sticker", lottie: false
     } }
     compare(service.downloadMedia(sticker), true)
-    compare(lastFrame().command, "download_sticker")
+    compare(lastFrame().command, "download_media")
     compare(service.downloadMedia({ id: "l1", chat_jid: "chat", media: {
       kind: "sticker", lottie: true
     } }), false)
@@ -488,7 +360,7 @@ TestCase {
       } },
       automatic
     ]), 1)
-    compare(lastFrame().command, "download_sticker")
+    compare(lastFrame().command, "download_media")
     compare(service.mediaDownloading(automatic), true)
     compare(service.autoDownloadStickers([automatic]), 0)
     requestId = Number(Object.keys(service.mediaDownloadRequestIds)[0])
@@ -827,7 +699,7 @@ TestCase {
     compare(service.mediaRevision, 1)
     compare(service.mediaDownloading(service.messages[3]), true)
     verify(sentFrames().some(function(frame) {
-      return frame.command === "download_sticker" && frame.message_id === "m4"
+      return frame.command === "download_media" && frame.message_id === "m4"
     }))
 
     requestId = service.requestMessages("one")
@@ -921,24 +793,10 @@ TestCase {
     }))
     compare(service.lastError, "WhatsApp media download failed")
 
-    service.messages = [
-      { id: "own", chat_jid: "group@g.us", from_me: true, receipt: 0 },
-      { id: "incoming", chat_jid: "group@g.us", from_me: false, receipt: 0 }
-    ]
-    service.handleLine(JSON.stringify({
-      event: "receipts", chat_jid: "group@g.us", message_ids: ["own", "incoming"], receipt: 3
-    }))
-    compare(service.messages[0].receipt, 3)
-    compare(service.messages[1].receipt, 0)
   }
 
   function test_event_sent_incoming_avatars_and_hello() {
     service.selectedChatJid = "chat"
-    service.messages = [{ id: "sent", from_me: true, receipt: 1 }]
-    service.handleLine(JSON.stringify({
-      event: "receipts", message_ids: ["sent"], receipt: 3
-    }))
-    compare(service.messages[0].receipt, 3)
     service.handleLine(JSON.stringify({ event: "sent", message: { chat_jid: "chat" } }))
     compare(service.messageSentSerial, 1)
     service.handleLine(JSON.stringify({ event: "message", message: { chat_jid: "chat" } }))
@@ -1052,22 +910,6 @@ TestCase {
       generation: 1, sequence: 3
     }))
     compare(lastFrame().command, "get_messages")
-    service.handleLine(JSON.stringify({
-      event: "invalidated", resource: "unread", generation: 1, sequence: 4
-    }))
-    compare(lastFrame().command, "get_state")
-    service.handleLine(JSON.stringify({
-      event: "invalidated", resource: "avatars", generation: 1, sequence: 5
-    }))
-    compare(lastFrame().command, "list_avatars")
-    service.handleLine(JSON.stringify({
-      event: "invalidated", resource: "text_outbox", generation: 1, sequence: 6
-    }))
-    compare(lastFrame().command, "list_text_outbox")
-    service.handleLine(JSON.stringify({
-      event: "invalidated", resource: "voice_outbox", generation: 1, sequence: 7
-    }))
-    compare(lastFrame().command, "list_voice_outbox")
     compare(service.handleInvalidation({ resource: "unknown" }), false)
   }
 
@@ -1096,6 +938,10 @@ TestCase {
     service.selectedChatJid = "chat"
     compare(service.sendMessage("retry me"), true)
     var request = lastFrame()
+    compare(service.requestTimeoutMs, 135000)
+    var remaining = Number(service.requestDeadlines[String(request.id)]) - Date.now()
+    verify(remaining <= service.requestTimeoutMs)
+    verify(remaining > service.requestTimeoutMs - 1000)
     service.requestDeadlines[String(request.id)] = 1
     compare(service.expireRequests(2), 1)
     compare(service.textMessageRequests[String(request.id)], undefined)

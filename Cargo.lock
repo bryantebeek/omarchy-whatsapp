@@ -1209,20 +1209,15 @@ dependencies = [
 name = "omarchy-whatsappd"
 version = "0.3.0"
 dependencies = [
- "aes",
  "anyhow",
  "async-trait",
  "buffa",
- "cbc",
  "chrono",
  "clap",
  "flate2",
  "futures",
- "hkdf",
- "hmac",
  "omarchy-whatsapp-protocol",
  "qrcode",
- "rand",
  "rusqlite",
  "serde",
  "serde_json",

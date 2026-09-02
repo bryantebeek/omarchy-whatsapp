@@ -4,6 +4,7 @@ set -euo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 qml_files=(
   "$repo_dir/quickshell/BarWidget.qml"
+  "$repo_dir/quickshell/LicensesPopup.qml"
   "$repo_dir/quickshell/Panel.qml"
   "$repo_dir/quickshell/Service.qml"
 )

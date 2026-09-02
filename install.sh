@@ -110,6 +110,7 @@ if ((runtime_only == 0)); then
       "$plugin_dir/BarWidget.qml" \
       "$plugin_dir/Service.qml" \
       "$plugin_dir/Panel.qml" \
+      "$plugin_dir/LicensesPopup.qml" \
       "$plugin_dir/Model.js" \
       "$plugin_dir/licenses.json" \
       "$plugin_dir/icons/brand-whatsapp-filled.svg" \
@@ -120,6 +121,8 @@ if ((runtime_only == 0)); then
       "$plugin_dir/quickshell/Service.qml"
     install_atomically 644 "$repo_dir/quickshell/Panel.qml" \
       "$plugin_dir/quickshell/Panel.qml"
+    install_atomically 644 "$repo_dir/quickshell/LicensesPopup.qml" \
+      "$plugin_dir/quickshell/LicensesPopup.qml"
     install_atomically 644 "$repo_dir/quickshell/Model.js" \
       "$plugin_dir/quickshell/Model.js"
     install_atomically 644 "$repo_dir/quickshell/licenses.json" \
