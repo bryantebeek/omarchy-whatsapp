@@ -16,6 +16,9 @@ const CHAT_NAME_MESSAGE: i64 = 20;
 const CHAT_NAME_GROUP_METADATA: i64 = 30;
 const CHAT_NAME_ADDRESS_BOOK: i64 = 40;
 const READ_BOUNDARY_IDS_CAP: usize = 256;
+// The last step of the ordered migration ladder in `Database::migrate`. Every
+// opened database ends on this `user_version`.
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Clone, Copy)]
 enum ChatSetting {
@@ -111,11 +114,19 @@ fn reconcile_poll_tallies(
     ))
 }
 
+// Cached tallies are runtime state rather than schema, so no migration version
+// can describe drift left by a crash between a recorded vote and the rewritten
+// card. The repair therefore runs on every open, driven by the small vote table
+// instead of a scan over every stored media payload.
 fn reconcile_all_poll_tallies(connection: &mut Connection) -> Result<()> {
     let targets = {
         let mut statement = connection.prepare(
-            "SELECT chat_jid, id, media_json FROM messages
-             WHERE media_json LIKE '%\"kind\":\"poll\"%'",
+            "SELECT messages.chat_jid, messages.id, messages.media_json
+             FROM messages
+             JOIN (SELECT DISTINCT chat_jid, message_id FROM poll_votes) voted
+               ON voted.chat_jid = messages.chat_jid
+              AND voted.message_id = messages.id
+             WHERE messages.media_json IS NOT NULL",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -258,9 +269,9 @@ fn migration_source_exists(transaction: &Transaction<'_>, old_jid: &str) -> Resu
         .map_err(Into::into)
 }
 
-fn ensure_message_identity_schema(connection: &mut Connection) -> Result<()> {
+fn ensure_message_identity_schema(transaction: &Transaction<'_>) -> Result<()> {
     let primary_key = {
-        let mut statement = connection.prepare("PRAGMA table_info(messages)")?;
+        let mut statement = transaction.prepare("PRAGMA table_info(messages)")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
         })?;
@@ -283,7 +294,6 @@ fn ensure_message_identity_schema(connection: &mut Connection) -> Result<()> {
         "unsupported messages primary key: {}",
         primary_key.join(", ")
     );
-    let transaction = connection.transaction()?;
     transaction.execute_batch(
         "DROP INDEX IF EXISTS messages_by_chat_time;
          DROP INDEX IF EXISTS messages_by_sender;
@@ -318,13 +328,263 @@ fn ensure_message_identity_schema(connection: &mut Connection) -> Result<()> {
             ON messages(chat_jid, timestamp DESC);
          CREATE INDEX messages_by_sender ON messages(sender_jid);",
     )?;
+    Ok(())
+}
+
+// Forward-compatible migration for databases created by early builds.
+// Inspecting the schema first distinguishes an already-applied migration from
+// disk, permission, or corruption errors that must remain visible: every
+// database predating `PRAGMA user_version` reports version 0 regardless of how
+// many of these steps its build had already performed.
+fn migrate_receipt_columns(transaction: &Transaction<'_>) -> Result<()> {
+    for (table, column, declaration) in [
+        ("messages", "read", "read INTEGER NOT NULL DEFAULT 0"),
+        ("contacts", "source", "source INTEGER NOT NULL DEFAULT 0"),
+        ("messages", "receipt", "receipt INTEGER NOT NULL DEFAULT 0"),
+        ("messages", "delivered_at", "delivered_at INTEGER"),
+        ("messages", "receipt_read_at", "receipt_read_at INTEGER"),
+        (
+            "message_reads",
+            "delivered_at",
+            "delivered_at INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        ensure_column(transaction, table, column, declaration)?;
+    }
+    Ok(())
+}
+
+// Per-participant receipts replaced the aggregate columns. A direct chat has
+// exactly one reader, so its earlier aggregate timestamps still identify who
+// delivered and read each outgoing message.
+fn migrate_direct_receipts(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO message_reads
+         (chat_jid, message_id, reader_jid, read_at, delivered_at)
+         SELECT messages.chat_jid, messages.id, messages.chat_jid,
+                COALESCE(messages.receipt_read_at, 0),
+                COALESCE(messages.delivered_at, 0)
+         FROM messages
+         JOIN chats ON chats.jid = messages.chat_jid
+         WHERE messages.from_me = 1 AND chats.is_group = 0
+           AND (COALESCE(messages.delivered_at, 0) > 0
+                OR COALESCE(messages.receipt_read_at, 0) > 0)
+         ON CONFLICT(chat_jid, message_id, reader_jid) DO UPDATE SET
+            read_at = CASE
+                WHEN excluded.read_at > 0
+                     AND (message_reads.read_at <= 0
+                          OR excluded.read_at < message_reads.read_at)
+                THEN excluded.read_at ELSE message_reads.read_at END,
+            delivered_at = CASE
+                WHEN excluded.delivered_at > 0
+                     AND (message_reads.delivered_at <= 0
+                          OR excluded.delivered_at < message_reads.delivered_at)
+                THEN excluded.delivered_at ELSE message_reads.delivered_at END",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_message_media_columns(transaction: &Transaction<'_>) -> Result<()> {
+    for (column, declaration) in [
+        ("media_json", "media_json TEXT"),
+        ("media_download", "media_download BLOB"),
+    ] {
+        ensure_column(transaction, "messages", column, declaration)?;
+    }
+    Ok(())
+}
+
+fn migrate_chat_state_columns(transaction: &Transaction<'_>) -> Result<()> {
+    for (table, column, declaration) in [
+        ("chats", "phone_number", "phone_number TEXT"),
+        (
+            "chats",
+            "name_source",
+            "name_source INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "chat_settings",
+            "deleted",
+            "deleted INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "chat_settings",
+            "cleared_at",
+            "cleared_at INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "chat_settings",
+            "read_boundary",
+            "read_boundary INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "chat_settings",
+            "read_boundary_ids",
+            "read_boundary_ids TEXT",
+        ),
+        (
+            "chat_settings",
+            "explicit_unread",
+            "explicit_unread INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "chat_settings",
+            "pinned_updated_at",
+            "pinned_updated_at INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "chat_settings",
+            "archived_updated_at",
+            "archived_updated_at INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "chat_settings",
+            "mute_updated_at",
+            "mute_updated_at INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "chat_settings",
+            "read_state_updated_at",
+            "read_state_updated_at INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        ensure_column(transaction, table, column, declaration)?;
+    }
+    Ok(())
+}
+
+// Early builds represented protocol/control envelopes and unknown add-ons as
+// user-visible placeholder bubbles. They contain no recoverable user content
+// and must not survive after renderability is classified before insertion.
+fn migrate_control_bubbles(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM messages
+         WHERE text = '[Unsupported message]' AND media_json IS NULL",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE chats SET
+            last_message = COALESCE((
+                SELECT text FROM messages
+                WHERE messages.chat_jid = chats.jid
+                ORDER BY timestamp DESC LIMIT 1
+            ), ''),
+            last_timestamp = COALESCE((
+                SELECT timestamp FROM messages
+                WHERE messages.chat_jid = chats.jid
+                ORDER BY timestamp DESC LIMIT 1
+            ), 0)
+         WHERE last_message = '[Unsupported message]'",
+        [],
+    )?;
+    Ok(())
+}
+
+// Cache state is a property of the filesystem, not of the stored row: a media
+// payload counts as downloaded only while its file still exists.
+fn decode_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+    let mut media = row
+        .get::<_, Option<String>>(10)?
+        .and_then(|json| serde_json::from_str(&json).ok());
+    match &mut media {
+        Some(MessageMedia::Image {
+            path,
+            thumbnail_path,
+            downloaded,
+            ..
+        }) => {
+            // An empty thumbnail path identifies an ambiguous early
+            // image row whose preview may still occupy `path`.
+            *downloaded = !thumbnail_path.is_empty() && Path::new(path).is_file();
+            if !thumbnail_path.is_empty() && !Path::new(thumbnail_path).is_file() {
+                thumbnail_path.clear();
+            }
+        }
+        Some(MessageMedia::Sticker {
+            path,
+            thumbnail_path,
+            downloaded,
+            lottie,
+            ..
+        }) => {
+            *downloaded = !*lottie && Path::new(path).is_file();
+            if !thumbnail_path.is_empty() && !Path::new(thumbnail_path).is_file() {
+                thumbnail_path.clear();
+            }
+        }
+        Some(MessageMedia::Video {
+            path,
+            thumbnail_path,
+            downloaded,
+            ..
+        }) => {
+            *downloaded = Path::new(path).is_file();
+            if !thumbnail_path.is_empty() && !Path::new(thumbnail_path).is_file() {
+                thumbnail_path.clear();
+            }
+        }
+        Some(MessageMedia::Audio {
+            path, downloaded, ..
+        }) => {
+            *downloaded = Path::new(path).is_file();
+        }
+        _ => {}
+    }
+    Ok(Message {
+        id: row.get(0)?,
+        chat_jid: row.get(1)?,
+        sender_jid: row.get(2)?,
+        sender_name: row.get(3)?,
+        text: row.get(4)?,
+        timestamp: row.get(5)?,
+        from_me: row.get(6)?,
+        receipt: u8::try_from(row.get::<_, i64>(7)?.clamp(0, 4)).unwrap_or_default(),
+        delivered_at: row.get(8)?,
+        read_at: row.get(9)?,
+        delivered_to: Vec::new(),
+        read_by: Vec::new(),
+        media,
+        reactions: Vec::new(),
+    })
+}
+
+// Applies one ladder step and records its version in the same transaction, so
+// an interrupted upgrade either lands completely or is retried on the next
+// start. Steps below the stored version are skipped without touching storage.
+fn run_migration<F>(
+    connection: &mut Connection,
+    version: &mut i64,
+    target: i64,
+    apply: F,
+) -> Result<()>
+where
+    F: FnOnce(&Transaction<'_>) -> Result<()>,
+{
+    if *version >= target {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    apply(&transaction)?;
+    transaction.pragma_update(None, "user_version", target)?;
     transaction.commit()?;
+    *version = target;
     Ok(())
 }
 
 pub struct Database {
     connection: Mutex<Connection>,
     protocol_db: PathBuf,
+}
+
+// One message and the conversation context that decides how it is absorbed.
+struct MessageInsert<'a> {
+    message: &'a Message,
+    chat_name: &'a str,
+    is_group: bool,
+    increment_unread: bool,
+    from_history: bool,
+    read_intent: Option<&'a UnreadReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,123 +808,55 @@ impl Database {
             "UPDATE text_outbox SET status = 0, error = NULL WHERE status = 1",
             [],
         )?;
-        // Forward-compatible migration for databases created by early builds.
-        // Inspecting the schema first distinguishes an already-applied migration
-        // from disk, permission, or corruption errors that must remain visible.
-        for (table, column, declaration) in [
-            ("messages", "read", "read INTEGER NOT NULL DEFAULT 0"),
-            ("contacts", "source", "source INTEGER NOT NULL DEFAULT 0"),
-            ("messages", "receipt", "receipt INTEGER NOT NULL DEFAULT 0"),
-            ("messages", "delivered_at", "delivered_at INTEGER"),
-            ("messages", "receipt_read_at", "receipt_read_at INTEGER"),
-            (
-                "message_reads",
-                "delivered_at",
-                "delivered_at INTEGER NOT NULL DEFAULT 0",
-            ),
-        ] {
-            ensure_column(&connection, table, column, declaration)?;
+        Self::migrate(&mut connection, path)?;
+        // Cached poll tallies are runtime state rather than schema: this repairs
+        // drift left by a crash between a recorded vote and its rewritten card,
+        // so it is deliberately not part of the versioned ladder.
+        reconcile_all_poll_tallies(&mut connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            protocol_db: path.with_file_name("session.db"),
+        })
+    }
+
+    // Ordered one-time upgrades of an existing database. Every database created
+    // before this ladder existed reports `user_version` 0 and therefore receives
+    // all of them exactly once; a freshly bootstrapped database runs them as
+    // no-ops and lands on the same version. Later starts skip the whole ladder,
+    // so startup no longer costs more as stored history grows.
+    fn migrate(connection: &mut Connection, path: &Path) -> Result<()> {
+        let mut version: i64 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
         }
-        connection.execute(
-            "INSERT INTO message_reads
-             (chat_jid, message_id, reader_jid, read_at, delivered_at)
-             SELECT messages.chat_jid, messages.id, messages.chat_jid,
-                    COALESCE(messages.receipt_read_at, 0),
-                    COALESCE(messages.delivered_at, 0)
-             FROM messages
-             JOIN chats ON chats.jid = messages.chat_jid
-             WHERE messages.from_me = 1 AND chats.is_group = 0
-               AND (COALESCE(messages.delivered_at, 0) > 0
-                    OR COALESCE(messages.receipt_read_at, 0) > 0)
-             ON CONFLICT(chat_jid, message_id, reader_jid) DO UPDATE SET
-                read_at = CASE
-                    WHEN excluded.read_at > 0
-                         AND (message_reads.read_at <= 0
-                              OR excluded.read_at < message_reads.read_at)
-                    THEN excluded.read_at ELSE message_reads.read_at END,
-                delivered_at = CASE
-                    WHEN excluded.delivered_at > 0
-                         AND (message_reads.delivered_at <= 0
-                              OR excluded.delivered_at < message_reads.delivered_at)
-                    THEN excluded.delivered_at ELSE message_reads.delivered_at END",
-            [],
-        )?;
-        for (column, declaration) in [
-            ("media_json", "media_json TEXT"),
-            ("media_download", "media_download BLOB"),
-        ] {
-            ensure_column(&connection, "messages", column, declaration)?;
-        }
-        ensure_message_identity_schema(&mut connection)?;
-        for (table, column, declaration) in [
-            ("chats", "phone_number", "phone_number TEXT"),
-            (
-                "chats",
-                "name_source",
-                "name_source INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "chat_settings",
-                "deleted",
-                "deleted INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "chat_settings",
-                "cleared_at",
-                "cleared_at INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "chat_settings",
-                "read_boundary",
-                "read_boundary INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "chat_settings",
-                "read_boundary_ids",
-                "read_boundary_ids TEXT",
-            ),
-            (
-                "chat_settings",
-                "explicit_unread",
-                "explicit_unread INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "chat_settings",
-                "pinned_updated_at",
-                "pinned_updated_at INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "chat_settings",
-                "archived_updated_at",
-                "archived_updated_at INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "chat_settings",
-                "mute_updated_at",
-                "mute_updated_at INTEGER NOT NULL DEFAULT 0",
-            ),
-            (
-                "chat_settings",
-                "read_state_updated_at",
-                "read_state_updated_at INTEGER NOT NULL DEFAULT 0",
-            ),
-        ] {
-            ensure_column(&connection, table, column, declaration)?;
-        }
+        run_migration(connection, &mut version, 1, migrate_receipt_columns)?;
+        run_migration(connection, &mut version, 2, migrate_direct_receipts)?;
+        run_migration(connection, &mut version, 3, migrate_message_media_columns)?;
+        run_migration(connection, &mut version, 4, ensure_message_identity_schema)?;
+        run_migration(connection, &mut version, 5, migrate_chat_state_columns)?;
+        run_migration(connection, &mut version, 6, |transaction| {
+            Self::migrate_chat_names(transaction, path)
+        })?;
+        run_migration(connection, &mut version, 7, migrate_control_bubbles)?;
+        Ok(())
+    }
+
+    fn migrate_chat_names(transaction: &Transaction<'_>, path: &Path) -> Result<()> {
         // A JID is an identifier, never a chat name. Legacy databases stored
         // it in `name` as a rendering fallback, which made later syncs unable
         // to distinguish missing metadata from a real title.
-        connection.execute(
+        transaction.execute(
             "UPDATE chats SET name = '', name_source = ?1
              WHERE TRIM(name) = '' OR name = jid",
             [CHAT_NAME_UNKNOWN],
         )?;
-        connection.execute(
+        transaction.execute(
             "UPDATE chats SET name_source = ?1
              WHERE name_source = ?2 AND name != ''",
             params![CHAT_NAME_HISTORY, CHAT_NAME_UNKNOWN],
         )?;
-        connection.execute(
+        transaction.execute(
             "UPDATE chats SET
                 name = contacts.name,
                 name_source = CASE contacts.source WHEN 1 THEN ?1 ELSE ?2 END
@@ -676,7 +868,7 @@ impl Database {
         // Address-book names are authoritative for every rendering path. Older
         // builds could store a newer WhatsApp push name on individual messages
         // even while preserving the saved contact name in `contacts`.
-        connection.execute(
+        transaction.execute(
             "UPDATE messages SET sender_name = (
                 SELECT contacts.name FROM contacts
                 WHERE contacts.jid = messages.sender_jid AND contacts.source = 1
@@ -688,36 +880,7 @@ impl Database {
              )",
             [],
         )?;
-        Self::restore_legacy_chat_names(&connection, path)?;
-        // Early builds represented protocol/control envelopes and unknown
-        // add-ons as user-visible placeholder bubbles. They contain no
-        // recoverable user content and must not survive after renderability is
-        // classified before insertion.
-        connection.execute(
-            "DELETE FROM messages
-             WHERE text = '[Unsupported message]' AND media_json IS NULL",
-            [],
-        )?;
-        connection.execute(
-            "UPDATE chats SET
-                last_message = COALESCE((
-                    SELECT text FROM messages
-                    WHERE messages.chat_jid = chats.jid
-                    ORDER BY timestamp DESC LIMIT 1
-                ), ''),
-                last_timestamp = COALESCE((
-                    SELECT timestamp FROM messages
-                    WHERE messages.chat_jid = chats.jid
-                    ORDER BY timestamp DESC LIMIT 1
-                ), 0)
-             WHERE last_message = '[Unsupported message]'",
-            [],
-        )?;
-        reconcile_all_poll_tallies(&mut connection)?;
-        Ok(Self {
-            connection: Mutex::new(connection),
-            protocol_db: path.with_file_name("session.db"),
-        })
+        Self::restore_legacy_chat_names(transaction, path)
     }
 
     pub fn clear_account_data(&self) -> Result<()> {
@@ -1084,7 +1247,14 @@ impl Database {
         is_group: bool,
         increment_unread: bool,
     ) -> Result<bool> {
-        self.insert_message_inner(message, chat_name, is_group, increment_unread, false, None)
+        self.insert_message_inner(&MessageInsert {
+            message,
+            chat_name,
+            is_group,
+            increment_unread,
+            from_history: false,
+            read_intent: None,
+        })
     }
 
     pub fn insert_message_with_read_intent(
@@ -1094,7 +1264,14 @@ impl Database {
         is_group: bool,
         receipt: &UnreadReceipt,
     ) -> Result<bool> {
-        self.insert_message_inner(message, chat_name, is_group, false, false, Some(receipt))
+        self.insert_message_inner(&MessageInsert {
+            message,
+            chat_name,
+            is_group,
+            increment_unread: false,
+            from_history: false,
+            read_intent: Some(receipt),
+        })
     }
 
     pub fn insert_history_message(
@@ -1103,18 +1280,39 @@ impl Database {
         chat_name: &str,
         is_group: bool,
     ) -> Result<bool> {
-        self.insert_message_inner(message, chat_name, is_group, false, true, None)
+        self.insert_message_inner(&MessageInsert {
+            message,
+            chat_name,
+            is_group,
+            increment_unread: false,
+            from_history: true,
+            read_intent: None,
+        })
     }
 
-    fn insert_message_inner(
-        &self,
-        message: &Message,
-        chat_name: &str,
-        is_group: bool,
-        increment_unread: bool,
-        from_history: bool,
-        read_intent: Option<&UnreadReceipt>,
+    fn insert_message_inner(&self, insert: &MessageInsert<'_>) -> Result<bool> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let inserted = Self::insert_message_into(&transaction, insert)?;
+        Self::prune_chat_history(&transaction, &insert.message.chat_jid)?;
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    // Stores one message inside a caller-owned transaction. A tombstoned
+    // message, or one inside a cleared window, is dropped instead of stored.
+    fn insert_message_into(
+        transaction: &Transaction<'_>,
+        insert: &MessageInsert<'_>,
     ) -> Result<bool> {
+        let MessageInsert {
+            message,
+            chat_name,
+            is_group,
+            increment_unread,
+            from_history,
+            read_intent,
+        } = *insert;
         let candidate = chat_name.trim();
         let (candidate, name_source) = if candidate.is_empty() || candidate == message.chat_jid {
             ("", CHAT_NAME_UNKNOWN)
@@ -1123,8 +1321,6 @@ impl Database {
         } else {
             (candidate, CHAT_NAME_MESSAGE)
         };
-        let mut connection = self.connection();
-        let transaction = connection.transaction()?;
         let tombstoned = transaction
             .query_row(
                 "SELECT 1 FROM message_tombstones WHERE chat_jid = ?1 AND id = ?2",
@@ -1142,7 +1338,6 @@ impl Database {
             .optional()?
             .unwrap_or(false);
         if tombstoned || state_suppressed {
-            transaction.commit()?;
             return Ok(false);
         }
         if !from_history {
@@ -1239,30 +1434,33 @@ impl Database {
                 ],
             )?;
         }
-        // Keep history bounded without a background cleaner. Protocol state is in a
-        // separate database and is never touched by this retention policy.
+        Ok(inserted)
+    }
+
+    // Keep history bounded without a background cleaner. Protocol state is in a
+    // separate database and is never touched by this retention policy.
+    fn prune_chat_history(transaction: &Transaction<'_>, chat_jid: &str) -> Result<()> {
         transaction.execute(
             "DELETE FROM messages WHERE chat_jid = ?1 AND rowid NOT IN
              (SELECT rowid FROM messages WHERE chat_jid = ?1 ORDER BY timestamp DESC LIMIT 1000)",
-            [&message.chat_jid],
+            [chat_jid],
         )?;
         transaction.execute(
             "DELETE FROM poll_votes WHERE chat_jid = ?1 AND message_id NOT IN
              (SELECT id FROM messages WHERE chat_jid = ?1)",
-            [&message.chat_jid],
+            [chat_jid],
         )?;
         transaction.execute(
             "DELETE FROM poll_secrets WHERE chat_jid = ?1 AND message_id NOT IN
              (SELECT id FROM messages WHERE chat_jid = ?1)",
-            [&message.chat_jid],
+            [chat_jid],
         )?;
         transaction.execute(
             "DELETE FROM message_reads WHERE chat_jid = ?1 AND message_id NOT IN
              (SELECT id FROM messages WHERE chat_jid = ?1)",
-            [&message.chat_jid],
+            [chat_jid],
         )?;
-        transaction.commit()?;
-        Ok(inserted)
+        Ok(())
     }
 
     pub fn list_chats(&self, limit: u32) -> Result<Vec<Chat>> {
@@ -1348,14 +1546,72 @@ impl Database {
     }
 
     pub fn insert_history_chat(&self, chat: &Chat) -> Result<()> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        Self::insert_history_chat_into(&transaction, chat)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Persists one replayed conversation and its messages in a single
+    /// transaction, so a history sync costs one durable commit per conversation
+    /// instead of one per message. The per-message rules are identical to
+    /// [`Self::insert_history_chat`], [`Self::update_contact_name`],
+    /// [`Self::insert_history_message`], and [`Self::update_message_media`]
+    /// applied in slice order; retention pruning runs once at the end. Returns
+    /// whether any message was stored or had its media completed.
+    // The history ingester still calls the per-message methods; drop this
+    // allowance once it switches to the batch entry point.
+    #[allow(dead_code)]
+    pub fn insert_history_conversation(&self, chat: &Chat, messages: &[Message]) -> Result<bool> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        Self::insert_history_chat_into(&transaction, chat)?;
+        let mut changed = false;
+        for message in messages {
+            changed |= Self::insert_history_message_into(&transaction, chat, message)?;
+        }
+        Self::prune_chat_history(&transaction, &chat.jid)?;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    // The per-message half of a replayed conversation: learn the sender's push
+    // name, store the message, and otherwise complete the media of a message
+    // that is already indexed.
+    fn insert_history_message_into(
+        transaction: &Transaction<'_>,
+        chat: &Chat,
+        message: &Message,
+    ) -> Result<bool> {
+        if !message.from_me && message.sender_name != message.sender_jid {
+            let name = &message.sender_name;
+            Self::update_contact_name_into(transaction, &message.sender_jid, name, 0)?;
+        }
+        let insert = MessageInsert {
+            message,
+            chat_name: &chat.name,
+            is_group: chat.is_group,
+            increment_unread: false,
+            from_history: true,
+            read_intent: None,
+        };
+        if Self::insert_message_into(transaction, &insert)? {
+            return Ok(true);
+        }
+        let Some(media) = &message.media else {
+            return Ok(false);
+        };
+        Self::update_message_media_into(transaction, &message.chat_jid, &message.id, media)
+    }
+
+    fn insert_history_chat_into(transaction: &Transaction<'_>, chat: &Chat) -> Result<()> {
         let candidate = chat.name.trim();
         let (candidate, name_source) = if candidate.is_empty() || candidate == chat.jid {
             ("", CHAT_NAME_UNKNOWN)
         } else {
             (candidate, CHAT_NAME_HISTORY)
         };
-        let mut connection = self.connection();
-        let transaction = connection.transaction()?;
         let suppressed = transaction
             .query_row(
                 "SELECT deleted FROM chat_settings WHERE jid = ?1",
@@ -1365,7 +1621,6 @@ impl Database {
             .optional()?
             .unwrap_or(false);
         if suppressed {
-            transaction.commit()?;
             return Ok(());
         }
         transaction.execute(
@@ -1390,7 +1645,6 @@ impl Database {
                 CHAT_NAME_UNKNOWN,
             ],
         )?;
-        transaction.commit()?;
         Ok(())
     }
 
@@ -1403,18 +1657,28 @@ impl Database {
     }
 
     fn update_contact_name_from(&self, jid: &str, name: &str, source: i64) -> Result<bool> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let updated = Self::update_contact_name_into(&transaction, jid, name, source)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    fn update_contact_name_into(
+        transaction: &Transaction<'_>,
+        jid: &str,
+        name: &str,
+        source: i64,
+    ) -> Result<bool> {
         if name.trim().is_empty() {
             return Ok(false);
         }
-        let mut connection = self.connection();
-        let transaction = connection.transaction()?;
         let existing_source = transaction
             .query_row("SELECT source FROM contacts WHERE jid = ?1", [jid], |row| {
                 row.get::<_, i64>(0)
             })
             .optional()?;
         if existing_source.is_some_and(|existing| existing > source) {
-            transaction.commit()?;
             return Ok(false);
         }
         transaction.execute(
@@ -1438,7 +1702,6 @@ impl Database {
             "UPDATE messages SET sender_name = ?2 WHERE sender_jid = ?1",
             params![jid, name.trim()],
         )?;
-        transaction.commit()?;
         Ok(true)
     }
 
@@ -1467,93 +1730,58 @@ impl Database {
 
     pub fn messages(&self, chat_jid: &str, limit: u32) -> Result<Vec<Message>> {
         let connection = self.connection();
-        let mut statement = connection.prepare(
-            "SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me,
+        Self::load_messages(&connection, chat_jid, limit, None)
+    }
+
+    pub fn message_by_id(&self, chat_jid: &str, message_id: &str) -> Result<Option<Message>> {
+        let connection = self.connection();
+        Ok(Self::load_messages(&connection, chat_jid, 1, Some(message_id))?.pop())
+    }
+
+    // The single read path for rendered messages. `message_id` selects one
+    // conversation entry without loading the surrounding page, and both callers
+    // therefore observe identical media, reaction, and receipt state.
+    fn load_messages(
+        connection: &Connection,
+        chat_jid: &str,
+        limit: u32,
+        message_id: Option<&str>,
+    ) -> Result<Vec<Message>> {
+        // Equal timestamps are common in a synced conversation, so insertion
+        // order breaks the tie and keeps repeated reads in the same sequence.
+        let sql = "SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me,
                     receipt, delivered_at, receipt_read_at, media_json
              FROM (
-                SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me,
-                       receipt, delivered_at, receipt_read_at, media_json
-                FROM messages WHERE chat_jid = ?1
-                ORDER BY timestamp DESC LIMIT ?2
-             ) ORDER BY timestamp ASC",
-        )?;
-        let rows =
-            statement.query_map(params![chat_jid, i64::from(limit.clamp(1, 1000))], |row| {
-                let mut media = row
-                    .get::<_, Option<String>>(10)?
-                    .and_then(|json| serde_json::from_str(&json).ok());
-                match &mut media {
-                    Some(MessageMedia::Image {
-                        path,
-                        thumbnail_path,
-                        downloaded,
-                        ..
-                    }) => {
-                        // An empty thumbnail path identifies an ambiguous early
-                        // image row whose preview may still occupy `path`.
-                        *downloaded = !thumbnail_path.is_empty() && Path::new(path).is_file();
-                        if !thumbnail_path.is_empty() && !Path::new(thumbnail_path).is_file() {
-                            thumbnail_path.clear();
-                        }
-                    }
-                    Some(MessageMedia::Sticker {
-                        path,
-                        thumbnail_path,
-                        downloaded,
-                        lottie,
-                        ..
-                    }) => {
-                        *downloaded = !*lottie && Path::new(path).is_file();
-                        if !thumbnail_path.is_empty() && !Path::new(thumbnail_path).is_file() {
-                            thumbnail_path.clear();
-                        }
-                    }
-                    Some(MessageMedia::Video {
-                        path,
-                        thumbnail_path,
-                        downloaded,
-                        ..
-                    }) => {
-                        *downloaded = Path::new(path).is_file();
-                        if !thumbnail_path.is_empty() && !Path::new(thumbnail_path).is_file() {
-                            thumbnail_path.clear();
-                        }
-                    }
-                    Some(MessageMedia::Audio {
-                        path, downloaded, ..
-                    }) => {
-                        *downloaded = Path::new(path).is_file();
-                    }
-                    _ => {}
-                }
-                Ok(Message {
-                    id: row.get(0)?,
-                    chat_jid: row.get(1)?,
-                    sender_jid: row.get(2)?,
-                    sender_name: row.get(3)?,
-                    text: row.get(4)?,
-                    timestamp: row.get(5)?,
-                    from_me: row.get(6)?,
-                    receipt: u8::try_from(row.get::<_, i64>(7)?.clamp(0, 4)).unwrap_or_default(),
-                    delivered_at: row.get(8)?,
-                    read_at: row.get(9)?,
-                    delivered_to: Vec::new(),
-                    read_by: Vec::new(),
-                    media,
-                    reactions: Vec::new(),
-                })
-            })?;
+                SELECT rowid AS insertion, id, chat_jid, sender_jid, sender_name, text,
+                       timestamp, from_me, receipt, delivered_at, receipt_read_at,
+                       media_json
+                FROM messages
+                WHERE chat_jid = ?1 AND (?3 IS NULL OR id = ?3)
+                ORDER BY timestamp DESC, insertion DESC LIMIT ?2
+             ) ORDER BY timestamp ASC, insertion ASC";
+        let limit = i64::from(limit.clamp(1, 1000));
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map(params![chat_jid, limit, message_id], decode_message)?;
         let mut messages = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
+        Self::attach_reactions_and_receipts(connection, chat_jid, message_id, &mut messages)?;
+        Ok(messages)
+    }
 
+    fn attach_reactions_and_receipts(
+        connection: &Connection,
+        chat_jid: &str,
+        message_id: Option<&str>,
+        messages: &mut [Message],
+    ) -> Result<()> {
         let mut reactions_by_message: HashMap<String, Vec<Reaction>> = HashMap::new();
-        let mut reaction_statement = connection.prepare(
-            "SELECT message_id, emoji, COUNT(*), MAX(from_me)
-             FROM reactions WHERE chat_jid = ?1
+        let reaction_sql = "SELECT message_id, emoji, COUNT(*), MAX(from_me)
+             FROM reactions
+             WHERE chat_jid = ?1 AND (?2 IS NULL OR message_id = ?2)
              GROUP BY message_id, emoji
-             ORDER BY MIN(timestamp), emoji",
-        )?;
-        let reaction_rows = reaction_statement.query_map([chat_jid], |row| {
+             ORDER BY MIN(timestamp), emoji";
+        let mut reaction_statement = connection.prepare(reaction_sql)?;
+        let reaction_rows = reaction_statement.query_map(params![chat_jid, message_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 Reaction {
@@ -1572,18 +1800,18 @@ impl Database {
         }
         let mut deliveries_by_message: HashMap<String, Vec<MessageDelivery>> = HashMap::new();
         let mut readers_by_message: HashMap<String, Vec<MessageReader>> = HashMap::new();
-        let mut receipt_statement = connection.prepare(
-            "SELECT message_reads.message_id, message_reads.reader_jid,
+        let receipt_sql = "SELECT message_reads.message_id, message_reads.reader_jid,
                     COALESCE(NULLIF(contacts.name, ''), NULLIF(chats.name, ''), ''),
                     message_reads.delivered_at, message_reads.read_at
              FROM message_reads
              LEFT JOIN contacts ON contacts.jid = message_reads.reader_jid
              LEFT JOIN chats ON chats.jid = message_reads.reader_jid
              WHERE message_reads.chat_jid = ?1
+               AND (?2 IS NULL OR message_reads.message_id = ?2)
              ORDER BY LOWER(COALESCE(NULLIF(contacts.name, ''), NULLIF(chats.name, ''), '')),
-                      message_reads.reader_jid",
-        )?;
-        let receipt_rows = receipt_statement.query_map([chat_jid], |row| {
+                      message_reads.reader_jid";
+        let mut receipt_statement = connection.prepare(receipt_sql)?;
+        let receipt_rows = receipt_statement.query_map(params![chat_jid, message_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1615,21 +1843,14 @@ impl Database {
                     });
             }
         }
-        for message in &mut messages {
+        for message in messages {
             message.reactions = reactions_by_message.remove(&message.id).unwrap_or_default();
             message.delivered_to = deliveries_by_message
                 .remove(&message.id)
                 .unwrap_or_default();
             message.read_by = readers_by_message.remove(&message.id).unwrap_or_default();
         }
-        Ok(messages)
-    }
-
-    pub fn message_by_id(&self, chat_jid: &str, message_id: &str) -> Result<Option<Message>> {
-        Ok(self
-            .messages(chat_jid, 1_000)?
-            .into_iter()
-            .find(|message| message.id == message_id))
+        Ok(())
     }
 
     pub fn apply_reaction(
@@ -2499,13 +2720,25 @@ impl Database {
         media: &MessageMedia,
     ) -> Result<bool> {
         let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let updated = Self::update_message_media_into(&transaction, chat_jid, message_id, media)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    fn update_message_media_into(
+        transaction: &Transaction<'_>,
+        chat_jid: &str,
+        message_id: &str,
+        media: &MessageMedia,
+    ) -> Result<bool> {
         let mut merged_media = media.clone();
         if let MessageMedia::Location {
             thumbnail_path,
             duration_seconds,
             ..
         } = &mut merged_media
-            && let Some(previous_json) = connection
+            && let Some(previous_json) = transaction
                 .query_row(
                     "SELECT media_json FROM messages WHERE chat_jid = ?1 AND id = ?2",
                     params![chat_jid, message_id],
@@ -2531,7 +2764,7 @@ impl Database {
             total_voters,
             ..
         } = &mut merged_media
-            && let Some(previous_json) = connection
+            && let Some(previous_json) = transaction
                 .query_row(
                     "SELECT media_json FROM messages WHERE chat_jid = ?1 AND id = ?2",
                     params![chat_jid, message_id],
@@ -2564,8 +2797,7 @@ impl Database {
             }
         )
         .then_some("[GIF]");
-        let transaction = connection.transaction()?;
-        reconcile_poll_tallies(&transaction, chat_jid, message_id, &mut merged_media)?;
+        reconcile_poll_tallies(transaction, chat_jid, message_id, &mut merged_media)?;
         let json = serde_json::to_string(&merged_media)?;
         let updated = transaction.execute(
             "UPDATE messages SET
@@ -2588,7 +2820,6 @@ impl Database {
                 params![chat_jid, message_id, placeholder],
             )?;
         }
-        transaction.commit()?;
         Ok(updated)
     }
 
@@ -3007,6 +3238,21 @@ impl Database {
 mod tests {
     use super::*;
 
+    // Models a database written before the schema ladder existed: every such
+    // file reports version 0 and receives the whole ladder on the next open.
+    fn mark_as_legacy(database: &Database) {
+        database
+            .execute_test_sql("PRAGMA user_version = 0")
+            .unwrap();
+    }
+
+    fn schema_version(database: &Database) -> i64 {
+        database
+            .connection()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
     fn message(id: &str, timestamp: i64) -> Message {
         Message {
             id: id.into(),
@@ -3051,7 +3297,8 @@ mod tests {
         unsupported
             .execute("CREATE TABLE messages (id TEXT PRIMARY KEY)", [])
             .unwrap();
-        assert!(ensure_message_identity_schema(&mut unsupported).is_err());
+        let transaction = unsupported.transaction().unwrap();
+        assert!(ensure_message_identity_schema(&transaction).is_err());
     }
 
     #[test]
@@ -3136,6 +3383,191 @@ mod tests {
     }
 
     #[test]
+    fn fresh_database_records_the_schema_version_and_stops_replaying_the_ladder() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let database = Database::open(&path).unwrap();
+        assert_eq!(schema_version(&database), SCHEMA_VERSION);
+        database
+            .insert_message(&message("kept", 1), "Ada", false, false)
+            .unwrap();
+        database
+            .update_address_book_name("1@s.whatsapp.net", "Ada Lovelace")
+            .unwrap();
+        // Rows the legacy ladder would rewrite: a JID used as a chat name and a
+        // sender name that disagrees with the saved contact.
+        database
+            .execute_test_sql(
+                "UPDATE chats SET name = jid, name_source = 0;
+                 UPDATE messages SET sender_name = 'Stale push name';",
+            )
+            .unwrap();
+        drop(database);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(schema_version(&reopened), SCHEMA_VERSION);
+        assert_eq!(reopened.list_chats(10).unwrap()[0].name, "1@s.whatsapp.net");
+        assert_eq!(
+            reopened.messages("1@s.whatsapp.net", 10).unwrap()[0].sender_name,
+            "Stale push name"
+        );
+    }
+
+    #[test]
+    fn legacy_database_receives_the_whole_ladder_exactly_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE chats (
+                    jid            TEXT PRIMARY KEY,
+                    name           TEXT NOT NULL,
+                    last_message   TEXT NOT NULL DEFAULT '',
+                    last_timestamp INTEGER NOT NULL DEFAULT 0,
+                    unread         INTEGER NOT NULL DEFAULT 0,
+                    is_group       INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE messages (
+                    chat_jid    TEXT NOT NULL,
+                    id          TEXT NOT NULL,
+                    sender_jid  TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    text        TEXT NOT NULL,
+                    timestamp   INTEGER NOT NULL,
+                    from_me     INTEGER NOT NULL,
+                    PRIMARY KEY (chat_jid, id)
+                 );
+                 CREATE TABLE contacts (
+                    jid    TEXT PRIMARY KEY,
+                    name   TEXT NOT NULL,
+                    source INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO chats (jid, name, last_message, last_timestamp)
+                 VALUES ('1@s.whatsapp.net', '1@s.whatsapp.net',
+                         '[Unsupported message]', 9);
+                 INSERT INTO messages VALUES
+                    ('1@s.whatsapp.net', 'kept', '1@s.whatsapp.net',
+                     'Stale push name', 'hello', 5, 0),
+                    ('1@s.whatsapp.net', 'control', '1@s.whatsapp.net',
+                     'Stale push name', '[Unsupported message]', 9, 0);
+                 INSERT INTO contacts (jid, name, source)
+                 VALUES ('1@s.whatsapp.net', 'Ada Lovelace', 1);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        assert_eq!(schema_version(&database), SCHEMA_VERSION);
+        let chat = database.list_chats(10).unwrap().remove(0);
+        assert_eq!(chat.name, "Ada Lovelace");
+        assert_eq!(chat.last_message, "hello");
+        assert_eq!(chat.last_timestamp, 5);
+        let stored = database.messages("1@s.whatsapp.net", 10).unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["kept"]
+        );
+        assert_eq!(stored[0].sender_name, "Ada Lovelace");
+        // The rebuilt identity key keeps equal IDs from distinct senders apart.
+        let mut other_sender = message("kept", 6);
+        other_sender.sender_jid = "2@s.whatsapp.net".into();
+        assert!(
+            database
+                .insert_message(&other_sender, "Ada", false, false)
+                .unwrap()
+        );
+        assert_eq!(database.messages("1@s.whatsapp.net", 10).unwrap().len(), 2);
+
+        database
+            .execute_test_sql("UPDATE messages SET sender_name = 'Stale push name'")
+            .unwrap();
+        drop(database);
+        let reopened = Database::open(&path).unwrap();
+        assert!(
+            reopened
+                .messages("1@s.whatsapp.net", 10)
+                .unwrap()
+                .iter()
+                .all(|message| message.sender_name == "Stale push name")
+        );
+    }
+
+    #[test]
+    fn unsupported_legacy_schema_fails_the_open_and_keeps_its_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (
+                    chat_jid    TEXT NOT NULL,
+                    id          TEXT NOT NULL PRIMARY KEY,
+                    sender_jid  TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    text        TEXT NOT NULL,
+                    timestamp   INTEGER NOT NULL,
+                    from_me     INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let Err(error) = Database::open(&path) else {
+            panic!("expected an unsupported schema to fail the open")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported messages primary key"),
+            "{error}"
+        );
+        // The steps that did complete are recorded, so the failing one is the
+        // only work a later start retries.
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn partially_migrated_database_resumes_at_its_recorded_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let database = Database::open(&path).unwrap();
+        let mut control = message("control", 9);
+        control.text = "[Unsupported message]".into();
+        database
+            .insert_message(&control, "Ada", false, false)
+            .unwrap();
+        // An upgrade that stopped after the chat-name step.
+        database
+            .execute_test_sql(
+                "UPDATE chats SET name = jid, name_source = 0;
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(database);
+
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(schema_version(&reopened), SCHEMA_VERSION);
+        assert!(
+            reopened
+                .messages("1@s.whatsapp.net", 10)
+                .unwrap()
+                .is_empty()
+        );
+        // Only the remaining step ran, so the earlier one did not rewrite names.
+        assert_eq!(reopened.list_chats(10).unwrap()[0].name, "1@s.whatsapp.net");
+    }
+
+    #[test]
     fn database_access_recovers_after_a_poisoned_mutex() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(&directory.path().join("history.db")).unwrap();
@@ -3209,6 +3641,97 @@ mod tests {
                 .unread_receipts("1@s.whatsapp.net")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn same_second_messages_keep_insertion_order_across_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        for id in ["first", "second", "third"] {
+            assert!(
+                database
+                    .insert_message(&message(id, 7), "Ada", false, false)
+                    .unwrap()
+            );
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                database
+                    .messages("1@s.whatsapp.net", 50)
+                    .unwrap()
+                    .iter()
+                    .map(|message| message.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["first", "second", "third"]
+            );
+        }
+        // A page smaller than the conversation still ends on the newest rows.
+        assert_eq!(
+            database
+                .messages("1@s.whatsapp.net", 2)
+                .unwrap()
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "third"]
+        );
+    }
+
+    #[test]
+    fn single_message_lookup_returns_the_conversation_view_of_that_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        database
+            .insert_message(&message("incoming", 1), "Ada", false, false)
+            .unwrap();
+        let mut outgoing = message("outgoing", 2);
+        outgoing.sender_jid = "me".into();
+        outgoing.sender_name = "You".into();
+        outgoing.from_me = true;
+        database
+            .insert_message(&outgoing, "Ada", false, false)
+            .unwrap();
+        database
+            .update_receipts(
+                &outgoing.chat_jid,
+                std::slice::from_ref(&outgoing.id),
+                3,
+                Some("1@s.whatsapp.net"),
+                4,
+            )
+            .unwrap();
+        database
+            .apply_reaction(
+                &outgoing.chat_jid,
+                &outgoing.id,
+                "1@s.whatsapp.net",
+                "🎉",
+                false,
+                5,
+            )
+            .unwrap();
+
+        let page = database.messages(&outgoing.chat_jid, 50).unwrap();
+        let looked_up = database
+            .message_by_id(&outgoing.chat_jid, &outgoing.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(looked_up, page[1]);
+        assert_eq!(looked_up.reactions.len(), 1);
+        assert_eq!(looked_up.read_by.len(), 1);
+        assert!(looked_up.delivered_to.is_empty());
+        assert_eq!(
+            database
+                .message_by_id(&outgoing.chat_jid, "missing")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            database
+                .message_by_id("missing@g.us", &outgoing.id)
+                .unwrap(),
+            None
         );
     }
 
@@ -3308,6 +3831,7 @@ mod tests {
             database
                 .insert_message(&outgoing, "Ada", false, false)
                 .unwrap();
+            mark_as_legacy(&database);
         }
 
         let database = Database::open(&path).unwrap();
@@ -4093,6 +4617,7 @@ mod tests {
         database
             .insert_message(&control, "Ada", false, false)
             .unwrap();
+        mark_as_legacy(&database);
         drop(database);
 
         let database = Database::open(&path).unwrap();
@@ -4190,6 +4715,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        mark_as_legacy(&database);
         drop(database);
         let reopened = Database::open(&directory.path().join("history.db")).unwrap();
         assert_eq!(
@@ -4352,6 +4878,7 @@ mod tests {
                 .insert_message(&group_message, "123-456@g.us", true, false)
                 .unwrap();
             assert_eq!(database.list_chats(10).unwrap()[0].name, "");
+            mark_as_legacy(&database);
         }
         fs::write(
             directory.path().join("store.json"),
@@ -4951,20 +5478,42 @@ mod tests {
                 [r#"{"kind":"poll","#],
             )
             .unwrap();
+        connection
+            .execute(
+                "INSERT INTO poll_votes
+                 (chat_jid, message_id, voter_jid, selected_options, from_me, timestamp)
+                 VALUES ('chat', 'bad', 'me', '[\"One\"]', 1, 1)",
+                [],
+            )
+            .unwrap();
+        // A vote whose card cannot be parsed leaves the stored payload alone.
         reconcile_all_poll_tallies(&mut connection).unwrap();
         connection.execute("DELETE FROM messages", []).unwrap();
+        connection.execute("DELETE FROM poll_votes", []).unwrap();
         connection
             .execute(
                 "INSERT INTO messages (chat_jid, id, media_json) VALUES ('chat', 'poll', ?1)",
                 [serde_json::to_string(&poll).unwrap()],
             )
             .unwrap();
+        // A poll nobody voted on is not even inspected.
         reconcile_all_poll_tallies(&mut connection).unwrap();
         connection
             .execute(
                 "INSERT INTO poll_votes
                  (chat_jid, message_id, voter_jid, selected_options, from_me, timestamp)
                  VALUES ('chat', 'poll', 'me', '[\"One\"]', 1, 1)",
+                [],
+            )
+            .unwrap();
+        reconcile_all_poll_tallies(&mut connection).unwrap();
+        // The repaired card already agrees with the votes, so nothing is written.
+        reconcile_all_poll_tallies(&mut connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO poll_votes
+                 (chat_jid, message_id, voter_jid, selected_options, from_me, timestamp)
+                 VALUES ('chat', 'poll', 'other', '[\"One\"]', 0, 2)",
                 [],
             )
             .unwrap();
@@ -5434,6 +5983,215 @@ mod tests {
                 ..
             })
         )));
+    }
+
+    fn history_conversation() -> (Chat, Vec<Message>) {
+        let chat = Chat {
+            jid: "123-456@g.us".into(),
+            name: "Friends".into(),
+            phone_number: None,
+            last_message: "message b".into(),
+            last_sender_name: "Bob".into(),
+            last_timestamp: 20,
+            unread: 3,
+            pinned: false,
+            muted: false,
+            is_group: true,
+        };
+        let mut alice = message("a", 10);
+        alice.chat_jid = chat.jid.clone();
+        alice.sender_jid = "alice@s.whatsapp.net".into();
+        alice.sender_name = "Alice".into();
+        let mut bob = message("b", 20);
+        bob.chat_jid = chat.jid.clone();
+        bob.sender_jid = "bob@s.whatsapp.net".into();
+        bob.sender_name = "Bob".into();
+        let mut recovered_media = alice.clone();
+        recovered_media.media = Some(MessageMedia::Image {
+            path: "/nonexistent/omarchy-whatsapp/a.jpg".into(),
+            thumbnail_path: "/nonexistent/omarchy-whatsapp/a-thumb.jpg".into(),
+            downloaded: false,
+            mime_type: "image/jpeg".into(),
+            width: 1,
+            height: 1,
+        });
+        // A duplicate replay and a later media completion of an already stored
+        // message are both part of one WhatsApp conversation payload.
+        (chat, vec![alice.clone(), bob, alice, recovered_media])
+    }
+
+    // Exactly what the history ingester performs message by message today.
+    fn ingest_sequentially(database: &Database, chat: &Chat, messages: &[Message]) -> bool {
+        database.insert_history_chat(chat).unwrap();
+        let mut changed = false;
+        for message in messages {
+            if !message.from_me && message.sender_name != message.sender_jid {
+                database
+                    .update_contact_name(&message.sender_jid, &message.sender_name)
+                    .unwrap();
+            }
+            if database
+                .insert_history_message(message, &chat.name, chat.is_group)
+                .unwrap()
+            {
+                changed = true;
+            } else if let Some(media) = &message.media {
+                changed |= database
+                    .update_message_media(&message.chat_jid, &message.id, media)
+                    .unwrap();
+            }
+        }
+        changed
+    }
+
+    #[test]
+    fn history_batch_matches_sequential_ingestion() {
+        let (chat, messages) = history_conversation();
+        let sequential_directory = tempfile::tempdir().unwrap();
+        let sequential = Database::open(&sequential_directory.path().join("history.db")).unwrap();
+        let batched_directory = tempfile::tempdir().unwrap();
+        let batched = Database::open(&batched_directory.path().join("history.db")).unwrap();
+
+        assert!(ingest_sequentially(&sequential, &chat, &messages));
+        assert!(
+            batched
+                .insert_history_conversation(&chat, &messages)
+                .unwrap()
+        );
+
+        assert_eq!(
+            batched.list_chats(10).unwrap(),
+            sequential.list_chats(10).unwrap()
+        );
+        let stored = batched.messages(&chat.jid, 50).unwrap();
+        assert_eq!(stored, sequential.messages(&chat.jid, 50).unwrap());
+        assert_eq!(
+            stored
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(stored[0].media.is_some());
+        for jid in ["alice@s.whatsapp.net", "bob@s.whatsapp.net"] {
+            assert_eq!(
+                batched.contact_name(jid).unwrap(),
+                sequential.contact_name(jid).unwrap()
+            );
+        }
+
+        // Replaying the same conversation stores nothing new in either path.
+        assert!(!ingest_sequentially(&sequential, &chat, &messages));
+        assert!(
+            !batched
+                .insert_history_conversation(&chat, &messages)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn history_batch_preserves_tombstones_clearing_and_deleted_chats() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let (chat, messages) = history_conversation();
+        database
+            .insert_message(&messages[0], &chat.name, true, false)
+            .unwrap();
+        database.delete_message(&chat.jid, &messages[0].id).unwrap();
+
+        assert!(
+            !database
+                .insert_history_conversation(&chat, &messages[..1])
+                .unwrap()
+        );
+        assert!(
+            database
+                .insert_history_conversation(&chat, &messages)
+                .unwrap()
+        );
+        assert_eq!(
+            database
+                .messages(&chat.jid, 50)
+                .unwrap()
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+
+        database.clear_chat(&chat.jid, 20).unwrap();
+        assert!(
+            !database
+                .insert_history_conversation(&chat, &messages)
+                .unwrap()
+        );
+        assert!(database.messages(&chat.jid, 50).unwrap().is_empty());
+
+        let mut deleted = chat.clone();
+        deleted.jid = "789-012@g.us".into();
+        let deleted_messages = messages
+            .iter()
+            .map(|message| {
+                let mut copy = message.clone();
+                copy.chat_jid = deleted.jid.clone();
+                copy
+            })
+            .collect::<Vec<_>>();
+        database.delete_chat(&deleted.jid, 30).unwrap();
+        assert!(
+            !database
+                .insert_history_conversation(&deleted, &deleted_messages)
+                .unwrap()
+        );
+        assert!(
+            database
+                .list_chats(10)
+                .unwrap()
+                .iter()
+                .all(|chat| chat.jid != deleted.jid)
+        );
+    }
+
+    #[test]
+    fn history_batch_prunes_the_conversation_once_it_exceeds_retention() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("history.db")).unwrap();
+        let chat = Chat {
+            jid: "1@s.whatsapp.net".into(),
+            name: "Ada".into(),
+            phone_number: None,
+            last_message: "message m1099".into(),
+            last_sender_name: "Ada".into(),
+            last_timestamp: 1_099,
+            unread: 0,
+            pinned: false,
+            muted: false,
+            is_group: false,
+        };
+        let messages = (0..1_100)
+            .map(|index| {
+                let mut entry = message(&format!("m{index}"), index);
+                entry.sender_name = entry.sender_jid.clone();
+                entry
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            database
+                .insert_history_conversation(&chat, &messages)
+                .unwrap()
+        );
+        let stored = database.messages(&chat.jid, 1_000).unwrap();
+        assert_eq!(stored.len(), 1_000);
+        assert_eq!(stored[0].id, "m100");
+        assert_eq!(
+            database
+                .connection()
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1_000
+        );
     }
 
     #[test]
