@@ -15,7 +15,6 @@ use whatsapp_rust::wacore_binary::JidExt;
 
 const AVATAR_SYNC_LIMIT: u32 = 1_000;
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn sync_group_names(shared: Arc<Shared>, transport: Arc<dyn Transport>) {
     let _guard = shared.group_name_sync.lock().await;
     match transport.participating_groups().await {
@@ -77,7 +76,6 @@ pub(crate) async fn sync_group_names(shared: Arc<Shared>, transport: Arc<dyn Tra
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn sync_missing_contact_names(shared: Arc<Shared>, transport: Arc<dyn Transport>) {
     let unresolved = match shared.database.unresolved_chat_jids(false, 100) {
         Ok(unresolved) => unresolved,
@@ -125,7 +123,6 @@ pub(crate) async fn sync_missing_contact_names(shared: Arc<Shared>, transport: A
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn refresh_avatar(
     shared: Arc<Shared>,
     transport: Arc<dyn Transport>,
@@ -150,7 +147,6 @@ pub(crate) async fn refresh_avatar(
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn sync_avatars(shared: Arc<Shared>, transport: Arc<dyn Transport>) {
     // Connected can precede the initial history import on a fresh link. Keep
     // sync passes serialized so a pass queued by each history chunk observes
@@ -185,17 +181,28 @@ pub(crate) async fn sync_avatars(shared: Arc<Shared>, transport: Arc<dyn Transpo
     info!(total, "completed bounded WhatsApp avatar sync");
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn backfill_video_previews(shared: Arc<Shared>) {
     let media_dir = shared.media_dir.clone();
-    match tokio::task::spawn_blocking(move || assets::backfill_message_video_thumbnails(&media_dir))
-        .await
-    {
+    let outcome =
+        tokio::task::spawn_blocking(move || assets::backfill_message_video_thumbnails(&media_dir))
+            .await;
+    apply_video_preview_backfill(&shared, outcome);
+}
+
+/// Reacts to one preview-backfill run. It is separate from the worker above so
+/// that the outcomes a hermetic test cannot produce — generating a preview
+/// needs `ffmpeg`, and a join error needs a worker that dies — stay decided by
+/// measured code instead of by the process boundary.
+fn apply_video_preview_backfill(
+    shared: &Shared,
+    outcome: std::result::Result<Result<usize>, tokio::task::JoinError>,
+) {
+    match outcome {
         Ok(Ok(generated)) => {
             info!(generated, "generated missing video previews");
             if generated > 0 {
                 for chat_jid in shared.connection_state().active_chats {
-                    broadcast_messages(&shared, &chat_jid);
+                    broadcast_messages(shared, &chat_jid);
                 }
             }
         }
@@ -204,7 +211,6 @@ pub(crate) async fn backfill_video_previews(shared: Arc<Shared>) {
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn request_missing_contact_history(
     shared: Arc<Shared>,
     transport: Arc<dyn Transport>,
@@ -332,7 +338,517 @@ pub(crate) fn prepare_event_state_resync(protocol_db: &Path, marker: &Path) -> R
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::test_support::test_shared;
+    use crate::transport::ContactInfo;
+    use crate::transport::fake::{Call, CallKind, FakeTransport, transport};
+    use omarchy_whatsapp_protocol::{Chat, Message};
     use std::os::unix::fs::PermissionsExt;
+
+    fn chat(jid: &str, name: &str, is_group: bool) -> Chat {
+        Chat {
+            jid: jid.to_owned(),
+            name: name.to_owned(),
+            phone_number: None,
+            last_message: String::new(),
+            last_sender_name: String::new(),
+            last_timestamp: 10,
+            unread: 0,
+            pinned: false,
+            muted: false,
+            is_group,
+        }
+    }
+
+    fn message(chat_jid: &str, id: &str) -> Message {
+        Message {
+            id: id.to_owned(),
+            chat_jid: chat_jid.to_owned(),
+            sender_jid: chat_jid.to_owned(),
+            sender_name: chat_jid.to_owned(),
+            text: "synthetic".into(),
+            timestamp: 100,
+            from_me: false,
+            receipt: 0,
+            delivered_at: None,
+            read_at: None,
+            delivered_to: Vec::new(),
+            read_by: Vec::new(),
+            media: None,
+            reactions: Vec::new(),
+        }
+    }
+
+    fn seed(shared: &Shared, chat: &Chat, messages: &[Message]) {
+        shared
+            .database
+            .insert_history_conversation(chat, messages)
+            .unwrap();
+    }
+
+    fn subject(name: &str) -> whatsapp_rust::GroupMetadata {
+        whatsapp_rust::GroupMetadata {
+            subject: name.to_owned(),
+            ..whatsapp_rust::GroupMetadata::default()
+        }
+    }
+
+    fn chat_names(shared: &Shared) -> Vec<(String, String)> {
+        let mut names = shared
+            .database
+            .list_chats(20)
+            .unwrap()
+            .into_iter()
+            .map(|chat| (chat.jid, chat.name))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn group_subjects_come_from_participation_and_are_recovered_per_chat() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        for jid in [
+            "123-456@g.us",
+            "999-999@g.us",
+            "888-888@g.us",
+            "777-777@g.us",
+            "555-555@g.us",
+        ] {
+            seed(&shared, &chat(jid, jid, true), &[]);
+        }
+        shared
+            .database
+            .execute_test_sql("INSERT INTO chats (jid, name, is_group) VALUES ('broken', '', 1)")
+            .unwrap();
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_participating_group("123-456@g.us", subject("Garden"))
+                .with_group_metadata("999-999@g.us", subject("Recovered"))
+                .with_group_metadata("888-888@g.us", subject("   "))
+                // A group WhatsApp names after its own identity stays
+                // unresolved, so the next pass re-reads and re-stores it.
+                .with_group_metadata("555-555@g.us", subject("555-555@g.us")),
+        );
+
+        sync_group_names(Arc::clone(&shared), transport(&fake)).await;
+
+        assert_eq!(
+            chat_names(&shared),
+            vec![
+                ("123-456@g.us".to_owned(), "Garden".to_owned()),
+                ("555-555@g.us".to_owned(), "555-555@g.us".to_owned()),
+                ("777-777@g.us".to_owned(), String::new()),
+                ("888-888@g.us".to_owned(), String::new()),
+                ("999-999@g.us".to_owned(), "Recovered".to_owned()),
+                ("broken".to_owned(), String::new()),
+            ]
+        );
+        // The unparseable stored identity is never asked about.
+        assert!(
+            !fake
+                .calls_of(CallKind::GroupMetadata)
+                .contains(&Call::GroupMetadata("broken".into()))
+        );
+
+        // A repeat pass re-reads the still-unresolved subjects and stores none
+        // of them again.
+        fake.clear_calls();
+        sync_group_names(Arc::clone(&shared), transport(&fake)).await;
+        assert_eq!(
+            fake.calls_of(CallKind::ParticipatingGroups),
+            vec![Call::ParticipatingGroups]
+        );
+        assert!(
+            fake.calls_of(CallKind::GroupMetadata)
+                .contains(&Call::GroupMetadata("555-555@g.us".into()))
+        );
+
+        // Persisting failures on either path are logged, not fatal.
+        shared
+            .database
+            .execute_test_sql("PRAGMA query_only = ON")
+            .unwrap();
+        sync_group_names(Arc::clone(&shared), transport(&fake)).await;
+        shared
+            .database
+            .execute_test_sql("PRAGMA query_only = OFF")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_subject_synchronization_degrades_on_every_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        let failing = Arc::new(
+            FakeTransport::new().failing(CallKind::ParticipatingGroups, "WhatsApp is offline"),
+        );
+
+        sync_group_names(Arc::clone(&shared), transport(&failing)).await;
+        assert_eq!(
+            failing.calls(),
+            vec![Call::ParticipatingGroups],
+            "a failed participation query ends the pass"
+        );
+
+        let fake = Arc::new(FakeTransport::new());
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chats")
+            .unwrap();
+        sync_group_names(Arc::clone(&shared), transport(&fake)).await;
+        assert!(fake.calls_of(CallKind::GroupMetadata).is_empty());
+    }
+
+    #[tokio::test]
+    async fn business_profile_names_fill_in_unresolved_direct_chats() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        let business = "31600000001@s.whatsapp.net";
+        let business_lid = "100000000000001@lid";
+        let anonymous = "100000012345678@lid";
+        for jid in [business, anonymous, "0@s.whatsapp.net"] {
+            seed(&shared, &chat(jid, jid, false), &[]);
+        }
+        shared
+            .database
+            .execute_test_sql("INSERT INTO chats (jid, name) VALUES ('broken', '')")
+            .unwrap();
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_user_info(ContactInfo {
+                    jid: business.parse().unwrap(),
+                    lid: Some(business_lid.parse().unwrap()),
+                    verified_name: Some("Ada's Flowers".into()),
+                })
+                .with_user_info(ContactInfo {
+                    jid: anonymous.parse().unwrap(),
+                    lid: None,
+                    verified_name: None,
+                }),
+        );
+        // The business's LID already carries an address-book name, which
+        // outranks a verified profile name and is therefore left alone.
+        shared
+            .database
+            .update_address_book_name(business_lid, "Ada")
+            .unwrap();
+
+        // A read-only database logs instead of aborting the pass.
+        shared
+            .database
+            .execute_test_sql("PRAGMA query_only = ON")
+            .unwrap();
+        sync_missing_contact_names(Arc::clone(&shared), transport(&fake)).await;
+        shared
+            .database
+            .execute_test_sql("PRAGMA query_only = OFF")
+            .unwrap();
+        assert!(shared.database.contact_name(business).unwrap().is_none());
+
+        sync_missing_contact_names(Arc::clone(&shared), transport(&fake)).await;
+
+        let queried = match &fake.calls_of(CallKind::UserInfo)[..] {
+            [Call::UserInfo(jids), Call::UserInfo(_)] => {
+                let mut jids = jids.clone();
+                jids.sort();
+                jids
+            }
+            other => panic!("unexpected calls {other:?}"),
+        };
+        assert_eq!(
+            queried,
+            vec![anonymous.to_owned(), business.to_owned()],
+            "the placeholder and unparseable identities are filtered out"
+        );
+        assert_eq!(
+            shared.database.contact_name(business).unwrap().as_deref(),
+            Some("Ada's Flowers")
+        );
+        assert_eq!(
+            shared
+                .database
+                .contact_name(business_lid)
+                .unwrap()
+                .as_deref(),
+            Some("Ada"),
+            "the address book keeps precedence over the verified name"
+        );
+        assert!(shared.database.contact_name(anonymous).unwrap().is_none());
+
+        fake.fail(CallKind::UserInfo, "WhatsApp is offline");
+        sync_missing_contact_names(Arc::clone(&shared), transport(&fake)).await;
+        assert_eq!(fake.calls_of(CallKind::UserInfo).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn contact_name_synchronization_stops_before_asking_for_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        let fake = Arc::new(FakeTransport::new());
+
+        // Nothing unresolved: the batch query is never issued.
+        sync_missing_contact_names(Arc::clone(&shared), transport(&fake)).await;
+        assert!(fake.calls().is_empty());
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chats")
+            .unwrap();
+        sync_missing_contact_names(Arc::clone(&shared), transport(&fake)).await;
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn avatar_refresh_respects_the_cache_the_marker_and_a_forced_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        let raw = "31600000000@s.whatsapp.net";
+        let jid: Jid = raw.parse().unwrap();
+        let fake = Arc::new(FakeTransport::new().with_profile_picture(raw, None));
+
+        assets::write_private_bytes(&assets::avatar_path(&shared.avatar_dir, raw), b"avatar")
+            .unwrap();
+        refresh_avatar(Arc::clone(&shared), transport(&fake), jid.clone(), false).await;
+        assert!(
+            fake.calls().is_empty(),
+            "a cached avatar is never re-fetched"
+        );
+
+        // Forcing drops the cache and records that WhatsApp has no picture.
+        refresh_avatar(Arc::clone(&shared), transport(&fake), jid.clone(), true).await;
+        assert_eq!(
+            fake.calls_of(CallKind::ProfilePicture),
+            vec![Call::ProfilePicture(raw.into())]
+        );
+        assert!(!assets::avatar_path(&shared.avatar_dir, raw).exists());
+        assert!(assets::avatar_missing_path(&shared.avatar_dir, raw).exists());
+
+        // The missing marker keeps unforced passes from asking again.
+        fake.clear_calls();
+        refresh_avatar(Arc::clone(&shared), transport(&fake), jid.clone(), false).await;
+        assert!(fake.calls().is_empty());
+
+        // A failed lookup is logged and leaves no marker behind.
+        fake.fail(CallKind::ProfilePicture, "WhatsApp is offline");
+        refresh_avatar(Arc::clone(&shared), transport(&fake), jid, true).await;
+        assert_eq!(fake.calls_of(CallKind::ProfilePicture).len(), 1);
+        assert!(!assets::avatar_missing_path(&shared.avatar_dir, raw).exists());
+    }
+
+    #[tokio::test]
+    async fn the_bounded_avatar_sync_only_fetches_uncached_contact_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        let wanted = "31600000001@s.whatsapp.net";
+        let cached = "31600000002@s.whatsapp.net";
+        let known_missing = "31600000003@s.whatsapp.net";
+        for jid in [wanted, cached, known_missing] {
+            seed(&shared, &chat(jid, jid, false), &[]);
+        }
+        shared
+            .database
+            .execute_test_sql(
+                "INSERT INTO chats (jid, name) VALUES
+                   ('broken', ''), ('status@broadcast', ''), ('1@newsletter', '')",
+            )
+            .unwrap();
+        assets::write_private_bytes(&assets::avatar_path(&shared.avatar_dir, cached), b"avatar")
+            .unwrap();
+        assets::write_private_bytes(
+            &assets::avatar_missing_path(&shared.avatar_dir, known_missing),
+            b"none\n",
+        )
+        .unwrap();
+        let fake = Arc::new(FakeTransport::new().with_profile_picture(wanted, None));
+
+        sync_avatars(Arc::clone(&shared), transport(&fake)).await;
+
+        assert_eq!(
+            fake.calls_of(CallKind::ProfilePicture),
+            vec![Call::ProfilePicture(wanted.into())]
+        );
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chats; DROP TABLE messages;")
+            .unwrap();
+        fake.clear_calls();
+        sync_avatars(Arc::clone(&shared), transport(&fake)).await;
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn video_preview_backfill_only_reloads_chats_when_it_produced_something() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        let connection = shared.open_connection();
+        shared
+            .set_connection_active_chat(connection, Some("31600000000@s.whatsapp.net".into()))
+            .unwrap();
+        let mut events = shared.events.subscribe();
+
+        apply_video_preview_backfill(&shared, Ok(Ok(0)));
+        assert!(events.try_recv().is_err());
+
+        apply_video_preview_backfill(&shared, Ok(Ok(2)));
+        assert!(matches!(
+            events.try_recv().unwrap().event,
+            omarchy_whatsapp_protocol::ServerEvent::Invalidated {
+                resource: omarchy_whatsapp_protocol::Resource::Messages,
+                ..
+            }
+        ));
+
+        apply_video_preview_backfill(&shared, Ok(Err(anyhow::anyhow!("cache is unreadable"))));
+        let aborted = tokio::spawn(std::future::pending::<()>());
+        aborted.abort();
+        apply_video_preview_backfill(&shared, Err(aborted.await.unwrap_err()));
+        assert!(events.try_recv().is_err());
+
+        // The worker itself runs against the real media directory.
+        backfill_video_previews(Arc::clone(&shared)).await;
+        assets::private_dir(&shared.media_dir).unwrap();
+        backfill_video_previews(Arc::clone(&shared)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_time_history_recovery_is_consumed_only_once_every_chat_is_queued() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut shared = test_shared(&directory);
+        shared.contact_history_marker = directory.path().join("markers/contact-history");
+        let shared = Arc::new(shared);
+        let first = "31600000001@s.whatsapp.net";
+        let second = "31600000002@s.whatsapp.net";
+        seed(&shared, &chat(first, first, false), &[message(first, "M1")]);
+        seed(
+            &shared,
+            &chat(second, second, false),
+            &[message(second, "M2")],
+        );
+        shared
+            .database
+            .execute_test_sql(
+                "INSERT INTO chats (jid, name) VALUES ('broken', '');
+                 INSERT INTO messages
+                   (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me)
+                 VALUES ('broken', 'M3', 'broken', '', 'x', 1, 0);",
+            )
+            .unwrap();
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_history_request_id("request-1")
+                .failing(CallKind::FetchMessageHistory, "WhatsApp is offline"),
+        );
+
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+        assert_eq!(fake.calls_of(CallKind::FetchMessageHistory).len(), 2);
+        assert!(
+            !shared.contact_history_marker.exists(),
+            "a partially queued recovery stays armed"
+        );
+
+        fake.succeed(CallKind::FetchMessageHistory);
+        fake.clear_calls();
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+        let requested = fake
+            .calls_of(CallKind::FetchMessageHistory)
+            .into_iter()
+            .map(|call| match call {
+                Call::FetchMessageHistory {
+                    chat,
+                    oldest_message_id,
+                    count,
+                    ..
+                } => (chat, oldest_message_id, count),
+                other => panic!("unexpected call {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let mut requested = requested;
+        requested.sort();
+        assert_eq!(
+            requested,
+            vec![
+                (first.to_owned(), "M1".to_owned(), 25),
+                (second.to_owned(), "M2".to_owned(), 25),
+            ]
+        );
+        assert!(
+            !shared.contact_history_marker.exists(),
+            "an unparseable chat leaves one request unqueued"
+        );
+
+        shared
+            .database
+            .execute_test_sql("DELETE FROM messages WHERE chat_jid = 'broken'")
+            .unwrap();
+        fake.clear_calls();
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+        assert_eq!(fake.calls_of(CallKind::FetchMessageHistory).len(), 2);
+        assert!(
+            !shared.contact_history_marker.exists(),
+            "an unwritable marker is logged and leaves the recovery armed"
+        );
+
+        std::fs::create_dir(directory.path().join("markers")).unwrap();
+        fake.clear_calls();
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+        assert_eq!(fake.calls_of(CallKind::FetchMessageHistory).len(), 2);
+        assert!(shared.contact_history_marker.exists());
+
+        // The marker makes every later pass a no-op.
+        fake.clear_calls();
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn history_recovery_waits_for_a_chat_before_consuming_its_one_shot() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut shared = test_shared(&directory);
+        shared.contact_history_marker = directory.path().join("missing/contact-history");
+        let shared = Arc::new(shared);
+        let fake = Arc::new(FakeTransport::new());
+
+        // A fresh link has no chats yet, so the recovery stays armed.
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+        assert!(!shared.contact_history_marker.exists());
+
+        // With a resolved chat present there is nothing to request, but the
+        // marker directory is unwritable, which is logged rather than fatal.
+        let resolved = "31600000004@s.whatsapp.net";
+        seed(&shared, &chat(resolved, "Ada", false), &[]);
+        shared
+            .database
+            .execute_test_sql(
+                "UPDATE chats SET name = 'Ada', name_source = 40 WHERE jid = '31600000004@s.whatsapp.net'",
+            )
+            .unwrap();
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+        assert!(!shared.contact_history_marker.exists());
+
+        // Once the marker can be written the one-shot is finally consumed.
+        std::fs::create_dir(directory.path().join("missing")).unwrap();
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+        assert!(shared.contact_history_marker.exists());
+        std::fs::remove_file(&shared.contact_history_marker).unwrap();
+
+        // A broken chat listing is logged as well.
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chat_settings")
+            .unwrap();
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chats")
+            .unwrap();
+        request_missing_contact_history(Arc::clone(&shared), transport(&fake)).await;
+        assert!(fake.calls().is_empty());
+    }
 
     #[test]
     fn contact_resync_only_resets_the_contact_collection_once() {

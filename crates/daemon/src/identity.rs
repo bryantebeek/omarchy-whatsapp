@@ -20,7 +20,6 @@ pub(crate) fn normalize_jid(value: &str) -> String {
         .map_or_else(|_| value.to_owned(), |jid| jid.to_non_ad_string())
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn canonical_contact_jid(
     shared: &Shared,
     transport: &dyn Transport,
@@ -47,35 +46,36 @@ pub(crate) async fn canonical_contact_jid(
     };
     let canonical = format!("{}@s.whatsapp.net", mapping.phone_number);
     let alias = format!("{}@lid", mapping.lid);
-    if alias != canonical {
-        match shared.database.migrate_contact_jid(&alias, &canonical) {
-            Ok(true) => {
-                let replacements = match assets::copy_chat_media_alias(
-                    &shared.media_dir,
-                    &alias,
-                    &canonical,
-                ) {
-                    Ok(replacements) => replacements,
-                    Err(error) => {
-                        warn!(%error, %alias, %canonical, "could not preserve aliased WhatsApp media paths");
-                        Vec::new()
-                    }
-                };
-                if let Err(error) = shared.database.rewrite_media_paths(&replacements) {
-                    warn!(%error, %alias, %canonical, "could not rewrite aliased WhatsApp media paths");
+    // The two identities are built from different servers, so they can never
+    // name the same row; `migrate_contact_jid` answers `false` for an identity
+    // that equals itself anyway, which leaves the alias copies below untouched.
+    match shared.database.migrate_contact_jid(&alias, &canonical) {
+        Ok(true) => {
+            let replacements = match assets::copy_chat_media_alias(
+                &shared.media_dir,
+                &alias,
+                &canonical,
+            ) {
+                Ok(replacements) => replacements,
+                Err(error) => {
+                    warn!(%error, %alias, %canonical, "could not preserve aliased WhatsApp media paths");
+                    Vec::new()
                 }
-                match assets::copy_avatar_alias(&shared.avatar_dir, &alias, &canonical) {
-                    Ok(true) => shared.avatars_changed(),
-                    Ok(false) => {}
-                    Err(error) => {
-                        warn!(%error, %alias, %canonical, "could not preserve aliased WhatsApp avatar");
-                    }
+            };
+            if let Err(error) = shared.database.rewrite_media_paths(&replacements) {
+                warn!(%error, %alias, %canonical, "could not rewrite aliased WhatsApp media paths");
+            }
+            match assets::copy_avatar_alias(&shared.avatar_dir, &alias, &canonical) {
+                Ok(true) => shared.avatars_changed(),
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(%error, %alias, %canonical, "could not preserve aliased WhatsApp avatar");
                 }
             }
-            Ok(false) => {}
-            Err(error) => {
-                warn!(%error, %alias, %canonical, "could not merge WhatsApp contact alias");
-            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(%error, %alias, %canonical, "could not merge WhatsApp contact alias");
         }
     }
     if let Err(error) = shared
@@ -87,7 +87,6 @@ pub(crate) async fn canonical_contact_jid(
     canonical
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn own_poll_creator_jid(transport: &dyn Transport, chat: &Jid) -> Result<Jid> {
     if chat.is_group()
         && transport.group_metadata(chat).await.is_ok_and(|metadata| {
@@ -105,7 +104,6 @@ pub(crate) async fn own_poll_creator_jid(transport: &dyn Transport, chat: &Jid) 
         .ok_or_else(|| anyhow!("own WhatsApp JID is unavailable"))
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn reconcile_direct_chat_aliases(shared: &Shared, transport: &dyn Transport) {
     let jids = match shared.database.direct_chat_jids(CHAT_LIST_LIMIT) {
         Ok(jids) => jids,
@@ -121,7 +119,6 @@ pub(crate) async fn reconcile_direct_chat_aliases(shared: &Shared, transport: &d
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn list_chats_with_phone_numbers(
     shared: &Shared,
     limit: u32,
@@ -181,7 +178,6 @@ pub(crate) struct GroupParticipantIdentity {
     profile_name: Option<String>,
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) fn group_participant_identity(
     participant: whatsapp_rust::GroupParticipant,
 ) -> GroupParticipantIdentity {
@@ -208,7 +204,6 @@ pub(crate) fn group_participant_identity(
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn resolve_group_participants(
     shared: &Shared,
     transport: &dyn Transport,
@@ -330,7 +325,548 @@ pub(crate) fn display_name(shared: &Shared, jid: &Jid) -> String {
 mod tests {
     use super::*;
     use crate::test_support::test_shared;
+    use crate::transport::fake::{Call, CallKind, FakeTransport, transport};
     use chrono::Utc;
+    use std::sync::Arc;
+    use whatsapp_rust::wacore::types::lid_pn::{LearningSource, LidPnEntry};
+    use whatsapp_rust::wacore::types::message::AddressingMode;
+    use whatsapp_rust::{GroupParticipant, GroupParticipantDetails, ParticipantType};
+
+    fn seed_chat(shared: &Shared, jid: &str, name: &str, is_group: bool) {
+        shared
+            .database
+            .insert_history_conversation(
+                &Chat {
+                    jid: jid.to_owned(),
+                    name: name.to_owned(),
+                    phone_number: None,
+                    last_message: String::new(),
+                    last_sender_name: String::new(),
+                    last_timestamp: 10,
+                    unread: 0,
+                    pinned: false,
+                    muted: false,
+                    is_group,
+                },
+                &[],
+            )
+            .unwrap();
+    }
+
+    fn mapping(lid: &str, phone_number: &str) -> LidPnEntry {
+        LidPnEntry {
+            lid: lid.into(),
+            phone_number: phone_number.into(),
+            created_at: 1,
+            learning_source: LearningSource::Usync,
+        }
+    }
+
+    fn participant(jid: &str, phone_number: Option<&str>, lid: Option<&str>) -> GroupParticipant {
+        GroupParticipant {
+            jid: jid.parse().unwrap(),
+            phone_number: phone_number.map(|value| value.parse().unwrap()),
+            lid: lid.map(|value| value.parse().unwrap()),
+            username: None,
+            participant_type: ParticipantType::Member,
+            details: None,
+        }
+    }
+
+    // `GroupParticipantDetails` is `#[non_exhaustive]`, so a struct literal is
+    // not available outside its own crate.
+    #[allow(clippy::field_reassign_with_default)]
+    fn with_profile_name(mut participant: GroupParticipant, name: &str) -> GroupParticipant {
+        let mut details = GroupParticipantDetails::default();
+        details.display_name = Some(name.into());
+        participant.details = Some(Box::new(details));
+        participant
+    }
+
+    #[tokio::test]
+    async fn identities_whatsapp_cannot_alias_stay_exactly_as_requested() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        let client = transport(&fake);
+
+        // Groups are never aliased, so the daemon does not even ask.
+        assert_eq!(
+            canonical_contact_jid(&shared, client.as_ref(), &"123-456@g.us".parse().unwrap()).await,
+            "123-456@g.us"
+        );
+        assert!(fake.calls().is_empty());
+
+        // An unmapped phone-number JID caches its own number on the chat row.
+        seed_chat(&shared, "31600000000@s.whatsapp.net", "Ada", false);
+        assert_eq!(
+            canonical_contact_jid(
+                &shared,
+                client.as_ref(),
+                &"31600000000:3@s.whatsapp.net".parse().unwrap(),
+            )
+            .await,
+            "31600000000@s.whatsapp.net"
+        );
+        assert_eq!(
+            shared.database.list_chats(10).unwrap()[0]
+                .phone_number
+                .as_deref(),
+            Some("31600000000")
+        );
+
+        // An unmapped LID has no phone number to cache and stays a LID.
+        assert_eq!(
+            canonical_contact_jid(
+                &shared,
+                client.as_ref(),
+                &"100000012345678@lid".parse().unwrap(),
+            )
+            .await,
+            "100000012345678@lid"
+        );
+        assert_eq!(
+            fake.calls_of(CallKind::LidPnEntry).len(),
+            2,
+            "only addressable identities are looked up"
+        );
+
+        // A failed lookup degrades to the requested identity.
+        fake.fail(CallKind::LidPnEntry, "offline");
+        assert_eq!(
+            canonical_contact_jid(
+                &shared,
+                client.as_ref(),
+                &"100000012345678@lid".parse().unwrap(),
+            )
+            .await,
+            "100000012345678@lid"
+        );
+
+        // A read-only database cannot cache the number but must not panic.
+        fake.succeed(CallKind::LidPnEntry);
+        shared
+            .database
+            .execute_test_sql("PRAGMA query_only = ON")
+            .unwrap();
+        assert_eq!(
+            canonical_contact_jid(
+                &shared,
+                client.as_ref(),
+                &"31600000001@s.whatsapp.net".parse().unwrap(),
+            )
+            .await,
+            "31600000001@s.whatsapp.net"
+        );
+        shared
+            .database
+            .execute_test_sql("PRAGMA query_only = OFF")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resolved_alias_merges_the_chat_and_carries_its_cached_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        assets::private_dir(&shared.media_dir).unwrap();
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        let alias = "100000012345678@lid";
+        let canonical = "31612345678@s.whatsapp.net";
+        seed_chat(&shared, alias, "Ada", false);
+        let alias_media = assets::message_image_path(&shared.media_dir, alias, "MSG-1");
+        assets::write_private_bytes(&alias_media, b"image").unwrap();
+        assets::write_private_bytes(&assets::avatar_path(&shared.avatar_dir, alias), b"avatar")
+            .unwrap();
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_lid_pn_entry(alias, Some(mapping("100000012345678", "31612345678"))),
+        );
+        let client = transport(&fake);
+
+        assert_eq!(
+            canonical_contact_jid(&shared, client.as_ref(), &alias.parse().unwrap()).await,
+            canonical
+        );
+
+        let chats = shared.database.list_chats(10).unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].jid, canonical);
+        assert_eq!(chats[0].phone_number.as_deref(), Some("31612345678"));
+        assert!(
+            assets::message_image_path(&shared.media_dir, canonical, "MSG-1").exists(),
+            "cached media follows the merged identity"
+        );
+        assert!(assets::avatar_path(&shared.avatar_dir, canonical).exists());
+
+        // Repeating the resolution finds nothing left to migrate.
+        assert_eq!(
+            canonical_contact_jid(&shared, client.as_ref(), &alias.parse().unwrap()).await,
+            canonical
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_merge_failures_are_logged_and_never_abort_the_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let alias = "100000012345678@lid";
+        let canonical = "31612345678@s.whatsapp.net";
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_lid_pn_entry(alias, Some(mapping("100000012345678", "31612345678"))),
+        );
+        let client = transport(&fake);
+
+        // The media directory does not exist yet, so the copy pass fails.
+        seed_chat(&shared, alias, "Ada", false);
+        assert_eq!(
+            canonical_contact_jid(&shared, client.as_ref(), &alias.parse().unwrap()).await,
+            canonical
+        );
+
+        // An avatar whose cache entry is not a file cannot be copied.
+        assets::private_dir(&shared.media_dir).unwrap();
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        seed_chat(&shared, alias, "Ada", false);
+        std::fs::create_dir(assets::avatar_path(&shared.avatar_dir, alias)).unwrap();
+        assert_eq!(
+            canonical_contact_jid(&shared, client.as_ref(), &alias.parse().unwrap()).await,
+            canonical
+        );
+        std::fs::remove_dir(assets::avatar_path(&shared.avatar_dir, alias)).unwrap();
+
+        // A blocked media rewrite leaves the merged rows in place.
+        seed_chat(&shared, alias, "Ada", false);
+        seed_chat(&shared, "31600000009@s.whatsapp.net", "Bob", false);
+        let alias_media = assets::message_image_path(&shared.media_dir, alias, "MSG-1");
+        assets::write_private_bytes(&alias_media, b"image").unwrap();
+        let media_json = format!(
+            "{{\"kind\":\"image\",\"path\":\"{}\"}}",
+            alias_media.display()
+        );
+        shared
+            .database
+            .execute_test_sql(&format!(
+                "INSERT INTO messages
+                   (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, media_json)
+                 VALUES ('31600000009@s.whatsapp.net', 'MSG-1', '31600000009@s.whatsapp.net',
+                         'Bob', '[Image]', 1, 0, '{media_json}');
+                 CREATE TRIGGER block_media_rewrite BEFORE UPDATE OF media_json ON messages
+                 BEGIN SELECT RAISE(ABORT, 'media rewrite blocked'); END;"
+            ))
+            .unwrap();
+        assert_eq!(
+            canonical_contact_jid(&shared, client.as_ref(), &alias.parse().unwrap()).await,
+            canonical
+        );
+        assert_eq!(
+            shared
+                .database
+                .messages("31600000009@s.whatsapp.net", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A broken database fails the merge and the phone-number cache alike.
+        shared
+            .database
+            .execute_test_sql("DROP TRIGGER block_media_rewrite; DROP TABLE chats;")
+            .unwrap();
+        assert_eq!(
+            canonical_contact_jid(&shared, client.as_ref(), &alias.parse().unwrap()).await,
+            canonical
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_chat_alias_reconciliation_walks_every_stored_lid() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let alias = "100000012345678@lid";
+        seed_chat(&shared, alias, "Ada", false);
+        shared
+            .database
+            .execute_test_sql("INSERT INTO chats (jid, name) VALUES ('weird@LID', 'x')")
+            .unwrap();
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_lid_pn_entry(alias, Some(mapping("100000012345678", "31612345678"))),
+        );
+        let client = transport(&fake);
+
+        reconcile_direct_chat_aliases(&shared, client.as_ref()).await;
+
+        // Every parseable stored LID is asked about exactly once.
+        assert_eq!(
+            fake.calls_of(CallKind::LidPnEntry),
+            vec![Call::LidPnEntry(alias.into())],
+            "an unparseable stored identity is skipped"
+        );
+        assert!(
+            shared
+                .database
+                .list_chats(10)
+                .unwrap()
+                .iter()
+                .any(|chat| chat.jid == "31612345678@s.whatsapp.net")
+        );
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chats")
+            .unwrap();
+        fake.clear_calls();
+        reconcile_direct_chat_aliases(&shared, client.as_ref()).await;
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_creators_use_the_addressing_mode_of_their_conversation() {
+        let group: Jid = "123-456@g.us".parse().unwrap();
+        let direct: Jid = "31600000000@s.whatsapp.net".parse().unwrap();
+        let lid_group = whatsapp_rust::GroupMetadata {
+            addressing_mode: AddressingMode::Lid,
+            ..whatsapp_rust::GroupMetadata::default()
+        };
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_pn("31600000000:2@s.whatsapp.net")
+                .with_lid("100000000000000:2@lid")
+                .with_group_metadata("123-456@g.us", lid_group),
+        );
+        let client = transport(&fake);
+
+        assert_eq!(
+            own_poll_creator_jid(client.as_ref(), &group).await.unwrap(),
+            "100000000000000@lid".parse::<Jid>().unwrap()
+        );
+        assert_eq!(
+            own_poll_creator_jid(client.as_ref(), &direct)
+                .await
+                .unwrap(),
+            "31600000000@s.whatsapp.net".parse::<Jid>().unwrap()
+        );
+
+        // A group whose metadata cannot be read falls back to the phone number.
+        let unknown_group: Jid = "999-999@g.us".parse().unwrap();
+        assert_eq!(
+            own_poll_creator_jid(client.as_ref(), &unknown_group)
+                .await
+                .unwrap(),
+            "31600000000@s.whatsapp.net".parse::<Jid>().unwrap()
+        );
+
+        let unpaired = Arc::new(FakeTransport::new().with_group_metadata(
+            "123-456@g.us",
+            whatsapp_rust::GroupMetadata {
+                addressing_mode: AddressingMode::Lid,
+                ..whatsapp_rust::GroupMetadata::default()
+            },
+        ));
+        let unpaired_client = transport(&unpaired);
+        assert_eq!(
+            own_poll_creator_jid(unpaired_client.as_ref(), &group)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "own LID is unavailable for this group poll"
+        );
+        assert_eq!(
+            own_poll_creator_jid(unpaired_client.as_ref(), &direct)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "own WhatsApp JID is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn listed_chats_backfill_phone_numbers_and_remember_the_misses() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let mapped = "100000012345678@lid";
+        let unmapped = "100000087654321@lid";
+        let failing = "100000011111111@lid";
+        seed_chat(&shared, "31600000000@s.whatsapp.net", "Ada", false);
+        seed_chat(&shared, "123-456@g.us", "Garden", true);
+        seed_chat(&shared, "status@broadcast", "Status", false);
+        shared
+            .database
+            .execute_test_sql("INSERT INTO chats (jid, name) VALUES ('broken', 'x')")
+            .unwrap();
+        seed_chat(&shared, mapped, "Bob", false);
+        seed_chat(&shared, unmapped, "Carol", false);
+        seed_chat(&shared, failing, "Dan", false);
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_lid_pn_entry(mapped, Some(mapping("100000012345678", "31612345678")))
+                .with_lid_pn_entry(unmapped, None),
+        );
+
+        // Without a client the LID chats cannot be resolved at all.
+        let chats = list_chats_with_phone_numbers(&shared, 10).await.unwrap();
+        assert!(
+            chats
+                .iter()
+                .filter(|chat| chat.jid.ends_with("@lid"))
+                .all(|chat| chat.phone_number.is_none())
+        );
+        assert!(fake.calls().is_empty());
+
+        *shared.client.write().await = Some(transport(&fake));
+        fake.fail(CallKind::LidPnEntry, "offline");
+        let chats = list_chats_with_phone_numbers(&shared, 10).await.unwrap();
+        let phone_number = |jid: &str| {
+            chats
+                .iter()
+                .find(|chat| chat.jid == jid)
+                .and_then(|chat| chat.phone_number.clone())
+        };
+        assert_eq!(
+            phone_number("31600000000@s.whatsapp.net").as_deref(),
+            Some("31600000000")
+        );
+        assert_eq!(phone_number("123-456@g.us"), None);
+        assert_eq!(phone_number("status@broadcast"), None);
+        assert_eq!(phone_number(mapped), None);
+
+        fake.succeed(CallKind::LidPnEntry);
+        let chats = list_chats_with_phone_numbers(&shared, 10).await.unwrap();
+        assert_eq!(
+            chats
+                .iter()
+                .find(|chat| chat.jid == mapped)
+                .and_then(|chat| chat.phone_number.clone())
+                .as_deref(),
+            Some("31612345678")
+        );
+        assert!(shared.phone_number_is_missing(unmapped));
+
+        // The cached number and the cached misses stop every SDK lookup.
+        fake.clear_calls();
+        list_chats_with_phone_numbers(&shared, 10).await.unwrap();
+        assert!(fake.calls().is_empty());
+
+        // A read-only database still reports the resolved number to the shell.
+        seed_chat(&shared, "31600000005@s.whatsapp.net", "Eve", false);
+        shared
+            .database
+            .execute_test_sql("PRAGMA query_only = ON")
+            .unwrap();
+        let chats = list_chats_with_phone_numbers(&shared, 10).await.unwrap();
+        assert_eq!(
+            chats
+                .iter()
+                .find(|chat| chat.jid == "31600000005@s.whatsapp.net")
+                .and_then(|chat| chat.phone_number.clone())
+                .as_deref(),
+            Some("31600000005")
+        );
+        shared
+            .database
+            .execute_test_sql("PRAGMA query_only = OFF")
+            .unwrap();
+        assert!(shared.phone_number_is_missing(failing));
+    }
+
+    #[tokio::test]
+    async fn group_participants_are_canonical_deduplicated_named_and_sorted() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let own_pn = "31600000000@s.whatsapp.net";
+        let named = "31600000001@s.whatsapp.net";
+        let chat_named = "31600000002@s.whatsapp.net";
+        let profile_named = "31600000003@s.whatsapp.net";
+        let unnamed = "31600000004@s.whatsapp.net";
+        shared
+            .database
+            .update_address_book_name(named, "Bob")
+            .unwrap();
+        seed_chat(&shared, chat_named, "Carol", false);
+        shared
+            .database
+            .execute_test_sql(
+                "UPDATE chats SET name = 'Carol', name_source = 20 WHERE jid = '31600000002@s.whatsapp.net'",
+            )
+            .unwrap();
+        // A stored name equal to the JID is a placeholder, not a real name.
+        shared
+            .database
+            .update_address_book_name(profile_named, profile_named)
+            .unwrap();
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_pn("31600000000:2@s.whatsapp.net")
+                .with_lid("100000000000000@lid"),
+        );
+        let client = transport(&fake);
+
+        let identity = |participant| group_participant_identity(participant);
+        let identities = vec![
+            identity(participant(unnamed, None, None)),
+            identity(participant(named, None, Some("100000000000001@lid"))),
+            identity(with_profile_name(
+                participant(profile_named, None, None),
+                "Dave",
+            )),
+            identity(participant(chat_named, None, None)),
+            identity(participant("100000000000000@lid", Some(own_pn), None)),
+            identity(participant(named, None, None)),
+        ];
+
+        let participants = resolve_group_participants(&shared, client.as_ref(), identities).await;
+
+        assert_eq!(
+            participants
+                .iter()
+                .map(|participant| (
+                    participant.jid.as_str(),
+                    participant.name.as_str(),
+                    participant.is_me
+                ))
+                .collect::<Vec<_>>(),
+            // Own identity first, then by display name; unnamed participants
+            // sort ahead of named ones and are ordered by JID.
+            vec![
+                (own_pn, "", true),
+                (unnamed, "", false),
+                (named, "Bob", false),
+                (chat_named, "Carol", false),
+                (profile_named, "Dave", false),
+            ]
+        );
+        assert_eq!(
+            participants[2].aliases,
+            vec!["100000000000001@lid".to_owned()]
+        );
+        assert_eq!(participants[0].aliases, vec!["100000000000000@lid"]);
+    }
+
+    #[test]
+    fn participant_identities_collapse_every_addressable_alias() {
+        let identity = group_participant_identity(with_profile_name(
+            GroupParticipant {
+                jid: "100000000000001:5@lid".parse().unwrap(),
+                phone_number: Some("31600000001:5@s.whatsapp.net".parse().unwrap()),
+                lid: Some("100000000000001@lid".parse().unwrap()),
+                username: None,
+                participant_type: ParticipantType::Member,
+                details: None,
+            },
+            "   ",
+        ));
+
+        assert_eq!(identity.jid.to_string(), "31600000001:5@s.whatsapp.net");
+        assert_eq!(
+            identity.aliases,
+            vec![
+                "100000000000001@lid".to_owned(),
+                "31600000001@s.whatsapp.net".to_owned(),
+            ]
+        );
+        assert_eq!(identity.profile_name, None);
+    }
 
     #[test]
     fn contact_ingestion_prefers_names_and_normalizes_all_identities() {

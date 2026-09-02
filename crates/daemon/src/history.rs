@@ -49,7 +49,6 @@ pub(crate) enum PendingMedia {
 }
 
 impl Shared {
-    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn ingest_history(
         &self,
         lazy: &whatsapp_rust::types::events::LazyHistorySync,
@@ -265,11 +264,9 @@ impl Shared {
                 }
             }
         }
-        if stream.skipped_conversations() > 0 {
-            warn!(
-                skipped = stream.skipped_conversations(),
-                "history sync contained undecodable conversations"
-            );
+        let skipped = stream.skipped_conversations();
+        if skipped > 0 {
+            warn!(skipped, "history sync contained undecodable conversations");
         }
         let remainder = stream.remainder()?;
         for push_name in remainder.pushnames {
@@ -302,7 +299,6 @@ fn collect_history_lid_jid(jids: &mut HashSet<String>, value: Option<&str>) {
 // Lazy history parsing is synchronous and deliberately bounded-memory. Scan
 // the compressed payload once for identity dependencies so their async SDK
 // lookups finish before a second bounded pass writes any conversation state.
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) fn history_lid_jids(
     lazy: &whatsapp_rust::types::events::LazyHistorySync,
 ) -> Result<HashSet<String>> {
@@ -331,7 +327,6 @@ pub(crate) fn history_lid_jids(
     Ok(jids)
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn download_pending_media(
     shared: Arc<Shared>,
     transport: Arc<dyn Transport>,
@@ -581,9 +576,633 @@ fn history_message(
 mod tests {
     use super::*;
     use crate::test_support::test_shared;
+    use crate::transport::fake::{Call, CallKind, FakeTransport, MediaKind, transport};
     use buffa::MessageField;
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
+
+    /// A `conversations` field (2) whose payload claims five bytes and carries
+    /// one, so the lenient stream skips and counts it.
+    const CORRUPT_CONVERSATION: &[u8] = &[0x12, 0x03, 0x0A, 0x05, b'x'];
+
+    fn compress(history: &wa::HistorySync, tail: &[u8]) -> Vec<u8> {
+        let mut raw = history.encode_to_vec();
+        raw.extend_from_slice(tail);
+        raw
+    }
+
+    fn lazy(raw: &[u8]) -> whatsapp_rust::types::events::LazyHistorySync {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(raw).unwrap();
+        whatsapp_rust::types::events::LazyHistorySync::new(
+            encoder.finish().unwrap().into(),
+            raw.len(),
+            wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP as i32,
+            None,
+            Some(100),
+        )
+    }
+
+    fn history_message_entry(
+        id: &str,
+        participant: Option<&str>,
+        body: wa::Message,
+        timestamp: u64,
+    ) -> wa::HistorySyncMsg {
+        wa::HistorySyncMsg {
+            message: MessageField::some(wa::WebMessageInfo {
+                key: MessageField::some(wa::MessageKey {
+                    remote_jid: Some("123-456@g.us".into()),
+                    from_me: Some(false),
+                    id: Some(id.into()),
+                    participant: participant.map(str::to_owned),
+                }),
+                message: MessageField::some(body),
+                message_timestamp: Some(timestamp),
+                push_name: Some("Bob".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn media_body(media: wa::Message) -> wa::Message {
+        media
+    }
+
+    fn poll_options(names: &[&str]) -> Vec<wa::message::poll_creation_message::Option> {
+        names
+            .iter()
+            .map(|name| wa::message::poll_creation_message::Option {
+                option_name: Some((*name).into()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn option_hash(name: &str) -> Vec<u8> {
+        whatsapp_rust::wacore::poll::compute_option_hash(name).to_vec()
+    }
+
+    fn poll_update(
+        from_me: bool,
+        participant: Option<&str>,
+        selected: &[&str],
+        sender_timestamp_ms: Option<i64>,
+        server_timestamp_ms: Option<i64>,
+    ) -> wa::PollUpdate {
+        wa::PollUpdate {
+            poll_update_message_key: MessageField::some(wa::MessageKey {
+                remote_jid: Some("123-456@g.us".into()),
+                from_me: Some(from_me),
+                id: Some("VOTE".into()),
+                participant: participant.map(str::to_owned),
+            }),
+            vote: MessageField::some(wa::message::PollVoteMessage {
+                selected_options: selected.iter().copied().map(option_hash).collect(),
+            }),
+            sender_timestamp_ms,
+            server_timestamp_ms,
+            ..Default::default()
+        }
+    }
+
+    fn synthetic_history() -> wa::HistorySync {
+        let participant_lid = "100000000000002@lid";
+        let group_poll = history_message_entry(
+            "MSG-POLL",
+            Some(participant_lid),
+            wa::Message {
+                poll_creation_message_v3: MessageField::some(wa::message::PollCreationMessage {
+                    name: Some("Lunch?".into()),
+                    options: poll_options(&["Soup", "Salad"]),
+                    selectable_options_count: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            1_700_000_400,
+        );
+        let group_poll = wa::HistorySyncMsg {
+            message: MessageField::some(wa::WebMessageInfo {
+                message_secret: Some(vec![7u8; 32]),
+                poll_updates: vec![
+                    // The device's own vote, timed by the sender clock.
+                    poll_update(true, None, &["Soup"], Some(1_700_000_450_000), None),
+                    // A participant's vote, timed by the server clock only.
+                    poll_update(
+                        false,
+                        Some(participant_lid),
+                        &["Salad"],
+                        None,
+                        Some(1_700_000_460_000),
+                    ),
+                    // A hash the poll never offered.
+                    wa::PollUpdate {
+                        vote: MessageField::some(wa::message::PollVoteMessage {
+                            selected_options: vec![vec![0u8; 32]],
+                        }),
+                        ..poll_update(false, Some(participant_lid), &[], None, None)
+                    },
+                    // A group vote WhatsApp did not attribute to anyone.
+                    poll_update(false, None, &["Soup"], None, None),
+                    // A vote selecting more options than the poll allows.
+                    poll_update(
+                        false,
+                        Some("31600000003@s.whatsapp.net"),
+                        &["Soup", "Salad"],
+                        Some(1_700_000_470_000),
+                        None,
+                    ),
+                    // A vote whose envelope carries neither key nor ballot.
+                    wa::PollUpdate::default(),
+                ],
+                ..group_poll.message.unwrap()
+            }),
+            ..group_poll
+        };
+
+        wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            pushnames: vec![
+                wa::Pushname {
+                    id: Some("31600000005:2@s.whatsapp.net".into()),
+                    pushname: Some("Eve".into()),
+                },
+                wa::Pushname::default(),
+            ],
+            conversations: vec![
+                wa::Conversation {
+                    id: "status@broadcast".into(),
+                    ..Default::default()
+                },
+                wa::Conversation {
+                    id: "1@newsletter".into(),
+                    ..Default::default()
+                },
+                wa::Conversation {
+                    id: "123-456@g.us".into(),
+                    display_name: Some("Garden".into()),
+                    last_msg_timestamp: Some(1_700_000_500),
+                    messages: vec![
+                        history_message_entry(
+                            "MSG-TEXT",
+                            Some(participant_lid),
+                            wa::Message::text("hello"),
+                            1_700_000_100,
+                        ),
+                        history_message_entry(
+                            "REACT-1",
+                            Some(participant_lid),
+                            wa::Message {
+                                reaction_message: MessageField::some(
+                                    wa::message::ReactionMessage {
+                                        key: MessageField::some(wa::MessageKey {
+                                            id: Some("MSG-TEXT".into()),
+                                            ..Default::default()
+                                        }),
+                                        text: Some("👍".into()),
+                                        sender_timestamp_ms: Some(1_700_000_200_000),
+                                        ..Default::default()
+                                    },
+                                ),
+                                ..Default::default()
+                            },
+                            1_700_000_200,
+                        ),
+                        history_message_entry(
+                            "MSG-IMG",
+                            Some(participant_lid),
+                            media_body(wa::Message {
+                                image_message: MessageField::some(wa::message::ImageMessage {
+                                    file_length: Some(16),
+                                    mimetype: Some("image/jpeg".into()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            1_700_000_210,
+                        ),
+                        history_message_entry(
+                            "MSG-STK",
+                            Some(participant_lid),
+                            media_body(wa::Message {
+                                lottie_sticker_message: MessageField::some(
+                                    wa::message::FutureProofMessage {
+                                        message: MessageField::some(wa::Message {
+                                            sticker_message: MessageField::some(
+                                                wa::message::StickerMessage {
+                                                    file_length: Some(8),
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                            ..Default::default()
+                                        }),
+                                    },
+                                ),
+                                ..Default::default()
+                            }),
+                            1_700_000_220,
+                        ),
+                        history_message_entry(
+                            "MSG-VID",
+                            Some(participant_lid),
+                            media_body(wa::Message {
+                                video_message: MessageField::some(wa::message::VideoMessage {
+                                    file_length: Some(32),
+                                    mimetype: Some("video/mp4".into()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            1_700_000_230,
+                        ),
+                        history_message_entry(
+                            "MSG-AUD",
+                            Some(participant_lid),
+                            media_body(wa::Message {
+                                audio_message: MessageField::some(wa::message::AudioMessage {
+                                    file_length: Some(12),
+                                    ptt: Some(true),
+                                    mimetype: Some("audio/ogg".into()),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            1_700_000_240,
+                        ),
+                        history_message_entry(
+                            "MSG-DOC",
+                            Some(participant_lid),
+                            media_body(wa::Message {
+                                document_message: MessageField::some(
+                                    wa::message::DocumentMessage {
+                                        file_length: Some(9),
+                                        file_name: Some("report.pdf".into()),
+                                        ..Default::default()
+                                    },
+                                ),
+                                ..Default::default()
+                            }),
+                            1_700_000_250,
+                        ),
+                        group_poll,
+                        // A history entry without a decodable body is dropped.
+                        wa::HistorySyncMsg::default(),
+                        // An envelope WhatsApp sent without a key.
+                        wa::HistorySyncMsg {
+                            message: MessageField::some(wa::WebMessageInfo {
+                                message: MessageField::some(wa::Message::text("keyless")),
+                                message_timestamp: Some(1_700_000_260),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        // An envelope whose key carries no message ID.
+                        wa::HistorySyncMsg {
+                            message: MessageField::some(wa::WebMessageInfo {
+                                key: MessageField::some(wa::MessageKey {
+                                    remote_jid: Some("123-456@g.us".into()),
+                                    from_me: Some(false),
+                                    id: None,
+                                    participant: None,
+                                }),
+                                message: MessageField::some(wa::Message::text("anonymous")),
+                                message_timestamp: Some(1_700_000_270),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                wa::Conversation {
+                    id: "100000012345678@lid".into(),
+                    name: Some("Ada".into()),
+                    unread_count: Some(1),
+                    messages: vec![wa::HistorySyncMsg {
+                        message: MessageField::some(wa::WebMessageInfo {
+                            key: MessageField::some(wa::MessageKey {
+                                remote_jid: Some("100000012345678@lid".into()),
+                                from_me: Some(false),
+                                id: Some("MSG-DIRECT-POLL".into()),
+                                participant: None,
+                            }),
+                            message: MessageField::some(wa::Message {
+                                poll_creation_message_v3: MessageField::some(
+                                    wa::message::PollCreationMessage {
+                                        name: Some("Tea?".into()),
+                                        options: poll_options(&["Yes", "No"]),
+                                        selectable_options_count: Some(1),
+                                        ..Default::default()
+                                    },
+                                ),
+                                ..Default::default()
+                            }),
+                            // A secret WhatsApp truncated: the daemon logs and
+                            // keeps the poll rather than aborting the chunk.
+                            message_secret: Some(vec![1, 2, 3]),
+                            message_timestamp: Some(1_700_000_600),
+                            poll_updates: vec![wa::PollUpdate {
+                                poll_update_message_key: MessageField::some(wa::MessageKey {
+                                    remote_jid: Some("100000012345678@lid".into()),
+                                    from_me: Some(false),
+                                    id: Some("VOTE".into()),
+                                    participant: None,
+                                }),
+                                vote: MessageField::some(wa::message::PollVoteMessage {
+                                    selected_options: vec![option_hash("Yes")],
+                                }),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                // Named only by the address book, and with no messages at all.
+                wa::Conversation {
+                    id: "31600000010@s.whatsapp.net".into(),
+                    ..Default::default()
+                },
+                // A blank name is not a name, and no address-book entry exists.
+                wa::Conversation {
+                    id: "31600000011@s.whatsapp.net".into(),
+                    name: Some("   ".into()),
+                    conversation_timestamp: Some(1_700_000_700),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn aliases() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "100000000000002@lid".to_owned(),
+                "31600000002@s.whatsapp.net".to_owned(),
+            ),
+            (
+                "100000012345678@lid".to_owned(),
+                "31612345678@s.whatsapp.net".to_owned(),
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_history_chunk_absorbs_media_reactions_polls_and_push_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        assets::private_dir(&shared.media_dir).unwrap();
+        shared
+            .database
+            .update_address_book_name("31600000010@s.whatsapp.net", "Frank")
+            .unwrap();
+        let raw = compress(&synthetic_history(), CORRUPT_CONVERSATION);
+        let lazy = lazy(&raw);
+
+        assert_eq!(
+            history_lid_jids(&lazy).unwrap(),
+            HashSet::from([
+                "100000000000002@lid".to_owned(),
+                "100000012345678@lid".to_owned(),
+            ])
+        );
+
+        let (pending, changed) = shared
+            .ingest_history(&lazy, Some("31600000000@s.whatsapp.net"), &aliases())
+            .unwrap();
+
+        // Broadcast and newsletter conversations never become chats.
+        let mut chats = shared
+            .database
+            .list_chats(20)
+            .unwrap()
+            .into_iter()
+            .map(|chat| (chat.jid, chat.name, chat.last_timestamp))
+            .collect::<Vec<_>>();
+        chats.sort();
+        assert_eq!(
+            chats,
+            vec![
+                (
+                    "123-456@g.us".to_owned(),
+                    "Garden".to_owned(),
+                    1_700_000_500
+                ),
+                (
+                    "31600000010@s.whatsapp.net".to_owned(),
+                    "Frank".to_owned(),
+                    0
+                ),
+                (
+                    "31600000011@s.whatsapp.net".to_owned(),
+                    String::new(),
+                    1_700_000_700
+                ),
+                (
+                    "31612345678@s.whatsapp.net".to_owned(),
+                    "Ada".to_owned(),
+                    1_700_000_600
+                ),
+            ]
+        );
+        assert_eq!(
+            changed,
+            HashSet::from([
+                "123-456@g.us".to_owned(),
+                "31612345678@s.whatsapp.net".to_owned(),
+            ])
+        );
+
+        let group = shared.database.messages("123-456@g.us", 20).unwrap();
+        assert_eq!(
+            group
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "MSG-TEXT", "MSG-IMG", "MSG-STK", "MSG-VID", "MSG-AUD", "MSG-DOC", "MSG-POLL",
+            ]
+        );
+        let text = &group[0];
+        assert_eq!(text.sender_jid, "31600000002@s.whatsapp.net");
+        assert_eq!(text.sender_name, "Bob");
+        assert_eq!(
+            text.reactions
+                .iter()
+                .map(|reaction| reaction.emoji.as_str())
+                .collect::<Vec<_>>(),
+            vec!["👍"]
+        );
+
+        // Only the votes WhatsApp attributed to a real option are tallied.
+        let poll = shared
+            .database
+            .message_by_id("123-456@g.us", "MSG-POLL")
+            .unwrap()
+            .unwrap();
+        let Some(MessageMedia::Poll {
+            options,
+            total_voters,
+            ..
+        }) = poll.media
+        else {
+            panic!("expected poll media");
+        };
+        assert_eq!(total_voters, 2);
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| (option.name.as_str(), option.votes))
+                .collect::<Vec<_>>(),
+            vec![("Soup", 1), ("Salad", 1)]
+        );
+        assert!(options[0].selected_by_me);
+        assert_eq!(
+            options[1].voter_jids,
+            vec!["31600000002@s.whatsapp.net".to_owned()]
+        );
+        assert_eq!(
+            shared
+                .database
+                .contact_name("31600000005@s.whatsapp.net")
+                .unwrap()
+                .as_deref(),
+            Some("Eve")
+        );
+
+        assert_eq!(pending.len(), 5);
+        let kinds = pending
+            .iter()
+            .map(|media| match media {
+                PendingMedia::Image { .. } => "image",
+                PendingMedia::Sticker { .. } => "sticker",
+                PendingMedia::Video { .. } => "video",
+                PendingMedia::Audio { .. } => "audio",
+                PendingMedia::Document { .. } => "document",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec!["image", "sticker", "video", "audio", "document"]
+        );
+        assert!(matches!(
+            &pending[1],
+            PendingMedia::Sticker { sticker, .. } if sticker.is_lottie == Some(true)
+        ));
+
+        // Replaying the same chunk changes nothing, which keeps the shell from
+        // reloading a chat that did not move.
+        let (_, replayed) = shared
+            .ingest_history(&lazy, Some("31600000000@s.whatsapp.net"), &aliases())
+            .unwrap();
+        assert!(replayed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_history_media_is_cached_and_failures_are_survivable() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        assets::private_dir(&shared.media_dir).unwrap();
+        let raw = compress(&synthetic_history(), CORRUPT_CONVERSATION);
+        let (pending, _) = shared
+            .ingest_history(&lazy(&raw), None, &aliases())
+            .unwrap();
+        let connection = shared.open_connection();
+        shared
+            .set_connection_active_chat(connection, Some("123-456@g.us".into()))
+            .unwrap();
+        let fake = Arc::new(FakeTransport::new().with_download_bytes(b"synthetic document"));
+        let mut events = shared.events.subscribe();
+
+        download_pending_media(Arc::clone(&shared), transport(&fake), pending).await;
+
+        for message_id in ["MSG-IMG", "MSG-STK", "MSG-VID", "MSG-AUD"] {
+            assert!(
+                shared
+                    .database
+                    .media_download("123-456@g.us", message_id)
+                    .unwrap()
+                    .is_some(),
+                "{message_id} keeps its encrypted payload for a later download"
+            );
+        }
+        assert_eq!(
+            fake.calls_of(CallKind::Download),
+            vec![Call::Download(MediaKind::Document)]
+        );
+        assert!(
+            assets::message_document_path(
+                &shared.media_dir,
+                "123-456@g.us",
+                "MSG-DOC",
+                "report.pdf"
+            )
+            .exists()
+        );
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(|frame| matches!(
+                frame.event,
+                omarchy_whatsapp_protocol::ServerEvent::Invalidated {
+                    resource: omarchy_whatsapp_protocol::Resource::Messages,
+                    ..
+                }
+            ))
+        );
+
+        // A document WhatsApp never sized cannot be cached; the pass logs it.
+        fake.clear_calls();
+        download_pending_media(
+            Arc::clone(&shared),
+            transport(&fake),
+            vec![PendingMedia::Document {
+                document: wa::message::DocumentMessage::default(),
+                path: shared.media_dir.join("unsized.document"),
+            }],
+        )
+        .await;
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_ingest_reports_storage_failures_to_its_caller() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(test_shared(&directory));
+        let raw = compress(&synthetic_history(), CORRUPT_CONVERSATION);
+        shared
+            .database
+            .execute_test_sql(
+                "CREATE TRIGGER block_reactions BEFORE INSERT ON reactions
+                 BEGIN SELECT RAISE(ABORT, 'reactions are blocked'); END;
+                 CREATE TRIGGER block_poll_votes BEFORE INSERT ON poll_votes
+                 BEGIN SELECT RAISE(ABORT, 'poll votes are blocked'); END;
+                 CREATE TRIGGER block_poll_secrets BEFORE INSERT ON poll_secrets
+                 BEGIN SELECT RAISE(ABORT, 'poll secrets are blocked'); END;",
+            )
+            .unwrap();
+
+        // Each per-row failure is logged and the chunk still lands.
+        shared
+            .ingest_history(&lazy(&raw), None, &aliases())
+            .unwrap();
+        assert_eq!(
+            shared.database.messages("123-456@g.us", 20).unwrap().len(),
+            7
+        );
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chats")
+            .unwrap();
+        assert!(
+            shared
+                .ingest_history(&lazy(&raw), None, &aliases())
+                .is_err()
+        );
+    }
 
     #[test]
     fn history_reaction_targets_parent_without_becoming_a_message() {
