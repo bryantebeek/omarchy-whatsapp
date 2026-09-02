@@ -428,6 +428,10 @@ fn cache_media_thumbnail(
         && let Some(thumbnail) = thumbnail
     {
         write_private_bytes(thumbnail_path, thumbnail)?;
+    } else {
+        // Nothing reached the disk, so a full cache scan would only add
+        // thousands of stats per media message during history import.
+        return Ok(());
     }
     prune_media_cache(directory, thumbnail_path);
     Ok(())
@@ -483,19 +487,30 @@ pub fn cache_message_sticker_thumbnail(
         && let Some(thumbnail) = thumbnail.filter(|bytes| bytes.starts_with(b"\x89PNG\r\n\x1a\n"))
     {
         write_private_bytes(&thumbnail_path, thumbnail)?;
+        prune_media_cache(directory, &thumbnail_path);
     }
-    prune_media_cache(directory, &thumbnail_path);
     Ok(thumbnail_path)
 }
 
+// The shell hands a cached document to xdg-open, which picks its handler from
+// the file name. A sender-controlled extension could therefore make the desktop
+// launch the payload instead of displaying it, so these names are dropped and
+// the cache entry is stored without any extension.
+const EXECUTABLE_DOCUMENT_EXTENSIONS: &[&str] = &[
+    "appimage", "bash", "bat", "bin", "cmd", "com", "csh", "desktop", "dll", "elf", "exe", "fish",
+    "jar", "js", "jse", "ksh", "msi", "pif", "ps1", "psm1", "py", "run", "scf", "scr", "sh", "so",
+    "vbe", "vbs", "wsf", "wsh", "zsh",
+];
+
 fn safe_document_extension(file_name: &str) -> Option<String> {
     let extension = Path::new(file_name).extension()?.to_str()?;
-    (!extension.is_empty()
+    let extension = (!extension.is_empty()
         && extension.len() <= 12
         && extension
             .chars()
             .all(|character| character.is_ascii_alphanumeric()))
-    .then(|| extension.to_ascii_lowercase())
+    .then(|| extension.to_ascii_lowercase())?;
+    (!EXECUTABLE_DOCUMENT_EXTENSIONS.contains(&extension.as_str())).then_some(extension)
 }
 
 pub fn message_document_path(
@@ -665,6 +680,12 @@ pub fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     temporary.commit(file, path)
 }
 
+/// Enforces a byte budget by deleting the oldest entries, keeping `preserve`.
+///
+/// This reads the whole directory and stats every entry, so it must only be
+/// called after a file was actually written, renamed, or removed. Calling it on
+/// an unchanged cache costs thousands of stats per media message during history
+/// import without ever freeing a byte.
 fn prune_directory(directory: &Path, max_bytes: u64, preserve: &Path) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -698,6 +719,8 @@ fn prune_directory(directory: &Path, max_bytes: u64, preserve: &Path) {
     }
 }
 
+/// Bounds the media cache after a write. Like [`prune_directory`], it scans the
+/// entire directory, so callers must invoke it only when they changed a file.
 pub fn prune_media_cache(directory: &Path, preserve: &Path) {
     prune_directory(directory, MAX_MEDIA_CACHE_BYTES, preserve);
 }
@@ -1014,6 +1037,92 @@ mod tests {
             audio.file_name().unwrap(),
             "31323340672e7573-6e6f7465.audio.ogg"
         );
+    }
+
+    #[test]
+    fn document_extensions_a_launcher_could_execute_are_dropped() {
+        for name in [
+            "invite.desktop",
+            "setup.AppImage",
+            "installer.run",
+            "hook.sh",
+            "hook.bash",
+            "hook.ZSH",
+            "payload.bin",
+            "setup.exe",
+            "setup.msi",
+            "job.bat",
+            "job.cmd",
+            "job.com",
+            "saver.scr",
+            "macro.VBS",
+            "task.ps1",
+            "app.jar",
+            "preload.so",
+            "core.elf",
+        ] {
+            assert_eq!(
+                safe_document_extension(name),
+                None,
+                "{name} must be dropped"
+            );
+        }
+        for (name, extension) in [
+            ("quote.PDF", "pdf"),
+            ("sheet.xlsx", "xlsx"),
+            ("scan.jpeg", "jpeg"),
+            ("notes.txt", "txt"),
+        ] {
+            assert_eq!(
+                safe_document_extension(name).as_deref(),
+                Some(extension),
+                "{name} must keep its extension"
+            );
+        }
+        assert_eq!(
+            message_document_path(
+                Path::new("/tmp/cache"),
+                "123@g.us",
+                "message",
+                "statement.Desktop"
+            )
+            .file_name()
+            .unwrap(),
+            "31323340672e7573-6d657373616765.document"
+        );
+    }
+
+    #[test]
+    fn thumbnail_caching_prunes_only_after_a_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path();
+        // Sparse files push the cache over its cap without writing real bytes.
+        let older = media.join("older.img");
+        let newer = media.join("newer.img");
+        File::create(&older)
+            .unwrap()
+            .set_len(MAX_MEDIA_CACHE_BYTES)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        File::create(&newer)
+            .unwrap()
+            .set_len(MAX_MEDIA_CACHE_BYTES)
+            .unwrap();
+
+        let unwritten =
+            cache_message_image_thumbnail(media, "chat", "no-preview", None, None).unwrap();
+        assert!(!unwritten.exists());
+        let skipped = cache_message_sticker_thumbnail(media, "chat", "no-preview", None).unwrap();
+        assert!(!skipped.exists());
+        assert!(older.exists());
+        assert!(newer.exists());
+
+        let png = b"\x89PNG\r\n\x1a\npreview".to_vec();
+        let written =
+            cache_message_sticker_thumbnail(media, "chat", "preview", Some(&png)).unwrap();
+        assert_eq!(std::fs::read(&written).unwrap(), png);
+        assert!(!older.exists());
+        assert!(!newer.exists());
     }
 
     #[test]
