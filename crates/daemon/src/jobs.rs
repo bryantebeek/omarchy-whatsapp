@@ -21,6 +21,16 @@ pub const MAX_PENDING_AVATAR_FETCHES: usize = 256;
 pub const MEDIA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 pub const AVATAR_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Invalidations are published per event: a group receipt burst or a batch of
+// incoming messages would otherwise make every client reload the same snapshot
+// once per event. The leading publish stays immediate and the rest of the
+// window folds into one trailing publish.
+pub const INVALIDATION_WINDOW: Duration = Duration::from_millis(50);
+// A bounded avatar sync writes up to a thousand files a few at a time. Folding
+// that burst into one directory scan keeps a single `avatars` broadcast from
+// becoming a thousand frames carrying the full jid list.
+pub const AVATAR_FLUSH_WINDOW: Duration = Duration::from_millis(100);
+
 #[must_use]
 pub fn timeout(command: &Command) -> Duration {
     match command {

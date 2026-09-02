@@ -31,3 +31,6 @@ whatsapp-rust.workspace = true
 [dev-dependencies]
 flate2.workspace = true
 tempfile.workspace = true
+# Coalescing windows are asserted on a paused clock, so the tests never sleep
+# for real time. The feature stays out of the release build.
+tokio = { workspace = true, features = ["test-util"] }

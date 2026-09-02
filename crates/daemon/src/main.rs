@@ -28,7 +28,7 @@ use std::future::Future;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, LazyLock, Mutex as StdMutex, Weak,
+    Arc, Mutex as StdMutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::io::AsyncWriteExt;
@@ -45,9 +45,304 @@ use whatsapp_rust::{PresencePolicy, SendOptions, UploadOptions, media};
 
 const CHAT_LIST_LIMIT: u32 = 500;
 const AVATAR_SYNC_LIMIT: u32 = 1_000;
-static AVATAR_FINGERPRINTS: LazyLock<
-    StdMutex<HashMap<PathBuf, std::collections::BTreeMap<String, assets::AvatarFingerprint>>>,
-> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+// WhatsApp replays app-state in bursts. The waiter treats the replay as
+// settled once no mutation arrived for the quiet period, and gives up after
+// the deadline so a stalled replay cannot arm the resync report forever.
+const APP_STATE_QUIET_MS: u64 = 2_000;
+const APP_STATE_QUIET_PERIOD: std::time::Duration =
+    std::time::Duration::from_millis(APP_STATE_QUIET_MS);
+const APP_STATE_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Coalescing state for the avatar directory. A bounded sync writes up to
+/// `AVATAR_SYNC_LIMIT` files, so scanning and publishing the complete jid list
+/// per file would push slow IPC clients into a lagged resync. Folding a burst
+/// into one scan keeps the wire shape while emitting a single event.
+#[derive(Default)]
+struct AvatarCoalescer {
+    fingerprints: std::collections::BTreeMap<String, assets::AvatarFingerprint>,
+    changed_jids: std::collections::BTreeSet<String>,
+    seeded: bool,
+    flush_scheduled: bool,
+}
+
+impl AvatarCoalescer {
+    /// Marks the directory dirty and reports whether this caller owns the
+    /// single pending flush.
+    fn mark_dirty(&mut self) -> bool {
+        !std::mem::replace(&mut self.flush_scheduled, true)
+    }
+
+    /// Folds one directory scan into the pending change set and returns every
+    /// jid that changed since the previous flush.
+    fn flush(
+        &mut self,
+        current: std::collections::BTreeMap<String, assets::AvatarFingerprint>,
+    ) -> Vec<String> {
+        self.flush_scheduled = false;
+        for jid in current.keys().chain(self.fingerprints.keys()) {
+            if current.get(jid) != self.fingerprints.get(jid) {
+                self.changed_jids.insert(jid.clone());
+            }
+        }
+        self.fingerprints = current;
+        self.seeded = true;
+        std::mem::take(&mut self.changed_jids).into_iter().collect()
+    }
+
+    /// Adopts the first scan served to a client as the baseline. Later
+    /// snapshots keep the previous baseline so a pending flush still announces
+    /// the files it has not published yet.
+    fn seed(&mut self, current: std::collections::BTreeMap<String, assets::AvatarFingerprint>) {
+        if !self.seeded {
+            self.fingerprints = current;
+            self.seeded = true;
+        }
+    }
+}
+
+/// Owns the avatar revision counter and the coalesced `avatars` broadcast. It
+/// is held behind an `Arc` so a delayed flush needs the publishing state only,
+/// not the whole daemon.
+struct AvatarBroadcaster {
+    events: broadcast::Sender<ServerFrame>,
+    clock: Arc<revisions::RevisionClock>,
+    revision: AtomicU64,
+    state: StdMutex<AvatarCoalescer>,
+}
+
+impl AvatarBroadcaster {
+    fn new(events: broadcast::Sender<ServerFrame>, clock: Arc<revisions::RevisionClock>) -> Self {
+        Self {
+            events,
+            clock,
+            revision: AtomicU64::new(0),
+            state: StdMutex::new(AvatarCoalescer::default()),
+        }
+    }
+
+    fn mark_dirty(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_dirty()
+    }
+
+    /// Publishes at most one `avatars` event covering every change since the
+    /// previous flush. The single scan serves both the diff and the list, and
+    /// runs inside the critical section so a write that folded into this flush
+    /// cannot land between the scan and the diff.
+    fn flush(&self, directory: &Path) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = assets::avatar_fingerprints(directory);
+        let jids = current.keys().cloned().collect::<Vec<_>>();
+        let changed_jids = state.flush(current);
+        drop(state);
+        if changed_jids.is_empty() {
+            return;
+        }
+        let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self
+            .events
+            .send(self.clock.stamp_event(ServerEvent::Avatars {
+                revision,
+                jids,
+                changed_jids,
+            }));
+    }
+
+    fn snapshot(&self, directory: &Path) -> ServerEvent {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = assets::avatar_fingerprints(directory);
+        let jids = current.keys().cloned().collect::<Vec<_>>();
+        state.seed(current);
+        drop(state);
+        ServerEvent::Avatars {
+            revision: self.revision.load(Ordering::Relaxed),
+            jids,
+            changed_jids: Vec::new(),
+        }
+    }
+}
+
+/// Per-key leading and trailing coalescing state for invalidation broadcasts.
+/// The first call for a key publishes immediately and opens a window; further
+/// calls inside that window collapse into one trailing publish.
+#[derive(Default)]
+struct InvalidationCoalescer {
+    windows: HashMap<String, bool>,
+}
+
+impl InvalidationCoalescer {
+    /// Returns whether the caller publishes now and owns the new window.
+    fn record(&mut self, key: &str) -> bool {
+        if let Some(trailing) = self.windows.get_mut(key) {
+            *trailing = true;
+            return false;
+        }
+        self.windows.insert(key.to_owned(), false);
+        true
+    }
+
+    /// Ends one window. A due trailing publish keeps a fresh window open, so a
+    /// steady stream of events stays bounded to one publish per window.
+    fn finish(&mut self, key: &str) -> bool {
+        let Some(trailing) = self.windows.get_mut(key) else {
+            return false;
+        };
+        if std::mem::replace(trailing, false) {
+            return true;
+        }
+        self.windows.remove(key);
+        false
+    }
+
+    /// Closes a window without a trailing publish.
+    fn cancel(&mut self, key: &str) {
+        self.windows.remove(key);
+    }
+}
+
+/// A local snapshot the shell has to reload. `Unread` carries no total because
+/// a coalesced window must report the count when it ends, not when it opened.
+#[derive(Clone)]
+enum Invalidation {
+    Chats,
+    Messages(String),
+    Unread,
+}
+
+impl Invalidation {
+    fn key(&self) -> String {
+        match self {
+            Self::Chats => "chats".to_owned(),
+            Self::Messages(chat_jid) => format!("messages:{chat_jid}"),
+            Self::Unread => "unread".to_owned(),
+        }
+    }
+}
+
+/// Publishes invalidations with a per-key coalescing window. Every receipt in
+/// a group and every incoming message invalidates the same few snapshots, so
+/// publishing each one separately makes the shell reload them per event.
+struct InvalidationBroadcaster {
+    database: Arc<Database>,
+    events: broadcast::Sender<ServerFrame>,
+    clock: Arc<revisions::RevisionClock>,
+    state: StdMutex<InvalidationCoalescer>,
+}
+
+impl InvalidationBroadcaster {
+    fn new(
+        database: Arc<Database>,
+        events: broadcast::Sender<ServerFrame>,
+        clock: Arc<revisions::RevisionClock>,
+    ) -> Self {
+        Self {
+            database,
+            events,
+            clock,
+            state: StdMutex::new(InvalidationCoalescer::default()),
+        }
+    }
+
+    fn publish(&self, invalidation: &Invalidation) {
+        let event = match invalidation {
+            Invalidation::Chats => ServerEvent::Invalidated {
+                resource: Resource::Chats,
+                key: None,
+            },
+            Invalidation::Messages(chat_jid) => ServerEvent::Invalidated {
+                resource: Resource::Messages,
+                key: Some(chat_jid.clone()),
+            },
+            Invalidation::Unread => match self.database.unread_total() {
+                Ok(total) => ServerEvent::Unread { total },
+                Err(error) => {
+                    warn!(%error, "could not publish WhatsApp unread state");
+                    return;
+                }
+            },
+        };
+        let _ = self.events.send(self.clock.stamp_event(event));
+    }
+
+    fn schedule(self: &Arc<Self>, invalidation: Invalidation) {
+        let key = invalidation.key();
+        let leading = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(&key);
+        if !leading {
+            return;
+        }
+        self.publish(&invalidation);
+        // Without a runtime there is nothing to schedule the trailing publish
+        // on, so every call keeps publishing on its leading edge instead.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel(&key);
+            return;
+        };
+        let broadcaster = Arc::clone(self);
+        runtime.spawn(async move {
+            broadcaster.drain_windows(key, invalidation).await;
+        });
+    }
+
+    fn finish_window(&self, key: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finish(key)
+    }
+
+    async fn drain_windows(&self, key: String, invalidation: Invalidation) {
+        loop {
+            tokio::time::sleep(jobs::INVALIDATION_WINDOW).await;
+            if !self.finish_window(&key) {
+                return;
+            }
+            self.publish(&invalidation);
+        }
+    }
+}
+
+/// Bounded negative cache for the `list_chats` phone-number backfill. A LID
+/// chat without a mapping keeps that answer until the client generation
+/// changes, so the hot list path stops re-querying the SDK for it.
+#[derive(Default)]
+struct PhoneNumberMisses {
+    generation: u64,
+    jids: HashSet<String>,
+}
+
+impl PhoneNumberMisses {
+    fn remember(&mut self, generation: u64, jid: &str) {
+        self.retain_generation(generation);
+        self.jids.insert(jid.to_owned());
+    }
+
+    fn contains(&mut self, generation: u64, jid: &str) -> bool {
+        self.retain_generation(generation);
+        self.jids.contains(jid)
+    }
+
+    fn retain_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.generation = generation;
+            self.jids.clear();
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Low-footprint WhatsApp companion daemon for Omarchy")]
@@ -122,7 +417,9 @@ struct Shared {
     status: RwLock<ConnectionStatus>,
     client: RwLock<Option<Arc<Client>>>,
     events: broadcast::Sender<ServerFrame>,
-    clock: revisions::RevisionClock,
+    clock: Arc<revisions::RevisionClock>,
+    avatars: Arc<AvatarBroadcaster>,
+    invalidations: Arc<InvalidationBroadcaster>,
     connection_intents: StdMutex<connections::ConnectionIntents>,
     pairing_qr: PathBuf,
     contact_sync_marker: PathBuf,
@@ -131,14 +428,16 @@ struct Shared {
     avatar_dir: PathBuf,
     media_dir: PathBuf,
     voice_outbox_dir: PathBuf,
-    avatar_revision: AtomicU64,
     presence_sync_generation: AtomicU64,
     app_state_failed: AtomicBool,
     app_state_activity_ms: AtomicU64,
+    app_state_notify: Notify,
     chat_state_resync: RwLock<(ChatStateResyncStatus, Option<String>)>,
     chat_state_resync_requested: AtomicBool,
     chat_state_resync_notify: Notify,
     logout_requested: AtomicBool,
+    logout_trigger: StdMutex<Option<oneshot::Sender<()>>>,
+    phone_number_misses: StdMutex<PhoneNumberMisses>,
     avatar_sync: Mutex<()>,
     group_name_sync: Mutex<()>,
     media_recovery_requested: RwLock<HashSet<String>>,
@@ -253,8 +552,42 @@ impl Shared {
         self.clock.stamp_response(id, event)
     }
 
-    fn invalidate(&self, resource: Resource, key: Option<String>) {
-        self.publish(ServerEvent::Invalidated { resource, key });
+    /// Installs this generation's logout channel. Each generation owns its
+    /// own channel, so a trigger armed for a previous client can never stop
+    /// the current run loop.
+    fn arm_logout(&self) -> oneshot::Receiver<()> {
+        let (trigger, signal) = oneshot::channel();
+        *self
+            .logout_trigger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(trigger);
+        signal
+    }
+
+    /// Takes this generation's logout trigger. It is single use: a second
+    /// logout while one is armed finds nothing and is rejected instead of
+    /// arming a second account wipe.
+    fn take_logout_trigger(&self) -> Option<oneshot::Sender<()>> {
+        self.logout_trigger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn phone_number_is_missing(&self, jid: &str) -> bool {
+        let generation = self.clock.generation();
+        self.phone_number_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(generation, jid)
+    }
+
+    fn remember_missing_phone_number(&self, jid: &str) {
+        let generation = self.clock.generation();
+        self.phone_number_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remember(generation, jid);
     }
 
     fn open_connection(&self) -> u64 {
@@ -433,42 +766,27 @@ impl Shared {
     }
 
     fn avatars_changed(&self) {
-        let current = assets::avatar_fingerprints(&self.avatar_dir);
-        let mut snapshots = AVATAR_FINGERPRINTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = snapshots.entry(self.avatar_dir.clone()).or_default();
-        let mut changed_jids = current
-            .keys()
-            .chain(previous.keys())
-            .filter(|jid| current.get(*jid) != previous.get(*jid))
-            .cloned()
-            .collect::<Vec<_>>();
-        changed_jids.sort();
-        changed_jids.dedup();
-        *previous = current;
-        drop(snapshots);
-        if changed_jids.is_empty() {
+        if !self.avatars.mark_dirty() {
             return;
         }
-        let revision = self.avatar_revision.fetch_add(1, Ordering::Relaxed) + 1;
-        let jids = assets::available_avatar_jids(&self.avatar_dir);
-        self.publish(ServerEvent::Avatars {
-            revision,
-            jids,
-            changed_jids,
-        });
+        let avatars = Arc::clone(&self.avatars);
+        let directory = self.avatar_dir.clone();
+        // Avatar writes arrive in bursts from the bounded sync and from picture
+        // updates. Without a runtime the flush stays inline; otherwise a single
+        // delayed task publishes the whole burst.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    tokio::time::sleep(jobs::AVATAR_FLUSH_WINDOW).await;
+                    avatars.flush(&directory);
+                });
+            }
+            Err(_) => avatars.flush(&directory),
+        }
     }
 
-    fn avatar_snapshot(&self) -> Vec<String> {
-        let current = assets::avatar_fingerprints(&self.avatar_dir);
-        let jids = current.keys().cloned().collect();
-        AVATAR_FINGERPRINTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(self.avatar_dir.clone())
-            .or_insert(current);
-        jids
+    fn avatar_snapshot(&self) -> ServerEvent {
+        self.avatars.snapshot(&self.avatar_dir)
     }
 
     async fn state_event(&self) -> ServerEvent {
@@ -1684,10 +2002,11 @@ async fn reconcile_direct_chat_aliases(shared: &Shared, client: &Client) {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn list_chats_with_phone_numbers(shared: &Shared, limit: u32) -> Result<Vec<Chat>> {
+    // Alias reconciliation belongs to connect, history ingest, and contact
+    // updates. The shell lists chats on every invalidation, so repeating a
+    // per-chat SDK lookup here would put an unbounded query burst on the
+    // cheapest command in the protocol.
     let client = shared.client.read().await.clone();
-    if let Some(client) = client.as_ref() {
-        reconcile_direct_chat_aliases(shared, client).await;
-    }
     let mut chats = shared.database.list_chats(limit)?;
     for chat in &mut chats {
         if chat.is_group || chat.phone_number.is_some() {
@@ -1702,9 +2021,15 @@ async fn list_chats_with_phone_numbers(shared: &Shared, limit: u32) -> Result<Ve
             let Some(client) = client.as_ref() else {
                 continue;
             };
+            if shared.phone_number_is_missing(&chat.jid) {
+                continue;
+            }
             match client.get_lid_pn_entry(&jid).await {
                 Ok(Some(mapping)) => Some(mapping.phone_number.to_string()),
-                Ok(None) => None,
+                Ok(None) => {
+                    shared.remember_missing_phone_number(&chat.jid);
+                    None
+                }
                 Err(error) => {
                     warn!(%error, "could not resolve WhatsApp contact phone number");
                     None
@@ -1823,20 +2148,17 @@ fn metadata_jid(value: &str, server: &str) -> String {
 }
 
 fn broadcast_chats(shared: &Shared) {
-    shared.invalidate(Resource::Chats, None);
+    shared.invalidations.schedule(Invalidation::Chats);
 }
 
 fn broadcast_unread(shared: &Shared) {
-    match shared.database.unread_total() {
-        Ok(total) => {
-            shared.publish(ServerEvent::Unread { total });
-        }
-        Err(error) => warn!(%error, "could not publish WhatsApp unread state"),
-    }
+    shared.invalidations.schedule(Invalidation::Unread);
 }
 
 fn broadcast_messages(shared: &Shared, chat_jid: &str) {
-    shared.invalidate(Resource::Messages, Some(chat_jid.to_owned()));
+    shared
+        .invalidations
+        .schedule(Invalidation::Messages(chat_jid.to_owned()));
 }
 
 fn voice_outbox_event(shared: &Shared) -> Result<ServerEvent> {
@@ -2255,70 +2577,43 @@ async fn process_group_event(
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn await_app_state_sync(shared: Arc<Shared>, generation: u64) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if !shared.clock.is_current(generation) || shared.app_state_failed.load(Ordering::Relaxed) {
-            return;
-        }
-        let complete = match shared.database.regular_app_state_is_complete() {
-            Ok(complete) => complete,
-            Err(error) => {
-                warn!(%error, generation, "could not inspect app-state replay progress");
-                false
-            }
-        };
-        let last_activity = shared.app_state_activity_ms.load(Ordering::Relaxed);
-        let now = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
-        let quiet = last_activity == 0 || now.saturating_sub(last_activity) >= 2_000;
-        if complete && quiet {
-            match shared.database.reconcile_unread_after_full_sync() {
-                Ok(changed) => {
-                    info!(
-                        changed,
-                        generation, "reconciled imported unread counters with app-state replay"
-                    );
-                    broadcast_snapshot(&shared);
-                    shared.mark_event_sync_complete();
-                    if shared
-                        .chat_state_resync_requested
-                        .swap(false, Ordering::SeqCst)
-                    {
-                        shared
-                            .set_chat_state_resync(
-                                ChatStateResyncStatus::Succeeded,
-                                Some("WhatsApp chat state is up to date".to_owned()),
-                            )
-                            .await;
-                    }
-                }
-                Err(error) => {
-                    warn!(%error, generation, "could not reconcile WhatsApp unread counters");
-                    if shared
-                        .chat_state_resync_requested
-                        .swap(false, Ordering::SeqCst)
-                    {
-                        shared
-                            .set_chat_state_resync(
-                                ChatStateResyncStatus::Failed,
-                                Some(
-                                    "Could not reconcile the replayed WhatsApp chat state"
-                                        .to_owned(),
-                                ),
-                            )
-                            .await;
-                    }
-                }
-            }
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            warn!(
-                generation,
-                "WhatsApp app-state replay did not reach a complete quiet checkpoint"
+/// Time left before the app-state replay counts as quiet. `None` means the
+/// quiet period elapsed and completeness can be inspected.
+fn app_state_quiet_remaining(now_ms: u64, last_activity_ms: u64) -> Option<std::time::Duration> {
+    if last_activity_ms == 0 {
+        return None;
+    }
+    let elapsed = now_ms.saturating_sub(last_activity_ms);
+    (elapsed < APP_STATE_QUIET_MS)
+        .then(|| std::time::Duration::from_millis(APP_STATE_QUIET_MS - elapsed))
+}
+
+/// Applies the terminal outcome of a settled app-state replay. Reconciling the
+/// imported counters is its last step, so a requested resync reports success
+/// or failure from that result.
+async fn finish_app_state_sync(shared: &Shared, generation: u64) {
+    match shared.database.reconcile_unread_after_full_sync() {
+        Ok(changed) => {
+            info!(
+                changed,
+                generation, "reconciled imported unread counters with app-state replay"
             );
+            broadcast_snapshot(shared);
+            shared.mark_event_sync_complete();
+            if shared
+                .chat_state_resync_requested
+                .swap(false, Ordering::SeqCst)
+            {
+                shared
+                    .set_chat_state_resync(
+                        ChatStateResyncStatus::Succeeded,
+                        Some("WhatsApp chat state is up to date".to_owned()),
+                    )
+                    .await;
+            }
+        }
+        Err(error) => {
+            warn!(%error, generation, "could not reconcile WhatsApp unread counters");
             if shared
                 .chat_state_resync_requested
                 .swap(false, Ordering::SeqCst)
@@ -2326,12 +2621,75 @@ async fn await_app_state_sync(shared: Arc<Shared>, generation: u64) {
                 shared
                     .set_chat_state_resync(
                         ChatStateResyncStatus::Failed,
-                        Some("WhatsApp did not finish the chat-state replay".to_owned()),
+                        Some("Could not reconcile the replayed WhatsApp chat state".to_owned()),
                     )
                     .await;
             }
+        }
+    }
+}
+
+/// Reports the deadline outcome when the linked device never reached a
+/// complete quiet checkpoint inside the replay window.
+async fn expire_app_state_sync(shared: &Shared, generation: u64) {
+    warn!(
+        generation,
+        "WhatsApp app-state replay did not reach a complete quiet checkpoint"
+    );
+    if shared
+        .chat_state_resync_requested
+        .swap(false, Ordering::SeqCst)
+    {
+        shared
+            .set_chat_state_resync(
+                ChatStateResyncStatus::Failed,
+                Some("WhatsApp did not finish the chat-state replay".to_owned()),
+            )
+            .await;
+    }
+}
+
+// Waiting for the replay is a scheduling shim around measured helpers: the
+// quiet window, both settled outcomes, and the deadline are unit tested. Each
+// completeness check opens the session database, so the waiter sleeps until
+// the quiet period elapses instead of polling it.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn await_app_state_sync(shared: Arc<Shared>, generation: u64) {
+    let deadline = tokio::time::Instant::now() + APP_STATE_SYNC_DEADLINE;
+    loop {
+        if !shared.clock.is_current(generation) || shared.app_state_failed.load(Ordering::Relaxed) {
             return;
         }
+        let now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default();
+        let last_activity = shared.app_state_activity_ms.load(Ordering::Relaxed);
+        let mut window = APP_STATE_QUIET_PERIOD;
+        if let Some(remaining) = app_state_quiet_remaining(now_ms, last_activity) {
+            window = remaining;
+        } else {
+            let complete = match shared.database.regular_app_state_is_complete() {
+                Ok(complete) => complete,
+                Err(error) => {
+                    warn!(%error, generation, "could not inspect app-state replay progress");
+                    false
+                }
+            };
+            if complete {
+                finish_app_state_sync(&shared, generation).await;
+                return;
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            expire_app_state_sync(&shared, generation).await;
+            return;
+        }
+        // A fresh app-state mutation restarts the quiet window; otherwise the
+        // waiter sleeps until that window or the replay deadline elapses.
+        let _ = tokio::time::timeout(
+            window.min(deadline - now),
+            shared.app_state_notify.notified(),
+        )
+        .await;
     }
 }
 
@@ -3053,6 +3411,7 @@ async fn handle_app_event(
         u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default(),
         Ordering::Relaxed,
     );
+    shared.app_state_notify.notify_waiters();
     match &*event {
         Event::Receipt(receipt) => {
             let receipt_type = receipt.r#type.as_wire_str();
@@ -3570,12 +3929,22 @@ async fn run_daemon() -> Result<()> {
     let (events, _) = broadcast::channel(256);
     let (message_reducer, message_queue) = mpsc::channel(4_096);
     let (app_event_reducer, app_event_queue) = mpsc::channel(4_096);
+    let database = Arc::new(Database::open(&paths.history_db)?);
+    let clock = Arc::new(revisions::RevisionClock::default());
+    let avatars = Arc::new(AvatarBroadcaster::new(events.clone(), Arc::clone(&clock)));
+    let invalidations = Arc::new(InvalidationBroadcaster::new(
+        Arc::clone(&database),
+        events.clone(),
+        Arc::clone(&clock),
+    ));
     let shared = Arc::new(Shared {
-        database: Arc::new(Database::open(&paths.history_db)?),
+        database,
         status: RwLock::new(ConnectionStatus::Starting),
         client: RwLock::new(None),
         events,
-        clock: revisions::RevisionClock::default(),
+        clock,
+        avatars,
+        invalidations,
         connection_intents: StdMutex::new(connections::ConnectionIntents::default()),
         pairing_qr: paths.runtime_dir.join("pairing.svg"),
         contact_sync_marker: paths.state_dir.join("contact-names-v2"),
@@ -3584,14 +3953,16 @@ async fn run_daemon() -> Result<()> {
         avatar_dir,
         media_dir,
         voice_outbox_dir,
-        avatar_revision: AtomicU64::new(0),
         presence_sync_generation: AtomicU64::new(0),
         app_state_failed: AtomicBool::new(false),
         app_state_activity_ms: AtomicU64::new(0),
+        app_state_notify: Notify::new(),
         chat_state_resync: RwLock::new((ChatStateResyncStatus::Idle, None)),
         chat_state_resync_requested: AtomicBool::new(false),
         chat_state_resync_notify: Notify::new(),
         logout_requested: AtomicBool::new(false),
+        logout_trigger: StdMutex::new(None),
+        phone_number_misses: StdMutex::new(PhoneNumberMisses::default()),
         avatar_sync: Mutex::new(()),
         group_name_sync: Mutex::new(()),
         media_recovery_requested: RwLock::new(HashSet::new()),
@@ -3624,6 +3995,7 @@ async fn run_daemon() -> Result<()> {
     loop {
         let generation = shared.clock.begin_generation();
         shared.begin_presence_sync(generation);
+        let mut logout_signal = shared.arm_logout();
         let generation_jobs = Arc::new(GenerationJobs::default());
         shared.app_state_failed.store(false, Ordering::Relaxed);
         shared.app_state_activity_ms.store(0, Ordering::Relaxed);
@@ -3876,6 +4248,14 @@ async fn run_daemon() -> Result<()> {
                 false
             }
             () = &mut bot_handle => true,
+            // The logout command owns this generation's trigger, so the run
+            // loop exits for a logout even when the upstream client keeps its
+            // own loop alive after the request.
+            _ = &mut logout_signal => {
+                info!("stopping WhatsApp client for a requested logout");
+                bot_handle.shutdown().await;
+                true
+            }
             () = shared.chat_state_resync_notify.notified() => {
                 shared
                     .set_chat_state_resync(
@@ -5202,11 +5582,7 @@ async fn handle_command(
             });
             Ok(ServerEvent::Ack)
         }
-        Command::ListAvatars => Ok(ServerEvent::Avatars {
-            revision: shared.avatar_revision.load(Ordering::Relaxed),
-            jids: shared.avatar_snapshot(),
-            changed_jids: Vec::new(),
-        }),
+        Command::ListAvatars => Ok(shared.avatar_snapshot()),
         Command::SetActiveChat { chat_jid } => {
             let client = shared.client.read().await.clone();
             let next = match chat_jid {
@@ -5288,8 +5664,14 @@ async fn handle_command(
                 .await
                 .clone()
                 .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+            let trigger = shared
+                .take_logout_trigger()
+                .ok_or_else(|| anyhow!("a WhatsApp logout is already in progress"))?;
             shared.logout_requested.store(true, Ordering::SeqCst);
             client.logout().await;
+            // Stopping the run loop here keeps the armed flag from outliving
+            // this request: the account wipe happens now or not at all.
+            let _ = trigger.send(());
             Ok(ServerEvent::Ack)
         }
         Command::Ping => Ok(ServerEvent::Pong),
@@ -5324,12 +5706,22 @@ mod tests {
         message_reducer: mpsc::Sender<MessageWork>,
         app_event_reducer: mpsc::Sender<AppEventWork>,
     ) -> Shared {
+        let database = Arc::new(Database::open(&directory.path().join("history.db")).unwrap());
+        let clock = Arc::new(revisions::RevisionClock::default());
+        let avatars = Arc::new(AvatarBroadcaster::new(events.clone(), Arc::clone(&clock)));
+        let invalidations = Arc::new(InvalidationBroadcaster::new(
+            Arc::clone(&database),
+            events.clone(),
+            Arc::clone(&clock),
+        ));
         Shared {
-            database: Arc::new(Database::open(&directory.path().join("history.db")).unwrap()),
+            database,
             status: RwLock::new(ConnectionStatus::Starting),
             client: RwLock::new(None),
             events,
-            clock: revisions::RevisionClock::default(),
+            clock,
+            avatars,
+            invalidations,
             connection_intents: StdMutex::new(connections::ConnectionIntents::default()),
             pairing_qr: directory.path().join("pairing.svg"),
             contact_sync_marker: directory.path().join("contact-names-v2"),
@@ -5338,14 +5730,16 @@ mod tests {
             avatar_dir: directory.path().join("avatars"),
             media_dir: directory.path().join("media"),
             voice_outbox_dir: directory.path().join("outbox"),
-            avatar_revision: AtomicU64::new(0),
             presence_sync_generation: AtomicU64::new(0),
             app_state_failed: AtomicBool::new(false),
             app_state_activity_ms: AtomicU64::new(0),
+            app_state_notify: Notify::new(),
             chat_state_resync: RwLock::new((ChatStateResyncStatus::Idle, None)),
             chat_state_resync_requested: AtomicBool::new(false),
             chat_state_resync_notify: Notify::new(),
             logout_requested: AtomicBool::new(false),
+            logout_trigger: StdMutex::new(None),
+            phone_number_misses: StdMutex::new(PhoneNumberMisses::default()),
             avatar_sync: Mutex::new(()),
             group_name_sync: Mutex::new(()),
             media_recovery_requested: RwLock::new(HashSet::new()),
@@ -5380,6 +5774,423 @@ mod tests {
             .await
             .unwrap()
             .client()
+    }
+
+    /// Ends a paused-time coalescing window: the scheduled task first has to
+    /// run far enough to register its timer, then the clock passes it.
+    async fn advance_past(window: std::time::Duration) {
+        tokio::task::yield_now().await;
+        tokio::time::advance(window + std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+    }
+
+    fn seed_completed_app_state(directory: &tempfile::TempDir) {
+        rusqlite::Connection::open(directory.path().join("session.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE app_state_versions (name TEXT NOT NULL);
+                 INSERT INTO app_state_versions (name) VALUES
+                    ('regular'), ('regular_low'), ('regular_high');",
+            )
+            .unwrap();
+    }
+
+    fn unread_message(id: &str) -> Message {
+        Message {
+            id: id.to_owned(),
+            chat_jid: "1@s.whatsapp.net".into(),
+            sender_jid: "1@s.whatsapp.net".into(),
+            sender_name: "Ada".into(),
+            text: "synthetic".into(),
+            timestamp: 10,
+            from_me: false,
+            receipt: 0,
+            delivered_at: None,
+            read_at: None,
+            delivered_to: Vec::new(),
+            read_by: Vec::new(),
+            media: None,
+            reactions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn avatar_coalescer_reports_every_change_since_the_last_flush() {
+        let mut coalescer = AvatarCoalescer::default();
+        assert!(coalescer.mark_dirty());
+        assert!(!coalescer.mark_dirty());
+
+        let first = std::collections::BTreeMap::from([("a".to_owned(), (1, 2, 3, 4))]);
+        assert_eq!(coalescer.flush(first.clone()), vec!["a".to_owned()]);
+        assert!(coalescer.flush(first.clone()).is_empty());
+        assert!(coalescer.mark_dirty());
+
+        // A snapshot served after the baseline exists must not adopt files the
+        // pending flush still has to announce.
+        let second = std::collections::BTreeMap::from([
+            ("a".to_owned(), (1, 2, 3, 4)),
+            ("b".to_owned(), (5, 6, 7, 8)),
+        ]);
+        coalescer.seed(second.clone());
+        assert_eq!(coalescer.flush(second), vec!["b".to_owned()]);
+        assert_eq!(coalescer.flush(first), vec!["b".to_owned()]);
+
+        let mut fresh = AvatarCoalescer::default();
+        fresh.seed(std::collections::BTreeMap::from([(
+            "c".to_owned(),
+            (9, 9, 9, 9),
+        )]));
+        assert!(
+            fresh
+                .flush(std::collections::BTreeMap::from([(
+                    "c".to_owned(),
+                    (9, 9, 9, 9)
+                )]))
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn avatar_bursts_publish_one_coalesced_broadcast() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        let mut events = shared.events.subscribe();
+
+        for jid in ["1@s.whatsapp.net", "2@s.whatsapp.net", "3@s.whatsapp.net"] {
+            assets::write_private_bytes(&assets::avatar_path(&shared.avatar_dir, jid), b"avatar")
+                .unwrap();
+            shared.avatars_changed();
+        }
+        assert!(events.try_recv().is_err());
+
+        advance_past(jobs::AVATAR_FLUSH_WINDOW).await;
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::Avatars {
+                revision: 1,
+                jids: vec![
+                    "1@s.whatsapp.net".into(),
+                    "2@s.whatsapp.net".into(),
+                    "3@s.whatsapp.net".into(),
+                ],
+                changed_jids: vec![
+                    "1@s.whatsapp.net".into(),
+                    "2@s.whatsapp.net".into(),
+                    "3@s.whatsapp.net".into(),
+                ],
+            }
+        );
+        assert!(events.try_recv().is_err());
+
+        // A later burst opens a fresh window and keeps the revision monotonic.
+        assets::remove_avatar(&shared.avatar_dir, "2@s.whatsapp.net");
+        shared.avatars_changed();
+        advance_past(jobs::AVATAR_FLUSH_WINDOW).await;
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::Avatars {
+                revision: 2,
+                jids: vec!["1@s.whatsapp.net".into(), "3@s.whatsapp.net".into()],
+                changed_jids: vec!["2@s.whatsapp.net".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn avatar_changes_without_a_runtime_publish_inline() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        let mut events = shared.events.subscribe();
+        let jid = "1@s.whatsapp.net";
+        assets::write_private_bytes(&assets::avatar_path(&shared.avatar_dir, jid), b"avatar")
+            .unwrap();
+
+        shared.avatars_changed();
+
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::Avatars {
+                revision: 1,
+                jids: vec![jid.into()],
+                changed_jids: vec![jid.into()],
+            }
+        );
+        shared.avatars_changed();
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn invalidation_coalescer_opens_one_window_per_key() {
+        let mut coalescer = InvalidationCoalescer::default();
+        assert!(coalescer.record("chats"));
+        assert!(!coalescer.record("chats"));
+        assert!(coalescer.record("unread"));
+
+        // The trailing publish keeps its window open so a steady stream stays
+        // bounded to one publish per window.
+        assert!(coalescer.finish("chats"));
+        assert!(!coalescer.finish("chats"));
+        assert!(coalescer.record("chats"));
+        assert!(!coalescer.finish("unread"));
+        assert!(!coalescer.finish("messages:1@s.whatsapp.net"));
+
+        coalescer.cancel("chats");
+        assert!(coalescer.record("chats"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalidations_publish_a_leading_and_one_trailing_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let mut events = shared.events.subscribe();
+
+        for _ in 0..3 {
+            broadcast_chats(&shared);
+            broadcast_messages(&shared, "1@s.whatsapp.net");
+            broadcast_unread(&shared);
+        }
+        let leading = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|frame| frame.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            leading,
+            vec![
+                ServerEvent::Invalidated {
+                    resource: Resource::Chats,
+                    key: None,
+                },
+                ServerEvent::Invalidated {
+                    resource: Resource::Messages,
+                    key: Some("1@s.whatsapp.net".into()),
+                },
+                ServerEvent::Unread { total: 0 },
+            ]
+        );
+
+        // The trailing unread total is evaluated when the window ends, not when
+        // the folded calls were made.
+        shared
+            .database
+            .insert_message(&unread_message("late"), "Ada", false, true)
+            .unwrap();
+        advance_past(jobs::INVALIDATION_WINDOW).await;
+        let trailing = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|frame| frame.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            trailing,
+            vec![
+                ServerEvent::Invalidated {
+                    resource: Resource::Chats,
+                    key: None,
+                },
+                ServerEvent::Invalidated {
+                    resource: Resource::Messages,
+                    key: Some("1@s.whatsapp.net".into()),
+                },
+                ServerEvent::Unread { total: 1 },
+            ]
+        );
+
+        // A window without folded calls closes instead of publishing again.
+        advance_past(jobs::INVALIDATION_WINDOW).await;
+        assert!(events.try_recv().is_err());
+        broadcast_chats(&shared);
+        assert!(matches!(
+            events.try_recv().unwrap().event,
+            ServerEvent::Invalidated {
+                resource: Resource::Chats,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_unread_failures_degrade_without_publishing() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let mut events = shared.events.subscribe();
+        broadcast_unread(&shared);
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::Unread { total: 0 }
+        );
+        broadcast_unread(&shared);
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chats")
+            .unwrap();
+
+        advance_past(jobs::INVALIDATION_WINDOW).await;
+
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn invalidations_without_a_runtime_publish_every_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let mut events = shared.events.subscribe();
+
+        broadcast_chats(&shared);
+        broadcast_chats(&shared);
+
+        assert_eq!(
+            std::iter::from_fn(|| events.try_recv().ok()).count(),
+            2,
+            "without a runtime there is nothing to schedule a trailing publish on"
+        );
+    }
+
+    #[test]
+    fn missing_phone_numbers_are_cached_per_client_generation() {
+        let mut misses = PhoneNumberMisses::default();
+        assert!(!misses.contains(1, "1@lid"));
+        misses.remember(1, "1@lid");
+        assert!(misses.contains(1, "1@lid"));
+        assert!(!misses.contains(1, "2@lid"));
+        assert!(!misses.contains(2, "1@lid"));
+        misses.remember(2, "1@lid");
+        assert!(misses.contains(2, "1@lid"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        assert!(!shared.phone_number_is_missing("1@lid"));
+        shared.remember_missing_phone_number("1@lid");
+        assert!(shared.phone_number_is_missing("1@lid"));
+        let _ = shared.clock.begin_generation();
+        assert!(!shared.phone_number_is_missing("1@lid"));
+    }
+
+    #[tokio::test]
+    async fn logout_triggers_are_single_use_and_scoped_to_one_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        assert!(shared.take_logout_trigger().is_none());
+
+        let mut signal = shared.arm_logout();
+        let trigger = shared.take_logout_trigger().unwrap();
+        assert!(
+            shared.take_logout_trigger().is_none(),
+            "a second logout must not arm another account wipe"
+        );
+        trigger.send(()).unwrap();
+        assert!(signal.try_recv().is_ok());
+
+        // Re-arming replaces the previous generation's channel, so its trigger
+        // can never stop the current run loop.
+        let mut stale = shared.arm_logout();
+        let mut current = shared.arm_logout();
+        assert!(stale.try_recv().is_err());
+        shared.take_logout_trigger().unwrap().send(()).unwrap();
+        assert!(current.try_recv().is_ok());
+    }
+
+    #[test]
+    fn app_state_quiet_period_restarts_with_every_mutation() {
+        assert_eq!(app_state_quiet_remaining(10_000, 0), None);
+        assert_eq!(
+            app_state_quiet_remaining(10_000, 9_500),
+            Some(std::time::Duration::from_millis(1_500))
+        );
+        assert_eq!(app_state_quiet_remaining(10_000, 8_000), None);
+        // A clock that jumped backwards restarts the window instead of
+        // declaring the replay settled.
+        assert_eq!(
+            app_state_quiet_remaining(1_000, 9_000),
+            Some(APP_STATE_QUIET_PERIOD)
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_app_state_replay_reconciles_and_reports_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        seed_completed_app_state(&directory);
+        shared
+            .database
+            .insert_message(&unread_message("replayed"), "Ada", false, true)
+            .unwrap();
+        let mut events = shared.events.subscribe();
+
+        finish_app_state_sync(&shared, 1).await;
+        assert!(shared.event_sync_marker.exists());
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|frame| matches!(frame.event, ServerEvent::ChatStateResync { .. })),
+            "an unrequested replay reports no resync outcome"
+        );
+
+        shared
+            .chat_state_resync_requested
+            .store(true, Ordering::SeqCst);
+        finish_app_state_sync(&shared, 1).await;
+        assert!(!shared.chat_state_resync_requested.load(Ordering::SeqCst));
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(|frame| frame.event
+                == ServerEvent::ChatStateResync {
+                    status: ChatStateResyncStatus::Succeeded,
+                    message: Some("WhatsApp chat state is up to date".into()),
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn unreconcilable_app_state_replay_reports_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        seed_completed_app_state(&directory);
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chats")
+            .unwrap();
+        let mut events = shared.events.subscribe();
+
+        finish_app_state_sync(&shared, 1).await;
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|frame| matches!(frame.event, ServerEvent::ChatStateResync { .. })),
+            "an unrequested replay reports no resync outcome"
+        );
+
+        shared
+            .chat_state_resync_requested
+            .store(true, Ordering::SeqCst);
+        finish_app_state_sync(&shared, 1).await;
+
+        assert!(!shared.event_sync_marker.exists());
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(|frame| frame.event
+                == ServerEvent::ChatStateResync {
+                    status: ChatStateResyncStatus::Failed,
+                    message: Some("Could not reconcile the replayed WhatsApp chat state".into()),
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_app_state_replay_reports_the_deadline_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = test_shared(&directory);
+        let mut events = shared.events.subscribe();
+
+        expire_app_state_sync(&shared, 1).await;
+        assert!(events.try_recv().is_err());
+
+        shared
+            .chat_state_resync_requested
+            .store(true, Ordering::SeqCst);
+        expire_app_state_sync(&shared, 1).await;
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::ChatStateResync {
+                status: ChatStateResyncStatus::Failed,
+                message: Some("WhatsApp did not finish the chat-state replay".into()),
+            }
+        );
+        assert!(!shared.chat_state_resync_requested.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -6374,7 +7185,7 @@ mod tests {
         serde_json::from_slice(buffer).unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn clearing_account_data_publishes_the_removed_avatar_jids() {
         let directory = tempfile::tempdir().unwrap();
         let shared = test_shared(&directory);
@@ -6385,6 +7196,7 @@ mod tests {
             .unwrap();
         let mut events = shared.events.subscribe();
         shared.avatars_changed();
+        advance_past(jobs::AVATAR_FLUSH_WINDOW).await;
         let _ = events.try_recv().unwrap();
         let paths = AppPaths {
             runtime_dir: directory.path().join("runtime"),
@@ -6395,6 +7207,7 @@ mod tests {
         };
 
         clear_local_account_data(&paths, &shared).await.unwrap();
+        advance_past(jobs::AVATAR_FLUSH_WINDOW).await;
 
         let avatar_event = std::iter::from_fn(|| events.try_recv().ok())
             .find(|frame| matches!(frame.event, ServerEvent::Avatars { .. }))
@@ -6432,8 +7245,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn avatar_events_only_revise_the_files_that_changed() {
+    #[tokio::test(start_paused = true)]
+    async fn avatar_events_only_revise_the_files_that_changed() {
         let directory = tempfile::tempdir().unwrap();
         let shared = test_shared(&directory);
         assets::private_dir(&shared.avatar_dir).unwrap();
@@ -6447,6 +7260,7 @@ mod tests {
         )
         .unwrap();
         shared.avatars_changed();
+        advance_past(jobs::AVATAR_FLUSH_WINDOW).await;
         assert_eq!(
             events.try_recv().unwrap().event,
             ServerEvent::Avatars {
@@ -6462,6 +7276,7 @@ mod tests {
         )
         .unwrap();
         shared.avatars_changed();
+        advance_past(jobs::AVATAR_FLUSH_WINDOW).await;
         assert_eq!(
             events.try_recv().unwrap().event,
             ServerEvent::Avatars {
@@ -6476,8 +7291,16 @@ mod tests {
             b"replacement avatar",
         )
         .unwrap();
-        assert_eq!(shared.avatar_snapshot(), vec![first_jid, second_jid]);
+        assert_eq!(
+            shared.avatar_snapshot(),
+            ServerEvent::Avatars {
+                revision: 2,
+                jids: vec![first_jid.into(), second_jid.into()],
+                changed_jids: Vec::new(),
+            }
+        );
         shared.avatars_changed();
+        advance_past(jobs::AVATAR_FLUSH_WINDOW).await;
         assert_eq!(
             events.try_recv().unwrap().event,
             ServerEvent::Avatars {
@@ -6488,6 +7311,7 @@ mod tests {
         );
 
         shared.avatars_changed();
+        advance_past(jobs::AVATAR_FLUSH_WINDOW).await;
         assert!(events.try_recv().is_err());
     }
 
