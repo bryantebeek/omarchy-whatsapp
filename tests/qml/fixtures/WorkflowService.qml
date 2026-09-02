@@ -317,7 +317,9 @@ QtObject {
   function requestAvatar(jid) { record("requestAvatar", String(jid || "")) }
   function refreshSelectedGroupParticipants() { return false }
   function reactToMessage() { return true }
-  function openMap() {}
+  function openMap(latitude, longitude) {
+    record("openMap", { latitude: latitude, longitude: longitude })
+  }
   function openFile(path) { record("openFile", path) }
   function saveFile(path) { record("saveFile", path) }
   function unlinkDevice() { return connectionState === "connected" }

@@ -2340,34 +2340,6 @@ Item {
                         reactionPicker.open()
                       }
 
-                      function selectedPollOptions() {
-                        var selected = []
-                        if (!isPoll || !Array.isArray(mediaData.options)) return selected
-                        for (var i = 0; i < mediaData.options.length; i++)
-                          if (mediaData.options[i].selected_by_me === true)
-                            selected.push(String(mediaData.options[i].name || ""))
-                        return selected
-                      }
-
-                      function togglePollOption(optionIndex) {
-                        if (!root.service || !isPoll || pollCard.ended
-                            || root.service.pollVotePending(modelData)) return
-                        var options = mediaData.options || []
-                        var option = options[optionIndex] || {}
-                        var name = String(option.name || "")
-                        if (!name) return
-                        var selected = selectedPollOptions()
-                        var selectedIndex = selected.indexOf(name)
-                        if (Number(mediaData.selectable_count || 1) === 1) {
-                          selected = selectedIndex >= 0 ? [] : [name]
-                        } else if (selectedIndex >= 0) {
-                          selected.splice(selectedIndex, 1)
-                        } else {
-                          selected.push(name)
-                        }
-                        root.service.votePoll(modelData, selected)
-                      }
-
                       width: messageList.width
                       height: dateDivider.height
                         + Math.max(bubble.height, senderAvatar.height)
@@ -2519,12 +2491,7 @@ Item {
                             / Math.max(1, Number(messageDelegate.mediaData
                               ? messageDelegate.mediaData.height || 1 : 1))
                         readonly property real imageAspectRatio:
-                          mediaPreviewImage.status === Image.Ready
-                            && mediaPreviewImage.sourceSize.width > 0
-                            && mediaPreviewImage.sourceSize.height > 0
-                          ? mediaPreviewImage.sourceSize.width
-                            / mediaPreviewImage.sourceSize.height
-                          : mediaAspectRatio
+                          mediaPreviewCard.imageAspectRatio
                         readonly property real imagePreviewWidth: Math.max(
                           Style.space(40), Math.min(maximumMediaWidth,
                             Style.space(280) * imageAspectRatio))
@@ -2649,877 +2616,115 @@ Item {
                               cursorShape: Qt.PointingHandCursor
                             }
                           }
-                          Item {
+                          PollCard {
                             id: pollCard
                             objectName: "pollCard-" + String(modelData.id || "")
-                            readonly property bool ended:
-                              Number(messageDelegate.mediaData
-                                ? messageDelegate.mediaData.end_timestamp || 0 : 0) > 0
-                              && Number(messageDelegate.mediaData.end_timestamp)
-                                <= root.currentTimestamp
-                            readonly property int totalVoters:
-                              Number(messageDelegate.mediaData
-                                ? messageDelegate.mediaData.total_voters || 0 : 0)
-                            visible: messageDelegate.isPoll
                             width: parent.width
-                            height: visible ? pollContent.implicitHeight : 0
-
-                            Column {
-                              id: pollContent
-                              width: parent.width
-                              spacing: Style.space(7)
-
-                              Text {
-                                width: parent.width
-                                text: messageDelegate.mediaData
-                                  ? String(messageDelegate.mediaData.question || "Poll") : "Poll"
-                                color: root.foreground
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.body
-                                font.bold: true
-                                wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                                textFormat: Text.PlainText
-                              }
-
-                              Text {
-                                width: parent.width
-                                text: Number(messageDelegate.mediaData
-                                  ? messageDelegate.mediaData.selectable_count || 1 : 1) > 1
-                                  ? "Select one or more" : "Select one"
-                                color: root.sidebarSecondary
-                                font.family: root.fontFamily
-                                font.pixelSize: root.messageMetaFontSize
-                              }
-
-                              Repeater {
-                                model: messageDelegate.mediaData
-                                  && Array.isArray(messageDelegate.mediaData.options)
-                                  ? messageDelegate.mediaData.options : []
-
-                                delegate: Item {
-                                  id: pollOption
-                                  objectName: "pollOption-" + String(index)
-                                  required property var modelData
-                                  required property int index
-                                  readonly property bool selected:
-                                    modelData.selected_by_me === true
-                                  readonly property int votes:
-                                    Number(modelData.votes || 0)
-                                  readonly property var voterJids:
-                                    modelData.voter_jids
-                                    && typeof modelData.voter_jids.length === "number"
-                                    ? modelData.voter_jids : []
-                                  width: pollContent.width
-                                  height: Math.max(Style.space(52),
-                                    pollOptionLabel.implicitHeight + Style.space(26))
-
-                                  CrispButton {
-                                    id: pollOptionButton
-                                    objectName: "pollOptionButton-"
-                                      + String(messageDelegate.modelData.id || "")
-                                      + "-" + String(pollOption.index)
-                                    anchors.fill: parent
-                                    readonly property color subtleBorderColor:
-                                      Qt.rgba(root.foreground.r,
-                                        root.foreground.g, root.foreground.b, 0.10)
-                                    radius: bubble.radius
-                                    foreground: root.foreground
-                                    accent: root.accent
-                                    background: Style.normalFillFor(
-                                      root.foreground, root.accent)
-                                    bordered: true
-                                    borderSpec: root.devicePixelBorderSpec(
-                                      pollOptionButton._showFocusRing
-                                        ? pollOptionButton._focusBorderSpec
-                                        : Border.flat(subtleBorderColor,
-                                          Math.max(1, Style.normalBorderWidth)))
-                                    selected: pollOption.selected
-                                    enabled: !pollCard.ended && root.service
-                                      && !root.service.pollVotePending(
-                                        messageDelegate.modelData)
-                                    focusable: true
-                                    onClicked: messageDelegate.togglePollOption(
-                                      pollOption.index)
-                                  }
-
-                                  Rectangle {
-                                    id: pollProgressTrack
-                                    objectName: "pollProgressTrack-"
-                                      + String(messageDelegate.modelData.id || "")
-                                      + "-" + String(pollOption.index)
-                                    anchors.left: parent.left
-                                    anchors.right: parent.right
-                                    anchors.bottom: parent.bottom
-                                    height: Style.space(9)
-                                    radius: height / 2
-                                    color: Style.normalFillFor(
-                                      root.foreground, root.accent)
-
-                                    Rectangle {
-                                      objectName: "pollProgressFill-"
-                                        + String(messageDelegate.modelData.id || "")
-                                        + "-" + String(pollOption.index)
-                                      anchors.left: parent.left
-                                      anchors.top: parent.top
-                                      anchors.bottom: parent.bottom
-                                      width: pollCard.totalVoters > 0
-                                        ? parent.width * Math.min(1,
-                                          pollOption.votes / pollCard.totalVoters) : 0
-                                      radius: height / 2
-                                      color: root.accent
-                                      opacity: 0.9
-                                    }
-                                  }
-
-                                  Text {
-                                    id: pollOptionLabel
-                                    anchors.left: parent.left
-                                    anchors.right: pollVoteSummary.left
-                                    anchors.leftMargin: Style.space(10)
-                                    anchors.rightMargin: Style.space(8)
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    anchors.verticalCenterOffset: -Style.space(5)
-                                    text: (pollOption.selected ? "✓  " : "")
-                                      + String(pollOption.modelData.name || "")
-                                    color: root.foreground
-                                    font.family: root.fontFamily
-                                    font.pixelSize: Style.font.body
-                                    wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                                    textFormat: Text.PlainText
-                                  }
-
-                                  Item {
-                                    id: pollVoteSummary
-                                    objectName: "pollVoteSummary-"
-                                      + String(messageDelegate.modelData.id || "")
-                                      + "-" + String(pollOption.index)
-                                    readonly property int avatarSize: Style.space(22)
-                                    readonly property int avatarStride: Style.space(14)
-                                    readonly property real avatarStackWidth:
-                                      pollOption.voterJids.length > 0
-                                      ? avatarSize + (pollOption.voterJids.length - 1)
-                                        * avatarStride : 0
-                                    anchors.right: parent.right
-                                    anchors.rightMargin: Style.space(10)
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    anchors.verticalCenterOffset: -Style.space(5)
-                                    width: pollOptionCount.implicitWidth
-                                      + (avatarStackWidth > 0
-                                        ? Style.space(5) + avatarStackWidth : 0)
-                                    height: avatarSize
-
-                                    Text {
-                                      id: pollOptionCount
-                                      objectName: "pollOptionCount-"
-                                        + String(messageDelegate.modelData.id || "")
-                                        + "-" + String(pollOption.index)
-                                      anchors.left: parent.left
-                                      anchors.verticalCenter: parent.verticalCenter
-                                      text: String(pollOption.votes)
-                                      color: root.sidebarSecondary
-                                      font.family: root.fontFamily
-                                      font.pixelSize: root.messageMetaFontSize
-                                    }
-
-                                    Item {
-                                      id: pollVoterStack
-                                      objectName: "pollVoterStack-"
-                                        + String(messageDelegate.modelData.id || "")
-                                        + "-" + String(pollOption.index)
-                                      anchors.left: pollOptionCount.right
-                                      anchors.leftMargin: Style.space(5)
-                                      anchors.verticalCenter: parent.verticalCenter
-                                      width: pollVoteSummary.avatarStackWidth
-                                      height: pollVoteSummary.avatarSize
-
-                                      Repeater {
-                                        model: pollOption.voterJids
-
-                                        delegate: Avatar {
-                                          required property var modelData
-                                          required property int index
-                                          objectName: "pollVoterAvatar-"
-                                            + String(messageDelegate.modelData.id || "")
-                                            + "-" + String(pollOption.index)
-                                            + "-" + String(index)
-                                          imageObjectName: "pollVoterImage-"
-                                            + String(messageDelegate.modelData.id || "")
-                                            + "-" + String(pollOption.index)
-                                            + "-" + String(index)
-                                          x: index * pollVoteSummary.avatarStride
-                                          z: pollOption.voterJids.length - index
-                                          service: root.service
-                                          jid: String(modelData || "")
-                                          name: root.pollVoterName(
-                                            String(modelData || ""))
-                                          size: pollVoteSummary.avatarSize
-                                          initialsPixelSize: Math.max(7,
-                                            root.messageMetaFontSize - 2)
-                                          fontFamily: root.fontFamily
-                                          foreground: root.foreground
-                                          accent: root.accent
-                                          devicePixelRatio: root.devicePixelRatio
-                                          requestOnLoad: true
-                                        }
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-
-                              Text {
-                                width: parent.width
-                                text: pollCard.ended ? "Poll ended"
-                                  : (pollCard.totalVoters === 1 ? "1 vote"
-                                    : pollCard.totalVoters + " votes")
-                                color: pollCard.ended ? Color.urgent : root.sidebarSecondary
-                                font.family: root.fontFamily
-                                font.pixelSize: root.messageMetaFontSize
-                              }
-                            }
+                            panel: root
+                            service: root.service
+                            message: modelData
+                            media: messageDelegate.mediaData
+                            active: messageDelegate.isPoll
+                            messageId: String(modelData.id || "")
+                            bubbleRadius: bubble.radius
+                            fontFamily: root.fontFamily
+                            metaFontSize: root.messageMetaFontSize
+                            foreground: root.foreground
+                            accent: root.accent
+                            secondary: root.sidebarSecondary
+                            devicePixelRatio: root.devicePixelRatio
                           }
-                          Item {
+                          StickerCard {
                             id: stickerCard
                             objectName: "stickerCard-" + String(modelData.id || "")
-                            readonly property bool active: messageDelegate.isSticker
-                            readonly property bool downloaded:
-                              messageDelegate.mediaData
-                              ? messageDelegate.mediaData.downloaded === true : false
-                            readonly property bool lottie: messageDelegate.mediaData
-                              ? messageDelegate.mediaData.lottie === true : false
-                            readonly property string mediaPath:
-                              messageDelegate.mediaData
-                              ? String(messageDelegate.mediaData.path || "") : ""
-                            readonly property string thumbnailPath:
-                              messageDelegate.mediaData
-                              ? String(messageDelegate.mediaData.thumbnail_path || "") : ""
-                            readonly property string displayPath: downloaded
-                              ? mediaPath : thumbnailPath
-                            visible: active
+                            imageObjectName: "stickerImage-"
+                              + String(modelData.id || "")
+                            statusObjectName: "stickerDownloadStatus-"
+                              + String(modelData.id || "")
                             width: parent.width
-                            height: active ? width / bubble.stickerAspectRatio : 0
-
-                            AnimatedImage {
-                              id: stickerImage
-                              objectName: "stickerImage-" + String(modelData.id || "")
-                              anchors.fill: parent
-                              source: stickerCard.active && root.service
-                                ? root.service.fileUrl(stickerCard.displayPath,
-                                  root.service.messageMediaRevision(modelData)) : ""
-                              asynchronous: true
-                              cache: false
-                              fillMode: Image.PreserveAspectFit
-                              onStatusChanged: {
-                                if (status === AnimatedImage.Ready)
-                                  root.scheduleMediaDownloadAnchorRestore(
-                                    modelData.id)
-                              }
-                            }
-
-                            Text {
-                              anchors.centerIn: parent
-                              width: parent.width
-                              visible: String(stickerImage.source) === ""
-                                || stickerImage.status === AnimatedImage.Error
-                              text: messageDelegate.mediaData
-                                && messageDelegate.mediaData.accessibility_label
-                                ? String(messageDelegate.mediaData.accessibility_label)
-                                : (stickerCard.lottie
-                                  ? "Lottie sticker unavailable" : "Sticker unavailable")
-                              color: root.muted
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
-                              wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-                              horizontalAlignment: Text.AlignHCenter
-                            }
-
-                            Text {
-                              anchors.right: parent.right
-                              anchors.bottom: parent.bottom
-                              anchors.margins: Style.space(4)
-                              visible: stickerCard.lottie
-                                && stickerImage.status === AnimatedImage.Ready
-                              text: "Animated sticker"
-                              color: root.foreground
-                              font.family: root.fontFamily
-                              font.pixelSize: root.messageMetaFontSize
-                            }
-
-                            Text {
-                              objectName: "stickerDownloadStatus-"
-                                + String(modelData.id || "")
-                              readonly property bool active: stickerCard.active
-                                && !stickerCard.lottie && !stickerCard.downloaded
-                                && root.service
-                                && root.service.mediaDownloading(modelData)
-                              anchors.centerIn: parent
-                              visible: active
-                              text: "󰔟"
-                              color: root.foreground
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.icon * 1.5
-                            }
+                            panel: root
+                            service: root.service
+                            message: modelData
+                            media: messageDelegate.mediaData
+                            active: messageDelegate.isSticker
+                            aspectRatio: bubble.stickerAspectRatio
+                            fontFamily: root.fontFamily
+                            metaFontSize: root.messageMetaFontSize
+                            foreground: root.foreground
+                            muted: root.muted
                           }
-                          Item {
+                          MediaPreviewCard {
                             id: mediaPreviewCard
                             objectName: "mediaPreviewCard-"
                               + String(modelData.id || "")
-                            readonly property bool isImage:
-                              messageDelegate.mediaData
-                              && messageDelegate.mediaData.kind === "image"
-                            property alias videoSurface: inlineVideoOutput
-                            readonly property bool isVideo: messageDelegate.mediaData
-                              && messageDelegate.mediaData.kind === "video"
-                            readonly property bool isGif: isVideo
-                              && messageDelegate.mediaData.gif_playback === true
-                            readonly property real topMargin: Style.space(8)
-                            readonly property bool downloaded: messageDelegate.mediaData
-                              ? messageDelegate.mediaData.downloaded === true : false
-                            readonly property string mediaPath: messageDelegate.mediaData
-                              ? String(messageDelegate.mediaData.path || "") : ""
-                            readonly property string thumbnailPath: messageDelegate.mediaData
-                              ? String(messageDelegate.mediaData.thumbnail_path || "") : ""
-                            readonly property string displayPath: isVideo
-                              ? thumbnailPath
-                              : (downloaded ? mediaPath : thumbnailPath)
-                            readonly property bool inlineActive:
-                              root.activeInlineVideoCard === mediaPreviewCard
-                            readonly property bool inlinePlaying: inlineActive
-                              && inlineVideoPlayer.playbackState === MediaPlayer.PlayingState
-                            visible: messageDelegate.mediaData
-                              && (messageDelegate.mediaData.kind === "image"
-                                || messageDelegate.mediaData.kind === "video")
+                            maskObjectName: "mediaPreviewMask-"
+                              + String(modelData.id || "")
+                            imageObjectName: "mediaPreviewImage-"
+                              + String(modelData.id || "")
+                            downloadButtonObjectName: "mediaDownloadButton-"
+                              + String(modelData.id || "")
                             width: parent.width
-                            height: visible && messageDelegate.mediaData
-                              ? topMargin + width / (isVideo
-                                  ? bubble.mediaAspectRatio
-                                  : bubble.imageAspectRatio)
-                              : 0
-
-                            Rectangle {
-                              id: mediaPreviewMask
-                              objectName: "mediaPreviewMask-"
-                                + String(modelData.id || "")
-                              anchors.fill: parent
-                              anchors.topMargin: mediaPreviewCard.topMargin
-                              radius: bubble.radius
-                              visible: false
-                              layer.enabled: true
-                            }
-
-                            Image {
-                              id: mediaPreviewImage
-                              objectName: "mediaPreviewImage-"
-                                + String(modelData.id || "")
-                              anchors.fill: parent
-                              anchors.topMargin: mediaPreviewCard.topMargin
-                              visible: !mediaPreviewCard.inlineActive
-                              source: mediaPreviewCard.visible && root.service
-                                ? root.service.fileUrl(
-                                  mediaPreviewCard.displayPath,
-                                  root.service.messageMediaRevision(modelData)) : ""
-                              asynchronous: true
-                              cache: false
-                              fillMode: Image.PreserveAspectFit
-                              layer.enabled: mediaPreviewCard.isImage
-                              layer.smooth: true
-                              layer.effect: MultiEffect {
-                                maskEnabled: true
-                                maskSource: mediaPreviewMask
-                                maskThresholdMin: 0.5
-                                maskSpreadAtMin: 1.0
-                              }
-                              onStatusChanged: {
-                                if (status === Image.Ready)
-                                  root.scheduleMediaDownloadAnchorRestore(
-                                    modelData.id)
-                              }
-                            }
-
-                            VideoOutput {
-                              id: inlineVideoOutput
-                              anchors.fill: parent
-                              anchors.topMargin: mediaPreviewCard.topMargin
-                              visible: mediaPreviewCard.inlineActive
-                              fillMode: VideoOutput.PreserveAspectFit
-                              endOfStreamPolicy: VideoOutput.KeepLastFrame
-                            }
-
-                            HoverHandler {
-                              id: mediaPreviewHover
-                            }
-
-                            MouseArea {
-                              anchors.fill: parent
-                              anchors.topMargin: mediaPreviewCard.topMargin
-                              enabled: mediaPreviewCard.downloaded
-                              cursorShape: enabled
-                                ? Qt.PointingHandCursor : Qt.ArrowCursor
-                              onClicked: {
-                                if (mediaPreviewCard.isVideo)
-                                  root.toggleInlineVideo(mediaPreviewCard)
-                                else if (root.service)
-                                  root.openImagePreview(
-                                    mediaPreviewCard.mediaPath,
-                                    root.service.messageMediaRevision(modelData))
-                              }
-                            }
-
-                            Text {
-                              anchors.centerIn: parent
-                              anchors.verticalCenterOffset:
-                                mediaPreviewCard.topMargin / 2
-                              visible: mediaPreviewCard.isVideo
-                                && !mediaPreviewCard.inlineActive
-                                && mediaPreviewImage.status !== Image.Ready
-                              text: "󰕧"
-                              color: root.muted
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.displayLarge
-                            }
-
-                            CrispButton {
-                              objectName: "mediaDownloadButton-"
-                                + String(modelData.id || "")
-                              readonly property bool downloading: visible
-                                && root.service
-                                && root.service.mediaDownloading(modelData)
-
-                              anchors.centerIn: parent
-                              anchors.verticalCenterOffset:
-                                mediaPreviewCard.topMargin / 2
-                              visible: messageDelegate.mediaData
-                                && mediaPreviewCard.visible
-                                && (mediaPreviewCard.isVideo
-                                  || !mediaPreviewCard.downloaded)
-                              opacity: mediaPreviewCard.isVideo
-                                && mediaPreviewCard.downloaded
-                                ? (mediaPreviewHover.hovered ? 1 : 0) : 1
-                              width: Style.space(40)
-                              height: Style.space(40)
-                              iconSize: Style.font.icon * 1.5
-                              iconText: downloading ? "󰔟"
-                                : (mediaPreviewCard.isVideo
-                                  && mediaPreviewCard.downloaded
-                                  ? (mediaPreviewCard.inlinePlaying ? "󰏤" : "󰐊")
-                                  : "󰇚")
-                              tooltipText: downloading
-                                ? "Downloading media"
-                                : (mediaPreviewCard.isVideo
-                                  ? (mediaPreviewCard.downloaded
-                                    ? (mediaPreviewCard.inlinePlaying
-                                      ? (mediaPreviewCard.isGif ? "Pause GIF" : "Pause video")
-                                      : (mediaPreviewCard.isGif ? "Play GIF" : "Play video"))
-                                    : (mediaPreviewCard.isGif ? "Download GIF" : "Download video"))
-                                  : "Download full image")
-                              foreground: root.foreground
-                              accent: root.accent
-                              enabled: visible && root.service && !downloading
-                                && (!mediaPreviewCard.isVideo
-                                  || !mediaPreviewCard.downloaded
-                                  || mediaPreviewHover.hovered)
-
-                              Behavior on opacity {
-                                NumberAnimation {
-                                  duration: 140
-                                  easing.type: Easing.OutCubic
-                                }
-                              }
-
-                              onClicked: {
-                                if (mediaPreviewCard.isVideo
-                                    && mediaPreviewCard.downloaded)
-                                  root.toggleInlineVideo(mediaPreviewCard)
-                                else
-                                  root.downloadMedia(modelData, messageDelegate)
-                              }
-                            }
-
-                            Component.onDestruction:
-                              root.stopInlineVideo(mediaPreviewCard)
+                            panel: root
+                            service: root.service
+                            player: inlineVideoPlayer
+                            message: modelData
+                            media: messageDelegate.mediaData
+                            delegateItem: messageDelegate
+                            maskRadius: bubble.radius
+                            mediaAspectRatio: bubble.mediaAspectRatio
+                            fontFamily: root.fontFamily
+                            foreground: root.foreground
+                            muted: root.muted
+                            accent: root.accent
+                            devicePixelRatio: root.devicePixelRatio
                           }
-                          Item {
+                          VoiceMessageCard {
                             id: voiceMessageCard
-                            readonly property bool downloaded:
-                              messageDelegate.mediaData
-                              ? messageDelegate.mediaData.downloaded === true : false
-                            readonly property string mediaPath:
-                              messageDelegate.mediaData
-                              ? String(messageDelegate.mediaData.path || "") : ""
-                            readonly property bool active:
-                              root.activeVoiceMessageCard === voiceMessageCard
-                            readonly property bool playing: active
-                              && voiceMessagePlayer.playbackState
-                                === MediaPlayer.PlayingState
-                            readonly property real totalSeconds: Math.max(0,
-                              Number(messageDelegate.mediaData
-                                ? messageDelegate.mediaData.duration_seconds || 0 : 0))
-                            readonly property real elapsedSeconds: active
-                              ? Math.max(0, Number(voiceMessagePlayer.position || 0) / 1000)
-                              : 0
-                            readonly property real progress: active
-                              && voiceMessagePlayer.duration > 0
-                              ? Math.min(1, voiceMessagePlayer.position
-                                / voiceMessagePlayer.duration) : 0
-
-                            visible: messageDelegate.mediaData
-                              && messageDelegate.mediaData.kind === "audio"
+                            objectName: "voiceMessageCard-"
+                              + String(modelData.id || "")
                             width: parent.width
-                            height: visible ? Style.space(48) : 0
-
-                            CrispButton {
-                              id: voiceMessageButton
-                              readonly property bool downloading: visible
-                                && root.service
-                                && root.service.mediaDownloading(modelData)
-
-                              anchors.left: parent.left
-                              anchors.verticalCenter: parent.verticalCenter
-                              width: Style.space(40)
-                              height: Style.space(40)
-                              iconText: downloading ? "󰔟"
-                                : (voiceMessageCard.downloaded
-                                  ? (voiceMessageCard.playing ? "󰏤" : "󰐊")
-                                  : "󰇚")
-                              tooltipText: downloading ? "Downloading voice message"
-                                : (voiceMessageCard.downloaded
-                                  ? (voiceMessageCard.playing
-                                    ? "Pause voice message" : "Play voice message")
-                                  : "Download voice message")
-                              foreground: root.foreground
-                              accent: root.accent
-                              enabled: root.service && !downloading
-
-                              onClicked: {
-                                if (voiceMessageCard.downloaded)
-                                  root.toggleVoiceMessage(voiceMessageCard)
-                                else
-                                  root.downloadMedia(modelData, messageDelegate)
-                              }
-                            }
-
-                            Column {
-                              anchors.left: voiceMessageButton.right
-                              anchors.right: parent.right
-                              anchors.leftMargin: Style.space(10)
-                              anchors.verticalCenter: parent.verticalCenter
-                              spacing: Style.space(6)
-
-                              Text {
-                                width: parent.width
-                                text: messageDelegate.mediaData
-                                  && messageDelegate.mediaData.voice_message === false
-                                  ? "Audio" : "Voice message"
-                                color: root.foreground
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.body
-                                font.bold: true
-                                elide: Text.ElideRight
-                              }
-
-                              Item {
-                                width: parent.width
-                                height: Math.max(voiceDuration.implicitHeight,
-                                  Style.space(8))
-
-                                Rectangle {
-                                  id: voiceProgressTrack
-                                  anchors.left: parent.left
-                                  anchors.right: voiceDuration.left
-                                  anchors.rightMargin: Style.space(10)
-                                  anchors.verticalCenter: parent.verticalCenter
-                                  height: Math.max(2, Style.normalBorderWidth)
-                                  radius: height / 2
-                                  color: Style.normalBorderFor(
-                                    root.foreground, root.accent)
-
-                                  Rectangle {
-                                    width: parent.width * voiceMessageCard.progress
-                                    height: parent.height
-                                    radius: parent.radius
-                                    color: root.accent
-                                  }
-
-                                  MouseArea {
-                                    anchors.fill: parent
-                                    enabled: voiceMessageCard.active
-                                      && voiceMessagePlayer.duration > 0
-                                    cursorShape: enabled
-                                      ? Qt.PointingHandCursor : Qt.ArrowCursor
-                                    onClicked: function(mouse) {
-                                      voiceMessagePlayer.position = Math.round(
-                                        mouse.x / width * voiceMessagePlayer.duration)
-                                    }
-                                  }
-                                }
-
-                                Text {
-                                  id: voiceDuration
-                                  anchors.right: parent.right
-                                  anchors.verticalCenter: parent.verticalCenter
-                                  text: Model.mediaDuration(voiceMessageCard.active
-                                    ? voiceMessageCard.elapsedSeconds
-                                    : voiceMessageCard.totalSeconds)
-                                  color: root.timestamp
-                                  font.family: root.fontFamily
-                                  font.pixelSize: root.messageMetaFontSize
-                                }
-                              }
-                            }
-
-                            Component.onDestruction:
-                              root.stopVoiceMessage(voiceMessageCard)
+                            panel: root
+                            service: root.service
+                            player: voiceMessagePlayer
+                            message: modelData
+                            media: messageDelegate.mediaData
+                            delegateItem: messageDelegate
+                            fontFamily: root.fontFamily
+                            metaFontSize: root.messageMetaFontSize
+                            foreground: root.foreground
+                            accent: root.accent
+                            timestamp: root.timestamp
+                            devicePixelRatio: root.devicePixelRatio
                           }
-                          Item {
+                          DocumentCard {
                             id: documentCard
-                            visible: messageDelegate.mediaData
-                              && messageDelegate.mediaData.kind === "document"
+                            objectName: "documentCard-"
+                              + String(modelData.id || "")
                             width: parent.width
-                            height: visible ? Math.max(
-                              documentIcon.implicitHeight,
-                              documentTextColumn.implicitHeight,
-                              Style.space(34)) : 0
-
-                            Text {
-                              id: documentIcon
-                              anchors.left: parent.left
-                              anchors.verticalCenter: parent.verticalCenter
-                              text: "󰈙"
-                              color: root.muted
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.displayLarge
-                            }
-                            Column {
-                              id: documentTextColumn
-                              anchors.left: documentIcon.right
-                              anchors.right: documentOpenButton.left
-                              anchors.leftMargin: Style.space(10)
-                              anchors.rightMargin: Style.space(8)
-                              anchors.verticalCenter: parent.verticalCenter
-                              spacing: Style.space(3)
-                              Text {
-                                width: parent.width
-                                text: String(messageDelegate.mediaData
-                                  ? messageDelegate.mediaData.file_name || "Document"
-                                  : "Document")
-                                color: root.foreground
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.body
-                                font.bold: true
-                                elide: Text.ElideMiddle
-                              }
-                              Text {
-                                width: parent.width
-                                text: messageDelegate.mediaData
-                                  ? Model.documentDetails(
-                                    messageDelegate.mediaData.mime_type,
-                                    messageDelegate.mediaData.file_size,
-                                    messageDelegate.mediaData.page_count) : "Document"
-                                color: root.foreground
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.caption
-                                elide: Text.ElideRight
-                              }
-                            }
-                            CrispButton {
-                              id: documentOpenButton
-                              anchors.right: documentSaveButton.left
-                              anchors.rightMargin: Style.space(4)
-                              anchors.verticalCenter: parent.verticalCenter
-                              width: Style.space(34)
-                              height: Style.space(34)
-                              iconText: "󰏌"
-                              tooltipText: "Open document"
-                              foreground: root.foreground
-                              accent: root.accent
-                              bordered: false
-                              onClicked: if (root.service) root.service.openFile(
-                                messageDelegate.mediaData.path)
-                            }
-                            CrispButton {
-                              id: documentSaveButton
-                              anchors.right: parent.right
-                              anchors.verticalCenter: parent.verticalCenter
-                              width: Style.space(34)
-                              height: Style.space(34)
-                              iconText: "󰇚"
-                              tooltipText: "Save to Downloads"
-                              foreground: root.foreground
-                              accent: root.accent
-                              bordered: false
-                              onClicked: if (root.service) root.service.saveFile(
-                                messageDelegate.mediaData.path,
-                                messageDelegate.mediaData.file_name)
-                            }
+                            service: root.service
+                            media: messageDelegate.mediaData
+                            fontFamily: root.fontFamily
+                            foreground: root.foreground
+                            muted: root.muted
+                            accent: root.accent
+                            devicePixelRatio: root.devicePixelRatio
                           }
-                          Rectangle {
+                          LocationCard {
                             id: locationCard
-                            readonly property real liveUntil: {
-                              if (!messageDelegate.mediaData
-                                  || messageDelegate.mediaData.live !== true) return 0
-                              var exact = Number(
-                                messageDelegate.mediaData.live_until || 0)
-                              if (exact > 0) return exact
-                              var started = Number(
-                                messageDelegate.mediaData.updated_at
-                                || modelData.timestamp || 0)
-                              var duration = Number(
-                                messageDelegate.mediaData.duration_seconds || 0)
-                              return started > 0 ? started + duration : 0
-                            }
-                            visible: messageDelegate.mediaData
-                              && messageDelegate.mediaData.kind === "location"
+                            objectName: "locationCard-"
+                              + String(modelData.id || "")
                             width: parent.width
-                            height: visible ? Style.space(120) : 0
-                            radius: 0
-                            clip: true
-                            color: Style.normalFillFor(root.foreground, root.accent)
-
-                            Image {
-                              anchors.fill: parent
-                              source: visible && root.service
-                                && messageDelegate.mediaData.thumbnail_path
-                                ? root.service.fileUrl(
-                                  messageDelegate.mediaData.thumbnail_path)
-                                  + "?revision=" + String(
-                                    messageDelegate.mediaData.updated_at || 0) : ""
-                              asynchronous: true
-                              cache: false
-                              fillMode: Image.PreserveAspectCrop
-                              smooth: true
-                              mipmap: true
-                              opacity: status === Image.Ready ? 1 : 0
-                            }
-
-                            Rectangle {
-                              anchors.left: parent.left
-                              anchors.right: parent.right
-                              anchors.bottom: parent.bottom
-                              height: Style.space(72)
-                              gradient: Gradient {
-                                GradientStop {
-                                  position: 0
-                                  color: "transparent"
-                                }
-                                GradientStop {
-                                  position: 1
-                                  color: Qt.rgba(root.background.r,
-                                    root.background.g, root.background.b, 0.9)
-                                }
-                              }
-                            }
-
-                            HoverHandler {
-                              id: locationHover
-                            }
-
-                            Row {
-                              anchors.left: parent.left
-                              anchors.bottom: parent.bottom
-                              anchors.margins: Style.space(10)
-                              spacing: Style.space(7)
-                              width: Math.max(0, parent.width - Style.space(20)
-                                - (liveRemainingLabel.visible
-                                  ? liveRemainingLabel.width + Style.space(10) : 0))
-
-                              Text {
-                                anchors.bottom: parent.bottom
-                                text: "󰍎"
-                                color: root.foreground
-                                font.family: root.fontFamily
-                                font.pixelSize: Style.font.icon
-                              }
-
-                              Column {
-                                anchors.bottom: parent.bottom
-                                width: parent.width - Style.space(7)
-                                  - Style.font.icon
-                                spacing: Style.space(1)
-
-                                Text {
-                                  width: parent.width
-                                  text: String(messageDelegate.mediaData
-                                    ? (messageDelegate.mediaData.name
-                                      || messageDelegate.mediaData.address)
-                                      || (messageDelegate.mediaData.live
-                                        ? "Live location" : "Location")
-                                    : "Location")
-                                  color: root.foreground
-                                  font.family: root.fontFamily
-                                  font.pixelSize: Style.font.body
-                                  font.bold: true
-                                  elide: Text.ElideRight
-                                }
-                                Text {
-                                  visible: messageDelegate.mediaData
-                                    && String(messageDelegate.mediaData.name
-                                      || "").length > 0
-                                    && String(messageDelegate.mediaData.address
-                                      || "").length > 0
-                                  width: parent.width
-                                  text: visible
-                                    ? String(messageDelegate.mediaData.address) : ""
-                                  color: root.muted
-                                  font.family: root.fontFamily
-                                  font.pixelSize: Style.font.caption
-                                  elide: Text.ElideRight
-                                }
-                              }
-                            }
-
-                            Text {
-                              id: liveRemainingLabel
-                              visible: messageDelegate.mediaData
-                                && messageDelegate.mediaData.live === true
-                              anchors.right: parent.right
-                              anchors.bottom: parent.bottom
-                              anchors.margins: Style.space(10)
-                              text: !visible ? ""
-                                : locationCard.liveUntil > 0
-                                  ? root.remainingTimeLabel(locationCard.liveUntil)
-                                  : "Updated " + Model.messageTime(
-                                    messageDelegate.mediaData.updated_at,
-                                    root.messageTimeFormat)
-                              color: root.foreground
-                              font.family: root.fontFamily
-                              font.pixelSize: Style.font.caption
-                              font.bold: true
-                            }
-
-                            MouseArea {
-                              anchors.fill: parent
-                              cursorShape: Qt.PointingHandCursor
-                              z: 1
-                              onClicked: if (root.service) root.service.openMap(
-                                messageDelegate.mediaData.latitude_e7,
-                                messageDelegate.mediaData.longitude_e7)
-                            }
-
-                            CrispButton {
-                              anchors.centerIn: parent
-                              visible: locationCard.visible
-                              opacity: locationHover.hovered ? 1 : 0
-                              width: Style.space(40)
-                              height: Style.space(40)
-                              iconSize: Style.font.icon * 1.5
-                              iconText: "󰏌"
-                              tooltipText: "Open map"
-                              foreground: root.foreground
-                              accent: root.accent
-                              enabled: locationHover.hovered && root.service
-                              z: 2
-
-                              Behavior on opacity {
-                                NumberAnimation {
-                                  duration: 140
-                                  easing.type: Easing.OutCubic
-                                }
-                              }
-
-                              onClicked: root.service.openMap(
-                                messageDelegate.mediaData.latitude_e7,
-                                messageDelegate.mediaData.longitude_e7)
-                            }
+                            panel: root
+                            service: root.service
+                            media: messageDelegate.mediaData
+                            messageTimestamp: Number(modelData.timestamp || 0)
+                            messageTimeFormat: root.messageTimeFormat
+                            fontFamily: root.fontFamily
+                            foreground: root.foreground
+                            background: root.background
+                            muted: root.muted
+                            accent: root.accent
+                            devicePixelRatio: root.devicePixelRatio
                           }
                         }
 
@@ -3578,195 +2783,28 @@ Item {
                           }
                         }
 
-                          QQC.Popup {
-                            id: reactionPicker
+                        ReactionPicker {
+                          id: reactionPicker
 
-                            property bool waitingForEmojiPicker: false
-                            readonly property var popupBorderSpec:
-                              Border.localOrSurfaceSpec("popups", "border",
-                                Color.popups.border, Color.popups.border,
-                                Math.max(1, Style.normalBorderWidth))
-
-                            function openOmarchyEmojiPicker() {
-                              waitingForEmojiPicker = true
-                              emojiPasteTarget.text = ""
-                              emojiPasteTarget.forceActiveFocus()
-                              Qt.callLater(function() {
-                                if (!root.shell
-                                    || typeof root.shell.summon !== "function"
-                                    || !root.shell.summon("omarchy.emojis", "{}"))
-                                  reactionPicker.waitingForEmojiPicker = false
-                              })
-                            }
-
-                            function acceptEmojiPickerText() {
-                              var value = emojiPasteTarget.text.trim()
-                              if (!waitingForEmojiPicker || !value) return
-                              waitingForEmojiPicker = false
-                              Qt.callLater(function() {
-                                messageDelegate.toggleReaction(value)
-                              })
-                            }
-
-                            parent: bubble
-                            x: modelData.from_me
-                              ? messageDelegate.reactionPickerX - width
-                              : messageDelegate.reactionPickerX
-                            y: messageDelegate.reactionPickerY + Style.space(4)
-                            width: Style.space(328)
-                            height: reactionPickerColumn.implicitHeight
-                              + topPadding + bottomPadding
-                            margins: Style.space(8)
-                            padding: Style.space(10)
-                            leftPadding: padding + Border.left(popupBorderSpec)
-                            rightPadding: padding + Border.right(popupBorderSpec)
-                            topPadding: padding + Border.top(popupBorderSpec)
-                            bottomPadding: padding + Border.bottom(popupBorderSpec)
-                            modal: false
-                            focus: true
-                            closePolicy: QQC.Popup.CloseOnEscape
-                              | QQC.Popup.CloseOnPressOutsideParent
-
-                            onOpened: {
-                              waitingForEmojiPicker = false
-                              emojiPasteTarget.text = ""
-                            }
-                            onClosed: waitingForEmojiPicker = false
-
-                            background: CrispBorderSurface {
-                              color: Color.popups.background
-                              sourceBorderSpec: reactionPicker.popupBorderSpec
-                              radius: Style.cornerRadius + Style.space(4)
-                            }
-
-                            contentItem: Column {
-                              id: reactionPickerColumn
-                              spacing: Style.space(8)
-
-                              Item {
-                                width: parent.width
-                                height: Math.max(reactionTitle.implicitHeight,
-                                  reactionHint.implicitHeight)
-
-                                Text {
-                                  id: reactionTitle
-                                  anchors.left: parent.left
-                                  anchors.verticalCenter: parent.verticalCenter
-                                  text: "React to message"
-                                  color: Color.popups.text
-                                  font.family: root.fontFamily
-                                  font.pixelSize: Style.font.body
-                                  font.bold: true
-                                }
-                                Text {
-                                  id: reactionHint
-                                  anchors.right: parent.right
-                                  anchors.verticalCenter: parent.verticalCenter
-                                  text: messageDelegate.ownReactionEmoji() !== ""
-                                    ? "Tap selected to remove" : "Choose one"
-                                  color: root.muted
-                                  font.family: root.fontFamily
-                                  font.pixelSize: root.messageMetaFontSize
-                                }
-                              }
-
-                              Row {
-                                id: quickReactionRow
-                                width: parent.width
-                                spacing: Style.space(6)
-
-                                Repeater {
-                                  model: ["👍", "❤️", "😂", "😮", "😢", "🙏"]
-
-                                  delegate: CrispBorderSurface {
-                                    id: quickReaction
-                                    required property string modelData
-                                    readonly property bool selected:
-                                      messageDelegate.ownReactionEmoji() === modelData
-                                    readonly property bool hot: quickReactionHover.hovered
-
-                                    width: (quickReactionRow.width
-                                      - quickReactionRow.spacing * 5) / 6
-                                    height: width
-                                    radius: width / 2
-                                    color: selected
-                                      ? Style.selectedFillFor(root.foreground, root.accent)
-                                      : hot
-                                        ? Style.hoverFillFor(root.foreground, root.accent)
-                                        : "transparent"
-                                    sourceBorderSpec: selected
-                                      ? Border.controlSpec("selected",
-                                        root.foreground, root.accent)
-                                      : hot
-                                        ? Border.controlSpec("hover-cursor",
-                                          root.foreground, root.accent)
-                                        : Border.none()
-
-                                    Behavior on color {
-                                      ColorAnimation { duration: 100 }
-                                    }
-
-                                    Text {
-                                      anchors.centerIn: parent
-                                      text: quickReaction.modelData
-                                      font.pixelSize: Style.font.display
-                                      scale: quickReaction.hot ? 1.08 : 1
-
-                                      Behavior on scale {
-                                        NumberAnimation {
-                                          duration: 100
-                                          easing.type: Easing.OutCubic
-                                        }
-                                      }
-                                    }
-                                    HoverHandler { id: quickReactionHover }
-                                    MouseArea {
-                                      anchors.fill: parent
-                                      cursorShape: Qt.PointingHandCursor
-                                      onClicked: messageDelegate.toggleReaction(
-                                        quickReaction.modelData)
-                                    }
-                                  }
-                                }
-                              }
-
-                              Rectangle {
-                                width: parent.width
-                                height: Math.max(1, Style.normalBorderWidth)
-                                color: Style.normalBorderFor(
-                                  root.foreground, root.accent)
-                              }
-
-                              Item {
-                                width: parent.width
-                                height: Style.space(36)
-
-                                CrispTextField {
-                                  id: emojiPasteTarget
-                                  anchors.left: parent.left
-                                  anchors.bottom: parent.bottom
-                                  width: 1
-                                  height: 1
-                                  opacity: 0
-                                  activeFocusOnTab: false
-                                  onTextChanged:
-                                    reactionPicker.acceptEmojiPickerText()
-                                }
-                                CrispButton {
-                                  anchors.fill: parent
-                                  iconText: ""
-                                  text: reactionPicker.waitingForEmojiPicker
-                                    ? "Choose an emoji…" : "Choose any emoji"
-                                  tooltipText: "Open the Omarchy emoji picker"
-                                  foreground: Color.popups.text
-                                  accent: root.accent
-                                  bordered: true
-                                  onClicked:
-                                    reactionPicker.openOmarchyEmojiPicker()
-                                }
-                              }
-                            }
+                          objectName: "reactionPicker-"
+                            + String(modelData.id || "")
+                          parent: bubble
+                          x: modelData.from_me
+                            ? messageDelegate.reactionPickerX - width
+                            : messageDelegate.reactionPickerX
+                          y: messageDelegate.reactionPickerY + Style.space(4)
+                          shell: root.shell
+                          ownReactionEmoji: messageDelegate.ownReactionEmoji()
+                          fontFamily: root.fontFamily
+                          metaFontSize: root.messageMetaFontSize
+                          foreground: root.foreground
+                          muted: root.muted
+                          accent: root.accent
+                          devicePixelRatio: root.devicePixelRatio
+                          onReactionChosen: function (emoji) {
+                            messageDelegate.toggleReaction(emoji)
                           }
+                        }
                       }
 
                       Row {
@@ -3828,113 +2866,14 @@ Item {
                             hoverEnabled: true
                           }
 
-                          QQC.ToolTip {
+                          ReceiptTooltip {
                             id: messageReceiptTooltipPopup
                             objectName: "messageReceiptTooltip-"
                               + String(modelData.id || "")
-                            readonly property color tooltipBackground:
-                              Color.tooltip.background
-                            readonly property color tooltipForeground:
-                              Color.tooltip.text
-                            readonly property color tooltipBorder:
-                              Color.tooltip.border
-                            readonly property var tooltipBorderSpec:
-                              Border.localOrSurfaceSpec("tooltip", "border",
-                                tooltipBorder, Color.tooltip.border,
-                                Math.max(1, Style.normalBorderWidth))
                             visible: messageReceiptHoverArea.containsMouse
                             text: messageReceiptStatus.receiptTooltipText
-                            delay: 400
-                            timeout: -1
-                            padding: 0
-
-                            background: BorderSurface {
-                              color: messageReceiptTooltipPopup.tooltipBackground
-                              borderSpec:
-                                messageReceiptTooltipPopup.tooltipBorderSpec
-                              radius: 0
-                            }
-
-                            contentItem: Item {
-                              id: messageReceiptTooltipBody
-                              readonly property var groups:
-                                messageReceiptStatus.receiptTooltipGroups
-                              readonly property color headerColor: Qt.rgba(
-                                messageReceiptTooltipPopup.tooltipForeground.r,
-                                messageReceiptTooltipPopup.tooltipForeground.g,
-                                messageReceiptTooltipPopup.tooltipForeground.b,
-                                messageReceiptTooltipPopup.tooltipForeground.a
-                                  * 0.72)
-                              readonly property color detailColor:
-                                messageReceiptTooltipPopup.tooltipForeground
-                              readonly property real groupSpacing: Style.space(6)
-                              readonly property string contentFontFamily:
-                                root.fontFamily
-                              readonly property real contentFontSize:
-                                Style.font.bodySmall
-                              readonly property real leftInset: Border.left(
-                                messageReceiptTooltipPopup.tooltipBorderSpec)
-                                + Style.spacing.controlPaddingX
-                              readonly property real rightInset: Border.right(
-                                messageReceiptTooltipPopup.tooltipBorderSpec)
-                                + Style.spacing.controlPaddingX
-                              readonly property real topInset: Border.top(
-                                messageReceiptTooltipPopup.tooltipBorderSpec)
-                                + Style.spacing.controlPaddingY
-                              readonly property real bottomInset: Border.bottom(
-                                messageReceiptTooltipPopup.tooltipBorderSpec)
-                                + Style.spacing.controlPaddingY
-
-                              implicitWidth:
-                                messageReceiptTooltipContent.implicitWidth
-                                + leftInset + rightInset
-                              implicitHeight:
-                                messageReceiptTooltipContent.implicitHeight
-                                  + topInset + bottomInset
-
-                              Column {
-                                id: messageReceiptTooltipContent
-                                x: parent.leftInset
-                                y: parent.topInset
-                                spacing: messageReceiptTooltipBody.groupSpacing
-
-                                Repeater {
-                                  model: messageReceiptTooltipBody.groups
-
-                                  delegate: Column {
-                                    required property var modelData
-                                    spacing: 0
-
-                                    Text {
-                                      text: parent.modelData.label
-                                      textFormat: Text.PlainText
-                                      color:
-                                        messageReceiptTooltipBody.headerColor
-                                      font.family: messageReceiptTooltipBody
-                                        .contentFontFamily
-                                      font.pixelSize: messageReceiptTooltipBody
-                                        .contentFontSize
-                                    }
-
-                                    Repeater {
-                                      model: parent.modelData.entries
-
-                                      delegate: Text {
-                                        required property var modelData
-                                        text: String(modelData || "")
-                                        textFormat: Text.PlainText
-                                        color:
-                                          messageReceiptTooltipBody.detailColor
-                                        font.family: messageReceiptTooltipBody
-                                          .contentFontFamily
-                                        font.pixelSize: messageReceiptTooltipBody
-                                          .contentFontSize
-                                      }
-                                    }
-                                  }
-                                }
-                              }
-                            }
+                            groups: messageReceiptStatus.receiptTooltipGroups
+                            fontFamily: root.fontFamily
                           }
                         }
 
