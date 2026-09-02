@@ -1274,22 +1274,6 @@ impl Database {
         })
     }
 
-    pub fn insert_history_message(
-        &self,
-        message: &Message,
-        chat_name: &str,
-        is_group: bool,
-    ) -> Result<bool> {
-        self.insert_message_inner(&MessageInsert {
-            message,
-            chat_name,
-            is_group,
-            increment_unread: false,
-            from_history: true,
-            read_intent: None,
-        })
-    }
-
     fn insert_message_inner(&self, insert: &MessageInsert<'_>) -> Result<bool> {
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
@@ -1545,24 +1529,13 @@ impl Database {
         Ok(())
     }
 
-    pub fn insert_history_chat(&self, chat: &Chat) -> Result<()> {
-        let mut connection = self.connection();
-        let transaction = connection.transaction()?;
-        Self::insert_history_chat_into(&transaction, chat)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
     /// Persists one replayed conversation and its messages in a single
     /// transaction, so a history sync costs one durable commit per conversation
     /// instead of one per message. The per-message rules are identical to
-    /// [`Self::insert_history_chat`], [`Self::update_contact_name`],
-    /// [`Self::insert_history_message`], and [`Self::update_message_media`]
-    /// applied in slice order; retention pruning runs once at the end. Returns
-    /// whether any message was stored or had its media completed.
-    // The history ingester still calls the per-message methods; drop this
-    // allowance once it switches to the batch entry point.
-    #[allow(dead_code)]
+    /// [`Self::update_contact_name`] and [`Self::update_message_media`] applied
+    /// in slice order over the replayed chat; retention pruning runs once at
+    /// the end. Returns whether any message was stored or had its media
+    /// completed.
     pub fn insert_history_conversation(&self, chat: &Chat, messages: &[Message]) -> Result<bool> {
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
@@ -3237,6 +3210,36 @@ impl Database {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    // Single-row entry points into the replay path. Production history
+    // ingestion commits a whole conversation at once through
+    // `insert_history_conversation`, while these tests assert one chat or one
+    // message at a time.
+    impl Database {
+        fn insert_history_chat(&self, chat: &Chat) -> Result<()> {
+            let mut connection = self.connection();
+            let transaction = connection.transaction()?;
+            Self::insert_history_chat_into(&transaction, chat)?;
+            transaction.commit()?;
+            Ok(())
+        }
+
+        fn insert_history_message(
+            &self,
+            message: &Message,
+            chat_name: &str,
+            is_group: bool,
+        ) -> Result<bool> {
+            self.insert_message_inner(&MessageInsert {
+                message,
+                chat_name,
+                is_group,
+                increment_unread: false,
+                from_history: true,
+                read_intent: None,
+            })
+        }
+    }
 
     // Models a database written before the schema ladder existed: every such
     // file reports version 0 and receives the whole ladder on the next open.

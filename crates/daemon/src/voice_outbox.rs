@@ -14,6 +14,10 @@ const MIN_DURATION_MS: u64 = 250;
 const MAX_DURATION_MS: u64 = 15 * 60 * 1_000;
 const ORPHAN_TTL_SECONDS: i64 = 24 * 60 * 60;
 const JOB_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+// A send that is still uploading must outlive the retention caps that another
+// recording's preparation applies. `recover_interrupted` turns a `Sending` job
+// that outlived this window into a failed one at startup.
+const ACTIVE_SEND_GRACE_SECONDS: i64 = 15 * 60;
 const MAX_JOBS: usize = 8;
 const MAX_OUTBOX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ERROR_CHARS: usize = 512;
@@ -273,29 +277,49 @@ fn cleanup_inner(outbox_dir: &Path, now: i64, preserve: Option<&str>) -> Result<
 
     let mut retained = Vec::new();
     for job in load_jobs(outbox_dir)? {
-        let audio_size = audio.get(&job.recording_id).map_or(0, |value| value.1);
+        let audio_bytes = audio.get(&job.recording_id).map_or(0, |value| value.1);
         if preserve != Some(job.recording_id.as_str())
             && now.saturating_sub(job.updated_at) > JOB_TTL_SECONDS
         {
             let _ = remove_job_files(outbox_dir, &job.recording_id);
         } else {
-            retained.push((job.created_at, job.recording_id, audio_size));
+            retained.push(RetainedJob {
+                created_at: job.created_at,
+                actively_sending: is_actively_sending(&job, now),
+                recording_id: job.recording_id,
+                audio_bytes,
+            });
         }
     }
-    retained.sort_by_key(|value| value.0);
-    let mut total_bytes: u64 = retained.iter().map(|value| value.2).sum();
+    retained.sort_by_key(|job| job.created_at);
+    let mut total_bytes: u64 = retained.iter().map(|job| job.audio_bytes).sum();
     while retained.len() > MAX_JOBS || total_bytes > MAX_OUTBOX_BYTES {
         let Some(index) = retained
             .iter()
-            .position(|value| preserve != Some(value.1.as_str()))
+            .position(|job| preserve != Some(job.recording_id.as_str()) && !job.actively_sending)
         else {
             break;
         };
-        let (_, recording_id, size) = retained.remove(index);
-        total_bytes = total_bytes.saturating_sub(size);
-        let _ = remove_job_files(outbox_dir, &recording_id);
+        let evicted = retained.remove(index);
+        total_bytes = total_bytes.saturating_sub(evicted.audio_bytes);
+        let _ = remove_job_files(outbox_dir, &evicted.recording_id);
     }
     Ok(())
+}
+
+// The retention caps only see the oldest jobs, so an upload that another
+// command started must be recognized and skipped: evicting it would delete the
+// recording out from under the in-flight send.
+fn is_actively_sending(job: &VoiceJob, now: i64) -> bool {
+    job.status == StoredStatus::Sending
+        && now.saturating_sub(job.updated_at) <= ACTIVE_SEND_GRACE_SECONDS
+}
+
+struct RetainedJob {
+    created_at: i64,
+    recording_id: String,
+    audio_bytes: u64,
+    actively_sending: bool,
 }
 
 fn load_jobs(outbox_dir: &Path) -> Result<Vec<VoiceJob>> {
@@ -736,13 +760,9 @@ mod tests {
             let recording_id = format!("bounded-{index}");
             let path = recording_path(outbox, &recording_id).unwrap();
             fs::write(&path, recording(1_000)).unwrap();
-            prepare(
-                outbox,
-                &recording_id,
-                "chat@s.whatsapp.net",
-                100 + i64::try_from(index).unwrap(),
-            )
-            .unwrap();
+            let now = 100 + i64::try_from(index).unwrap();
+            let mut prepared = prepare(outbox, &recording_id, "chat@s.whatsapp.net", now).unwrap();
+            mark_failed(outbox, &mut prepared.job, "offline", now).unwrap();
             fs::OpenOptions::new()
                 .write(true)
                 .open(path)
@@ -755,5 +775,50 @@ mod tests {
         assert_eq!(entries(outbox).unwrap().len(), MAX_JOBS);
         assert!(!recording_path(outbox, "bounded-0").unwrap().exists());
         assert!(recording_path(outbox, "bounded-8").unwrap().exists());
+    }
+
+    #[test]
+    fn cleanup_keeps_a_recent_in_flight_send_and_releases_a_stale_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = directory.path();
+        let in_flight_id = "in-flight";
+        fs::write(
+            recording_path(outbox, in_flight_id).unwrap(),
+            recording(1_000),
+        )
+        .unwrap();
+        let in_flight = prepare(outbox, in_flight_id, "chat@s.whatsapp.net", 100).unwrap();
+        let listed = entries(outbox).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, VoiceOutboxStatus::Sending);
+        assert!(is_actively_sending(&in_flight.job, 100));
+        assert!(is_actively_sending(
+            &in_flight.job,
+            100 + ACTIVE_SEND_GRACE_SECONDS
+        ));
+        assert!(!is_actively_sending(
+            &in_flight.job,
+            101 + ACTIVE_SEND_GRACE_SECONDS
+        ));
+        let mut failed = in_flight.job.clone();
+        failed.status = StoredStatus::Failed;
+        assert!(!is_actively_sending(&failed, 100));
+
+        // Preparing later recordings runs the retention caps, which must not
+        // delete the upload that is still running.
+        for index in 0..=MAX_JOBS {
+            let recording_id = format!("later-{index}");
+            let path = recording_path(outbox, &recording_id).unwrap();
+            fs::write(&path, recording(1_000)).unwrap();
+            let now = 200 + i64::try_from(index).unwrap();
+            let mut prepared = prepare(outbox, &recording_id, "chat@s.whatsapp.net", now).unwrap();
+            mark_failed(outbox, &mut prepared.job, "offline", now).unwrap();
+        }
+        assert!(recording_path(outbox, in_flight_id).unwrap().exists());
+        assert!(!recording_path(outbox, "later-0").unwrap().exists());
+
+        // Once the grace window passes, the interrupted job is evictable again.
+        cleanup(outbox, 100 + ACTIVE_SEND_GRACE_SECONDS + 1).unwrap();
+        assert!(!recording_path(outbox, in_flight_id).unwrap().exists());
     }
 }
