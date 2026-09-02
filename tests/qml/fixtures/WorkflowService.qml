@@ -24,6 +24,13 @@ QtObject {
   property bool messagesResponseHasFollowup: false
   property int messagesResponseSerial: 0
   property int messagesNavigationSerial: 0
+  property int messagesLimit: 300
+  readonly property int messagesLimitStep: 300
+  readonly property int messagesLimitMax: 1000
+  readonly property bool canLoadOlderMessages: messagesChatJid !== ""
+    && messagesChatJid === selectedChatJid
+    && messages.length >= messagesLimit
+    && messagesLimit < messagesLimitMax
   property int messageSentSerial: 0
   property int incomingMessageSerial: 0
   property int pollCreateRequestId: 0
@@ -276,6 +283,13 @@ QtObject {
       if (media && media.kind === "sticker" && media.downloaded !== true
           && media.lottie !== true) downloadMedia(messages[i])
     }
+  }
+
+  function loadOlderMessages() {
+    if (!canLoadOlderMessages) return false
+    messagesLimit = Math.min(messagesLimitMax, messagesLimit + messagesLimitStep)
+    record("loadOlderMessages", messagesLimit)
+    return true
   }
 
   function replaceMessages(items, preservePosition) {

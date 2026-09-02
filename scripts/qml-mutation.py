@@ -208,6 +208,13 @@ MUTATIONS = [
         "modelData.pinned === true)",
     ),
     Mutation(
+        "older-messages-request-guard",
+        P,
+        TP,
+        "if (!service || olderMessagesRequestPending || !canLoadOlderMessages",
+        "if (!service || !olderMessagesRequestPending || !canLoadOlderMessages",
+    ),
+    Mutation(
         "conversation-anchor-offset",
         P,
         TP,

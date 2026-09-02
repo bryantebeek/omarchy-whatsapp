@@ -44,9 +44,14 @@ TestCase {
   }
 
   function callRecorded(name) {
+    return callCount(name) > 0
+  }
+
+  function callCount(name) {
+    var total = 0
     for (var i = 0; i < service.calls.length; i++)
-      if (service.calls[i].name === name) return true
-    return false
+      if (service.calls[i].name === name) total++
+    return total
   }
 
   function verifyCenteredSquareButton(button, input) {
@@ -72,6 +77,24 @@ TestCase {
         from_me: i % 2 === 1,
         text: "Synthetic message " + i + " with enough text for a stable row",
         timestamp: 1000 + i * 61,
+        receipt: 1,
+        read_by: []
+      })
+    }
+    return messages
+  }
+
+  function olderMessages(count) {
+    var messages = []
+    for (var i = 0; i < count; i++) {
+      messages.push({
+        id: "older-" + i,
+        chat_jid: "alice@s.whatsapp.net",
+        sender_jid: "alice@s.whatsapp.net",
+        sender_name: "Alice",
+        from_me: false,
+        text: "Older message " + i + " from before the loaded window",
+        timestamp: 100 + i * 61,
         receipt: 1,
         read_by: []
       })
@@ -125,6 +148,10 @@ TestCase {
     tryCompare(control("messageList"), "count", 1)
     var delegate = control("messageDelegate-mention-1")
     compare(delegate.senderLabelText, "Alice's profile")
+    var senderAvatar = control("senderAvatar-mention-1")
+    compare(senderAvatar.jid, "alice@s.whatsapp.net")
+    compare(senderAvatar.initials, "AP")
+    compare(senderAvatar.size, Style.space(30))
     verify(delegate.renderedMessageText.indexOf("@Bob &amp; Sons") >= 0)
     verify(delegate.renderedMessageText.indexOf("mention:316222%40s.whatsapp.net") >= 0)
     verify(delegate.renderedMessageText.indexOf("@999") >= 0)
@@ -145,6 +172,8 @@ TestCase {
     verify(service.selectedChat !== null)
     compare(service.selectedChat.name, "Bob & Sons")
     compare(control("conversationTitle").text, "Bob & Sons")
+    compare(control("conversationAvatar").jid, "316222@s.whatsapp.net")
+    compare(control("conversationAvatar").initials, "BS")
     compare(control("composer").enabled, true)
   }
 
@@ -641,6 +670,96 @@ TestCase {
       "Appending at the bottom must retain the previous latest bubble")
   }
 
+  function test_load_older_messages_keeps_the_viewport_anchor() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var list = control("messageList")
+    var button = control("loadOlderMessagesButton")
+    compare(button.text, "Load earlier messages")
+
+    service.messagesLimit = 40
+    service.loadMessages(syntheticMessages(30), "")
+    tryCompare(list, "count", 30)
+    compare(service.canLoadOlderMessages, false)
+    compare(panel.canLoadOlderMessages, false)
+    compare(button.relevant, false)
+    compare(button.opacity, 0)
+    compare(button.enabled, false)
+    compare(panel.loadOlderMessages(), false)
+
+    service.loadMessages(syntheticMessages(40), "")
+    tryCompare(list, "count", 40)
+    compare(service.canLoadOlderMessages, true)
+    compare(panel.canLoadOlderMessages, true)
+    compare(button.relevant, true)
+    tryCompare(button, "opacity", 1)
+    compare(button.enabled, true)
+    tryCompare(panel, "conversationReady", true)
+
+    list.positionViewAtIndex(20, ListView.Beginning)
+    list.forceLayout()
+    wait(20)
+    var anchor = control("messageDelegate-scroll-20")
+    var anchorOffset = anchor.y - list.contentY
+    verify(list.contentY > 0)
+
+    button.click()
+    compare(callCount("loadOlderMessages"), 1)
+    compare(service.messagesLimit, 340)
+    compare(panel.olderMessagesRequestPending, true)
+    compare(button.text, "Loading earlier messages…")
+    compare(button.enabled, false)
+    compare(panel.loadOlderMessages(), false)
+    compare(callCount("loadOlderMessages"), 1)
+
+    service.loadMessages(olderMessages(8).concat(service.messages), "")
+    tryCompare(list, "count", 48)
+    compare(panel.olderMessagesRequestPending, false)
+    compare(list.model.get(0).messageKey, "id:older-0")
+    tryVerify(function() {
+      var restored = findChild(panel, "messageDelegate-scroll-20")
+      return restored !== null
+        && Math.abs((restored.y - list.contentY) - anchorOffset) < 1
+    })
+    compare(control("messageDelegate-scroll-20"), anchor,
+      "Loading older history must not recreate the anchored bubble")
+
+    // The snapshot is no longer full, so the control retires again.
+    compare(service.canLoadOlderMessages, false)
+    compare(button.relevant, false)
+    tryCompare(button, "opacity", 0)
+    service.messagesLimit = service.messagesLimitMax
+    service.loadMessages(syntheticMessages(40), "")
+    tryCompare(list, "count", 40)
+    compare(service.canLoadOlderMessages, false)
+  }
+
+  function test_scrolling_to_the_conversation_top_loads_older_messages() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    service.messagesLimit = 40
+    service.loadMessages(syntheticMessages(40), "")
+    var list = control("messageList")
+    tryCompare(list, "count", 40)
+    tryCompare(panel, "conversationReady", true)
+    compare(service.canLoadOlderMessages, true)
+
+    list.positionViewAtIndex(20, ListView.Beginning)
+    list.forceLayout()
+    wait(20)
+    verify(list.contentY > 0)
+    list.movementEnded()
+    compare(callCount("loadOlderMessages"), 0)
+
+    list.contentY = list.originY - list.topMargin
+    list.forceLayout()
+    wait(20)
+    verify(list.atYBeginning)
+    list.movementEnded()
+    compare(callCount("loadOlderMessages"), 1)
+    list.movementEnded()
+    compare(callCount("loadOlderMessages"), 1,
+      "A pending request must not be repeated by another movement to the top")
+  }
+
   function test_create_render_and_vote_in_poll() {
     panel.open('{"chatJid":"alice@s.whatsapp.net"}')
     control("pollButton").click()
@@ -700,8 +819,8 @@ TestCase {
     verify(progressFill.width > progressTrack.width * 0.65)
     verify(progressFill.width < progressTrack.width * 0.68)
     compare(control("pollOptionCount-poll-1-0").text, "2")
-    compare(firstVoter.voterJid, "alice@s.whatsapp.net")
-    compare(secondVoter.voterJid, "bob@s.whatsapp.net")
+    compare(firstVoter.jid, "alice@s.whatsapp.net")
+    compare(secondVoter.jid, "bob@s.whatsapp.net")
     verify(secondVoter.x > firstVoter.x)
     verify(secondVoter.x < firstVoter.x + firstVoter.width)
     verify(voterStack.width > firstVoter.width)

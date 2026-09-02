@@ -1,7 +1,9 @@
 import QtQuick
 import QtTest
+import qs.Commons
 
 import "../../quickshell" as Whatsapp
+import "../../quickshell/DevicePixel.js" as DevicePixel
 import "fixtures"
 
 TestCase {
@@ -19,6 +21,9 @@ TestCase {
   }
 
   Component { id: serviceComponent; WorkflowService {} }
+  Component { id: avatarComponent; Whatsapp.Avatar {} }
+  Component { id: crispSurfaceComponent; Whatsapp.DevicePixelBorderSurface {} }
+  Component { id: crispTextFieldComponent; Whatsapp.DevicePixelTextField {} }
 
   function init() {
     failOnWarning(/.*/)
@@ -136,6 +141,79 @@ TestCase {
     service.chatStateLabelResult = ""
     service.presenceLabelResult = ""
     compare(panel.conversationActivitySubtitle(), "+316123")
+  }
+
+  function test_device_pixel_border_snapping() {
+    var none = DevicePixel.borderSpec(Border.none(), 2)
+    compare(none.widths.top, 0)
+    compare(none.widths.left, 0)
+    var hairline = DevicePixel.borderSpec(Border.flat("#ff0000", 0.4), 2)
+    compare(hairline.widths.top, 0.5)
+    compare(hairline.widths.right, 0.5)
+    compare(String(hairline.color), "#ff0000")
+    compare(hairline.gradient.enabled, true)
+    compare(String(hairline.gradient.colors[0]), "#ff0000")
+    compare(DevicePixel.borderSpec(Border.flat("#ff0000", 3), 1).widths.top, 3)
+    compare(DevicePixel.borderSpec(Border.flat("#ff0000", 1), 0).widths.top, 1)
+
+    var surface = createTemporaryObject(crispSurfaceComponent, testCase, {
+      devicePixelRatio: 2,
+      sourceBorderSpec: Border.flat("#00ff00", 0.4)
+    })
+    verify(surface !== null)
+    compare(Border.top(surface.borderSpec), 0.5)
+    compare(Border.bottom(surface.borderSpec), 0.5)
+
+    var field = createTemporaryObject(crispTextFieldComponent, testCase, {
+      devicePixelRatio: 3
+    })
+    verify(field !== null)
+    compare(field.background.devicePixelRatio, 3)
+  }
+
+  function test_avatar_initials_fallback_and_preview_requests() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var avatar = createTemporaryObject(avatarComponent, testCase, {
+      service: service,
+      jid: "alice@s.whatsapp.net",
+      name: "Alice Smith",
+      size: 40,
+      imageObjectName: "componentAvatarImage"
+    })
+    verify(avatar !== null)
+    compare(avatar.width, 40)
+    compare(avatar.height, 40)
+    compare(avatar.radius, 20)
+    compare(avatar.initials, "AS")
+    compare(avatar.hasRenderedAvatar, false)
+
+    var image = findChild(avatar, "componentAvatarImage")
+    verify(image !== null)
+    compare(String(image.source), "")
+    compare(image.fillMode, Image.PreserveAspectCrop)
+
+    service.avatarUrls = ({
+      "alice@s.whatsapp.net": String(Qt.resolvedUrl("fixtures/pixel.svg"))
+    })
+    tryCompare(avatar, "hasRenderedAvatar", true)
+    service.avatarUrls = ({})
+    tryCompare(avatar, "hasRenderedAvatar", false)
+
+    var placeholder = createTemporaryObject(avatarComponent, testCase, {})
+    verify(placeholder !== null)
+    compare(placeholder.initials, "?")
+    compare(placeholder.hasRenderedAvatar, false)
+
+    compare(service.calls.length, 0)
+    var voter = createTemporaryObject(avatarComponent, testCase, {
+      service: service,
+      jid: "carol@s.whatsapp.net",
+      requestOnLoad: true
+    })
+    verify(voter !== null)
+    compare(service.calls.length, 1)
+    compare(service.calls[0].name, "requestAvatar")
+    compare(service.calls[0].value, "carol@s.whatsapp.net")
   }
 
   function test_bar_widget_loads_and_formats_state() {

@@ -7,6 +7,7 @@ import Quickshell
 import qs.Commons
 import qs.Ui
 
+import "DevicePixel.js" as DevicePixel
 import "Model.js" as Model
 
 Item {
@@ -24,6 +25,7 @@ Item {
   property int conversationScrollSerial: 0
   property bool scrollToBottomAfterMessages: false
   property bool restoreConversationAfterMessages: false
+  property bool olderMessagesRequestPending: false
   property real preservedConversationContentY: 0
   property string preservedConversationMessageId: ""
   property real preservedConversationMessageOffset: 0
@@ -47,6 +49,8 @@ Item {
   property alias chatStateResyncAction: headerResyncAction
   property alias chatStateResyncConfirmation: resyncConfirmation
   readonly property bool unreadOnly: service && service.unreadOnly === true
+  readonly property bool canLoadOlderMessages: service
+    && service.canLoadOlderMessages === true
   readonly property bool voiceRecordingTestMode: service
     && service.voiceRecordingTestMode === true
   readonly property int voiceRecordingDurationMs: voiceRecordingTestMode
@@ -146,34 +150,15 @@ Item {
   }
 
   function devicePixelBorderSpec(spec) {
-    var scale = Math.max(1, Number(devicePixelRatio) || 1)
-    function snappedWidth(value) {
-      var width = Math.max(0, Number(value) || 0)
-      return width > 0 ? Math.max(1, Math.round(width * scale)) / scale : 0
-    }
-    var borderColor = Border.color(spec)
-    var gradient = spec && spec.gradient && spec.gradient.enabled
-      ? spec.gradient
-      : { colors: [borderColor, borderColor], angle: 0, enabled: true }
-    return {
-      color: borderColor,
-      widths: {
-        top: snappedWidth(Border.top(spec)),
-        right: snappedWidth(Border.right(spec)),
-        bottom: snappedWidth(Border.bottom(spec)),
-        left: snappedWidth(Border.left(spec))
-      },
-      gradient: gradient
-    }
+    return DevicePixel.borderSpec(spec, devicePixelRatio)
   }
 
-  component CrispBorderSurface: BorderSurface {
-    property var sourceBorderSpec: Border.none()
-    borderSpec: root.devicePixelBorderSpec(sourceBorderSpec)
+  component CrispBorderSurface: DevicePixelBorderSurface {
+    devicePixelRatio: root.devicePixelRatio
   }
 
-  component CrispButton: Button {
-    borderSpec: root.devicePixelBorderSpec(_borderSpec)
+  component CrispButton: DevicePixelButton {
+    devicePixelRatio: root.devicePixelRatio
   }
 
   component SquareControlButton: CrispButton {
@@ -248,14 +233,8 @@ Item {
     }
   }
 
-  component CrispTextField: TextField {
-    id: crispTextField
-    background: CrispBorderSurface {
-      color: Style.controlFill(crispTextField._focused,
-        crispTextField._hot, crispTextField.foreground, crispTextField.accent)
-      sourceBorderSpec: crispTextField._borderSpec
-      radius: Style.cornerRadius
-    }
+  component CrispTextField: DevicePixelTextField {
+    devicePixelRatio: root.devicePixelRatio
   }
 
   function groupConversationSubtitle() {
@@ -913,6 +892,19 @@ Item {
       firstUnreadId)
   }
 
+  // The conversation snapshot is capped. Raising the cap re-requests the
+  // conversation, and the larger snapshot arrives through the normal messages
+  // path with position preservation, so the anchor message stays put. Only one
+  // request is in flight at a time; scrolling back to the top while the answer
+  // is pending must not queue another.
+  function loadOlderMessages() {
+    if (!service || olderMessagesRequestPending || !canLoadOlderMessages
+        || typeof service.loadOlderMessages !== "function") return false
+    if (!service.loadOlderMessages()) return false
+    olderMessagesRequestPending = true
+    return true
+  }
+
   function remainingTimeLabel(untilTimestamp) {
     var minutes = Math.max(0, Math.ceil(
       (Number(untilTimestamp || 0) - currentTimestamp) / 60))
@@ -1139,6 +1131,7 @@ Item {
       scrollToBottomAnimation.stop()
       root.conversationScrollSerial++
       root.conversationReady = false
+      root.olderMessagesRequestPending = false
       root.scrollToBottomAfterMessages = false
       root.restoreConversationAfterMessages = false
       root.preservedConversationMessageId = ""
@@ -1170,6 +1163,7 @@ Item {
         root.scrollToBottomAfterMessages = true
     }
     function onMessagesResponseSerialChanged() {
+      root.olderMessagesRequestPending = false
       if (!root.service
           || root.service.messagesChatJid !== root.service.selectedChatJid) return
       if (root.service.messagesResponseHasFollowup === true) return
@@ -1891,55 +1885,16 @@ Item {
                         anchors.leftMargin: Style.space(12)
                         anchors.rightMargin: Style.space(12)
                         spacing: Style.space(8)
-                        CrispBorderSurface {
-                          width: Style.space(34)
-                          height: width
-                          radius: width / 2
-                          clip: true
-                          color: Style.normalFillFor(root.foreground, root.accent)
-                          sourceBorderSpec: Border.flat(
-                            Style.normalBorderFor(root.foreground, root.accent),
-                            Math.max(1, Style.normalBorderWidth))
+                        Avatar {
                           anchors.verticalCenter: parent.verticalCenter
-                          Text {
-                            anchors.centerIn: parent
-                            visible: !chatAvatar.hasRenderedAvatar
-                            text: Model.initials(modelData.name, modelData.jid)
-                            color: root.foreground
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.caption
-                            font.bold: true
-                          }
-                          Rectangle {
-                            id: chatAvatarMask
-                            anchors.fill: parent
-                            radius: width / 2
-                            visible: false
-                            layer.enabled: true
-                          }
-                          Image {
-                            id: chatAvatar
-                            property bool hasRenderedAvatar: false
-                            anchors.fill: parent
-                            source: root.service ? root.service.avatarUrl(modelData.jid) : ""
-                            asynchronous: true
-                            cache: false
-                            retainWhileLoading: true
-                            fillMode: Image.PreserveAspectCrop
-                            onSourceChanged: if (String(source) === "") hasRenderedAvatar = false
-                            onStatusChanged: {
-                              if (status === Image.Ready) hasRenderedAvatar = true
-                              else if (status === Image.Error) hasRenderedAvatar = false
-                            }
-                            layer.enabled: true
-                            layer.smooth: true
-                            layer.effect: MultiEffect {
-                              maskEnabled: true
-                              maskSource: chatAvatarMask
-                              maskThresholdMin: 0.5
-                              maskSpreadAtMin: 1.0
-                            }
-                          }
+                          service: root.service
+                          jid: String(modelData.jid || "")
+                          name: String(modelData.name || "")
+                          size: Style.space(34)
+                          fontFamily: root.fontFamily
+                          foreground: root.foreground
+                          accent: root.accent
+                          devicePixelRatio: root.devicePixelRatio
                         }
 
                         Column {
@@ -2193,57 +2148,18 @@ Item {
                       anchors.leftMargin: Style.space(18)
                       anchors.verticalCenter: parent.verticalCenter
                       spacing: Style.space(10)
-                      CrispBorderSurface {
-                        width: Style.space(38)
-                        height: width
-                        radius: width / 2
-                        clip: true
-                        color: Style.normalFillFor(root.foreground, root.accent)
-                        sourceBorderSpec: Border.flat(
-                          Style.normalBorderFor(root.foreground, root.accent),
-                          Math.max(1, Style.normalBorderWidth))
-                        Text {
-                          anchors.centerIn: parent
-                          visible: !selectedAvatar.hasRenderedAvatar
-                          text: root.service && root.service.selectedChat
-                            ? Model.initials(root.service.selectedChat.name,
-                              root.service.selectedChat.jid) : "?"
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
-                          font.bold: true
-                        }
-                        Rectangle {
-                          id: selectedAvatarMask
-                          anchors.fill: parent
-                          radius: width / 2
-                          visible: false
-                          layer.enabled: true
-                        }
-                        Image {
-                          id: selectedAvatar
-                          property bool hasRenderedAvatar: false
-                          anchors.fill: parent
-                          source: root.service && root.service.selectedChat
-                            ? root.service.avatarUrl(root.service.selectedChat.jid) : ""
-                          asynchronous: true
-                          cache: false
-                          retainWhileLoading: true
-                          fillMode: Image.PreserveAspectCrop
-                          onSourceChanged: if (String(source) === "") hasRenderedAvatar = false
-                          onStatusChanged: {
-                            if (status === Image.Ready) hasRenderedAvatar = true
-                            else if (status === Image.Error) hasRenderedAvatar = false
-                          }
-                          layer.enabled: true
-                          layer.smooth: true
-                          layer.effect: MultiEffect {
-                            maskEnabled: true
-                            maskSource: selectedAvatarMask
-                            maskThresholdMin: 0.5
-                            maskSpreadAtMin: 1.0
-                          }
-                        }
+                      Avatar {
+                        objectName: "conversationAvatar"
+                        service: root.service
+                        jid: root.service && root.service.selectedChat
+                          ? String(root.service.selectedChat.jid || "") : ""
+                        name: root.service && root.service.selectedChat
+                          ? String(root.service.selectedChat.name || "") : ""
+                        size: Style.space(38)
+                        fontFamily: root.fontFamily
+                        foreground: root.foreground
+                        accent: root.accent
+                        devicePixelRatio: root.devicePixelRatio
                       }
                       Column {
                         anchors.verticalCenter: parent.verticalCenter
@@ -2323,6 +2239,12 @@ Item {
                     boundsBehavior: Flickable.StopAtBounds
                     reuseItems: true
                     QQC.ScrollBar.vertical: QQC.ScrollBar {}
+
+                    // Reaching the very top of the loaded history is the
+                    // natural request for more of it. Only user-driven
+                    // movement counts, so programmatic positioning during a
+                    // conversation switch cannot trigger a request.
+                    onMovementEnded: if (atYBeginning) root.loadOlderMessages()
 
                     delegate: Item {
                       id: messageDelegate
@@ -2532,59 +2454,21 @@ Item {
                         }
                       }
 
-                      CrispBorderSurface {
+                      Avatar {
                         id: senderAvatar
+                        objectName: "senderAvatar-" + String(modelData.id || "")
                         visible: messageDelegate.showSenderAvatar
-                        width: visible ? Style.space(30) : 0
-                        height: width
                         x: Style.space(16)
                         anchors.verticalCenter: bubble.verticalCenter
-                        radius: width / 2
-                        clip: true
-                        color: Style.normalFillFor(root.foreground, root.accent)
-                        sourceBorderSpec: Border.flat(
-                          Style.normalBorderFor(root.foreground, root.accent),
-                          Math.max(1, Style.normalBorderWidth))
-                        Text {
-                          anchors.centerIn: parent
-                          visible: !senderAvatarImage.hasRenderedAvatar
-                          text: Model.initials(modelData.sender_name, modelData.sender_jid)
-                          color: root.foreground
-                          font.family: root.fontFamily
-                          font.pixelSize: Style.font.caption
-                          font.bold: true
-                        }
-                        Rectangle {
-                          id: senderAvatarMask
-                          anchors.fill: parent
-                          radius: width / 2
-                          visible: false
-                          layer.enabled: true
-                        }
-                        Image {
-                          id: senderAvatarImage
-                          property bool hasRenderedAvatar: false
-                          anchors.fill: parent
-                          source: root.service
-                            ? root.service.avatarUrl(modelData.sender_jid) : ""
-                          asynchronous: true
-                          cache: false
-                          retainWhileLoading: true
-                          fillMode: Image.PreserveAspectCrop
-                          onSourceChanged: if (String(source) === "") hasRenderedAvatar = false
-                          onStatusChanged: {
-                            if (status === Image.Ready) hasRenderedAvatar = true
-                            else if (status === Image.Error) hasRenderedAvatar = false
-                          }
-                          layer.enabled: true
-                          layer.smooth: true
-                          layer.effect: MultiEffect {
-                            maskEnabled: true
-                            maskSource: senderAvatarMask
-                            maskThresholdMin: 0.5
-                            maskSpreadAtMin: 1.0
-                          }
-                        }
+                        service: root.service
+                        jid: String(modelData.sender_jid || "")
+                        name: String(modelData.sender_name || "")
+                        size: messageDelegate.showSenderAvatar
+                          ? Style.space(30) : 0
+                        fontFamily: root.fontFamily
+                        foreground: root.foreground
+                        accent: root.accent
+                        devicePixelRatio: root.devicePixelRatio
                       }
 
                       Text {
@@ -2951,88 +2835,31 @@ Item {
                                       Repeater {
                                         model: pollOption.voterJids
 
-                                        delegate: CrispBorderSurface {
-                                          id: pollVoterAvatar
+                                        delegate: Avatar {
                                           required property var modelData
                                           required property int index
-                                          readonly property string voterJid:
-                                            String(modelData || "")
                                           objectName: "pollVoterAvatar-"
+                                            + String(messageDelegate.modelData.id || "")
+                                            + "-" + String(pollOption.index)
+                                            + "-" + String(index)
+                                          imageObjectName: "pollVoterImage-"
                                             + String(messageDelegate.modelData.id || "")
                                             + "-" + String(pollOption.index)
                                             + "-" + String(index)
                                           x: index * pollVoteSummary.avatarStride
                                           z: pollOption.voterJids.length - index
-                                          width: pollVoteSummary.avatarSize
-                                          height: width
-                                          radius: width / 2
-                                          clip: true
-                                          color: Style.normalFillFor(
-                                            root.foreground, root.accent)
-                                          sourceBorderSpec: Border.flat(
-                                            Style.normalBorderFor(
-                                              root.foreground, root.accent),
-                                            Math.max(1, Style.normalBorderWidth))
-
-                                          Component.onCompleted: {
-                                            if (root.service)
-                                              root.service.requestAvatar(voterJid)
-                                          }
-
-                                          Text {
-                                            anchors.centerIn: parent
-                                            visible: !pollVoterImage.hasRenderedAvatar
-                                            text: Model.initials(
-                                              root.pollVoterName(
-                                                pollVoterAvatar.voterJid),
-                                              pollVoterAvatar.voterJid)
-                                            color: root.foreground
-                                            font.family: root.fontFamily
-                                            font.pixelSize: Math.max(7,
-                                              root.messageMetaFontSize - 2)
-                                            font.bold: true
-                                          }
-
-                                          Rectangle {
-                                            id: pollVoterMask
-                                            anchors.fill: parent
-                                            radius: width / 2
-                                            visible: false
-                                            layer.enabled: true
-                                          }
-
-                                          Image {
-                                            id: pollVoterImage
-                                            objectName: "pollVoterImage-"
-                                              + String(messageDelegate.modelData.id || "")
-                                              + "-" + String(pollOption.index)
-                                              + "-" + String(index)
-                                            property bool hasRenderedAvatar: false
-                                            anchors.fill: parent
-                                            source: root.service
-                                              ? root.service.avatarUrl(
-                                                pollVoterAvatar.voterJid) : ""
-                                            asynchronous: true
-                                            cache: false
-                                            retainWhileLoading: true
-                                            fillMode: Image.PreserveAspectCrop
-                                            onSourceChanged: if (String(source) === "")
-                                              hasRenderedAvatar = false
-                                            onStatusChanged: {
-                                              if (status === Image.Ready)
-                                                hasRenderedAvatar = true
-                                              else if (status === Image.Error)
-                                                hasRenderedAvatar = false
-                                            }
-                                            layer.enabled: true
-                                            layer.smooth: true
-                                            layer.effect: MultiEffect {
-                                              maskEnabled: true
-                                              maskSource: pollVoterMask
-                                              maskThresholdMin: 0.5
-                                              maskSpreadAtMin: 1.0
-                                            }
-                                          }
+                                          service: root.service
+                                          jid: String(modelData || "")
+                                          name: root.pollVoterName(
+                                            String(modelData || ""))
+                                          size: pollVoteSummary.avatarSize
+                                          initialsPixelSize: Math.max(7,
+                                            root.messageMetaFontSize - 2)
+                                          fontFamily: root.fontFamily
+                                          foreground: root.foreground
+                                          accent: root.accent
+                                          devicePixelRatio: root.devicePixelRatio
+                                          requestOnLoad: true
                                         }
                                       }
                                     }
@@ -4415,6 +4242,38 @@ Item {
                         tooltipText: "Send voice message"
                         onClicked: root.stopVoiceRecording(true)
                       }
+                    }
+                  }
+                }
+
+                CrispButton {
+                  id: loadOlderMessagesButton
+
+                  objectName: "loadOlderMessagesButton"
+                  readonly property bool relevant: root.canLoadOlderMessages
+
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  anchors.top: parent.top
+                  anchors.topMargin: conversationHeader.height + Style.space(14)
+                  z: 1
+                  visible: relevant || opacity > 0
+                  enabled: relevant && !root.olderMessagesRequestPending
+                  opacity: relevant ? 1 : 0
+                  text: root.olderMessagesRequestPending
+                    ? "Loading earlier messages…" : "Load earlier messages"
+                  iconText: root.olderMessagesRequestPending ? "󰔟" : "󰁝"
+                  tooltipText: "Load more of this conversation's history"
+                  foreground: root.foreground
+                  background: root.background
+                  accent: root.accent
+                  bordered: true
+                  focusable: true
+                  onClicked: root.loadOlderMessages()
+
+                  Behavior on opacity {
+                    NumberAnimation {
+                      duration: 140
+                      easing.type: Easing.OutCubic
                     }
                   }
                 }

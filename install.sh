@@ -106,32 +106,21 @@ if ((runtime_only == 0)); then
   # A marketplace installation is a git checkout at plugin_dir already. A local
   # development checkout lives elsewhere and needs its runtime subset copied in.
   if [[ $(realpath -m -- "$repo_dir") != $(realpath -m -- "$plugin_dir") ]]; then
-    rm -f -- \
-      "$plugin_dir/BarWidget.qml" \
-      "$plugin_dir/Service.qml" \
-      "$plugin_dir/Panel.qml" \
-      "$plugin_dir/LicensesPopup.qml" \
-      "$plugin_dir/Model.js" \
-      "$plugin_dir/licenses.json" \
-      "$plugin_dir/icons/brand-whatsapp-filled.svg" \
-      "$plugin_dir/icons/LICENSE.tabler"
-    install_atomically 644 "$repo_dir/quickshell/BarWidget.qml" \
-      "$plugin_dir/quickshell/BarWidget.qml"
-    install_atomically 644 "$repo_dir/quickshell/Service.qml" \
-      "$plugin_dir/quickshell/Service.qml"
-    install_atomically 644 "$repo_dir/quickshell/Panel.qml" \
-      "$plugin_dir/quickshell/Panel.qml"
-    install_atomically 644 "$repo_dir/quickshell/LicensesPopup.qml" \
-      "$plugin_dir/quickshell/LicensesPopup.qml"
-    install_atomically 644 "$repo_dir/quickshell/Model.js" \
-      "$plugin_dir/quickshell/Model.js"
-    install_atomically 644 "$repo_dir/quickshell/licenses.json" \
-      "$plugin_dir/quickshell/licenses.json"
-    install_atomically 644 \
-      "$repo_dir/quickshell/icons/brand-whatsapp-filled.svg" \
-      "$plugin_dir/quickshell/icons/brand-whatsapp-filled.svg"
-    install_atomically 644 "$repo_dir/quickshell/icons/LICENSE.tabler" \
-      "$plugin_dir/quickshell/icons/LICENSE.tabler"
+    # The runtime file set is derived from the repository contents rather than
+    # repeated by hand, so a component extracted out of Panel.qml can never be
+    # left behind by one installer while the others ship it.
+    for source_file in "$repo_dir"/quickshell/*.qml "$repo_dir"/quickshell/*.js \
+        "$repo_dir"/quickshell/*.json "$repo_dir"/quickshell/icons/*; do
+      [[ -f $source_file ]] || {
+        echo "Missing plugin file: $source_file" >&2
+        exit 1
+      }
+      relative_file=${source_file#"$repo_dir/quickshell/"}
+      # Versions before 0.3 installed the plugin files at the plugin root.
+      rm -f -- "$plugin_dir/$relative_file"
+      install_atomically 644 "$source_file" \
+        "$plugin_dir/quickshell/$relative_file"
+    done
     # The manifest makes the directory visible to the shell, so install it last.
     install_atomically 644 "$repo_dir/manifest.json" "$plugin_dir/manifest.json"
   fi

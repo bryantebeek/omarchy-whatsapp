@@ -37,14 +37,19 @@ install -Dm644 "$repo_dir/packaging/applications/com.omarchy.WhatsApp.desktop" \
 install -Dm644 "$repo_dir/packaging/icons/com.omarchy.WhatsApp.svg" \
   "$package_root/usr/share/icons/hicolor/scalable/apps/com.omarchy.WhatsApp.svg"
 
-install -Dm644 "$repo_dir/manifest.json" \
-  "$package_root/usr/share/omarchy/shell/plugins/whatsapp/manifest.json"
-for plugin_file in BarWidget.qml Service.qml Panel.qml LicensesPopup.qml Model.js licenses.json; do
-  install -Dm644 "$repo_dir/quickshell/$plugin_file" \
-    "$package_root/usr/share/omarchy/shell/plugins/whatsapp/quickshell/$plugin_file"
+plugin_root="$package_root/usr/share/omarchy/shell/plugins/whatsapp"
+install -Dm644 "$repo_dir/manifest.json" "$plugin_root/manifest.json"
+# Derived from the repository contents so a component extracted out of
+# Panel.qml cannot be omitted from the archive and break panel loading.
+for plugin_file in "$repo_dir"/quickshell/*.qml "$repo_dir"/quickshell/*.js \
+    "$repo_dir"/quickshell/*.json "$repo_dir"/quickshell/icons/*; do
+  [[ -f $plugin_file ]] || {
+    echo "Missing plugin file: $plugin_file" >&2
+    exit 1
+  }
+  install -Dm644 "$plugin_file" \
+    "$plugin_root/${plugin_file#"$repo_dir/"}"
 done
-install -Dm644 "$repo_dir/quickshell/icons/brand-whatsapp-filled.svg" \
-  "$package_root/usr/share/omarchy/shell/plugins/whatsapp/quickshell/icons/brand-whatsapp-filled.svg"
 install -Dm644 "$repo_dir/quickshell/icons/LICENSE.tabler" \
   "$package_root/usr/share/licenses/omarchy-whatsapp/LICENSE.tabler"
 install -Dm644 "$repo_dir/LICENSE" \
