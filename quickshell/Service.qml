@@ -35,6 +35,7 @@ Item {
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
   readonly property int protocolVersion: 29
   readonly property int requestTimeoutMs: 135000
+  readonly property int avatarRequestIntervalMs: 60000
 
   property bool connected: false
   property bool protocolCompatible: false
@@ -44,6 +45,7 @@ Item {
   property int unreadTotal: 0
   property var avatarAvailable: ({})
   property var avatarRevisions: ({})
+  property var avatarRequestTimes: ({})
   property string ownAvatarJid: ""
   property int mediaRevision: 0
   property var mediaOverrides: ({})
@@ -64,6 +66,11 @@ Item {
   property var groupParticipantRequestJids: ({})
   property var messages: []
   property string messagesChatJid: ""
+  property int messagesLimit: 300
+  readonly property int messagesLimitStep: 300
+  readonly property int messagesLimitMax: 1000
+  readonly property bool canLoadOlderMessages: messagesChatJid === selectedChatJid
+    && messages.length >= messagesLimit && messagesLimit < messagesLimitMax
   property string messagesFirstUnreadId: ""
   property bool messagesResponseHasFollowup: false
   property int messagesResponseSerial: 0
@@ -718,7 +725,18 @@ Item {
 
   function requestAvatar(jid) {
     var key = avatarJid(jid)
-    if (key) send("request_avatar", { jid: key })
+    if (!key || avatarAvailable[key] === true) return false
+    // Every request occupies a daemon command slot, so an avatar the shell
+    // already asked for is not requested again until the answer arrives or the
+    // attempt is old enough to have been lost.
+    var now = Date.now()
+    if (now - Number(avatarRequestTimes[key] || 0) < avatarRequestIntervalMs)
+      return false
+    if (!send("request_avatar", { jid: key })) return false
+    var requestTimes = Object.assign({}, avatarRequestTimes)
+    requestTimes[key] = now
+    avatarRequestTimes = requestTimes
+    return true
   }
 
   function openMap(latitudeE7, longitudeE7) {
@@ -815,6 +833,7 @@ Item {
     }
     requestCommands = ({})
     requestDeadlines = ({})
+    avatarRequestTimes = ({})
     textMessageRequests = ({})
     groupParticipantRequestJids = ({})
     messagesRequestIds = ({})
@@ -844,11 +863,15 @@ Item {
       finishChatStateResyncRequest({
         id: Number(id), event: "error", message: "WhatsApp request timed out"
       })
-      finishMessagesRequest({ id: Number(id), event: "error" })
+      var queuedMessagesJid = finishMessagesRequest({
+        id: Number(id), event: "error"
+      })
       finishTextMessageRequest({ id: Number(id), event: "error" })
       finishRequest({ id: Number(id), event: "error" })
       lastError = "WhatsApp " + command.replace(/_/g, " ") + " timed out"
       lastErrorRequestId = id
+      if (queuedMessagesJid && queuedMessagesJid === selectedChatJid)
+        requestMessages(queuedMessagesJid)
     }
     return expired.length
   }
@@ -910,7 +933,10 @@ Item {
       }
       return pendingId
     }
-    var requestId = send("get_messages", { chat_jid: value, limit: 300 })
+    var requestId = send("get_messages", {
+      chat_jid: value,
+      limit: messagesLimit
+    })
     if (!requestId) return 0
     var requestIds = Object.assign({}, messagesRequestIds)
     var requestJids = Object.assign({}, messagesRequestJids)
@@ -937,6 +963,17 @@ Item {
     messagesRequestJids = requestJids
     messagesQueuedRequests = queuedRequests
     return shouldRefresh ? jid : ""
+  }
+
+  function loadOlderMessages() {
+    if (!canLoadOlderMessages) return false
+    var previousLimit = messagesLimit
+    messagesLimit = Math.min(messagesLimitMax, messagesLimit + messagesLimitStep)
+    if (!requestMessages(selectedChatJid, true)) {
+      messagesLimit = previousLimit
+      return false
+    }
+    return true
   }
 
   function mediaDownloadKey(message) {
@@ -1065,6 +1102,7 @@ Item {
       groupParticipantsChatJid = ""
       groupParticipantsError = ""
       messagesChatJid = ""
+      messagesLimit = messagesLimitStep
       messagesFirstUnreadId = ""
       messagesNavigationSerial++
       replaceMessages([], false)
@@ -1346,6 +1384,25 @@ Item {
     return true
   }
 
+  function finishStaleResponse(frame) {
+    var requestedMessagesJid = String(messagesRequestJids[String(frame.id)] || "")
+    finishGroupParticipantsRequest(frame)
+    finishPollRequest(frame)
+    finishMediaDownloadRequest(frame)
+    finishVoiceMessageRequest(frame)
+    finishChatStateResyncRequest(frame)
+    finishMessagesRequest(frame)
+    finishTextMessageRequest(frame)
+    finishRequest(frame)
+    // The daemon stamps a response before an invalidation that the select loop
+    // then writes first, so a rejected answer can leave the visible chat
+    // without the snapshot it asked for. Ask again instead of waiting for the
+    // watchdog.
+    if (!requestedMessagesJid || requestedMessagesJid !== selectedChatJid)
+      return false
+    return requestMessages(requestedMessagesJid) > 0
+  }
+
   function handleLine(line) {
     var frame
     try { frame = JSON.parse(String(line || "")) }
@@ -1357,11 +1414,12 @@ Item {
       return
     }
     if (!protocolCompatible) return
-    if (!acceptFrame(frame)) return
     var frameId = frame.id === undefined || frame.id === null
       ? "" : String(frame.id)
-    var requestedMessagesJid = frameId
-      ? String(messagesRequestJids[frameId] || "") : ""
+    if (!acceptFrame(frame)) {
+      if (frameId) finishStaleResponse(frame)
+      return
+    }
     var requestedGroupParticipantsJid = finishGroupParticipantsRequest(frame)
     finishPollRequest(frame)
     finishMediaDownloadRequest(frame)
@@ -1405,11 +1463,12 @@ Item {
     } else if (frame.event === "text_outbox") {
       applyTextOutbox(frame)
     } else if (frame.event === "text_delivery") {
+      // The daemon broadcasts text_outbox after every delivery transition, so
+      // only the failure reason is handled here.
       if (String(frame.status || "") === "failed") {
         lastError = String(frame.error || "WhatsApp could not deliver the message")
         lastErrorRequestId = ""
       }
-      send("list_text_outbox")
     } else if (frame.event === "invalidated") {
       handleInvalidation(frame)
     } else if (frame.event === "messages") {
@@ -1449,16 +1508,22 @@ Item {
     } else if (frame.event === "avatars") {
       var available = {}
       var avatarJids = copyArray(frame.jids)
-      for (var avatarIndex = 0; avatarIndex < avatarJids.length; avatarIndex++)
+      var avatarRequests = Object.assign({}, avatarRequestTimes)
+      for (var avatarIndex = 0; avatarIndex < avatarJids.length; avatarIndex++) {
         available[String(avatarJids[avatarIndex])] = true
+        delete avatarRequests[String(avatarJids[avatarIndex])]
+      }
       var revisions = Object.assign({}, avatarRevisions)
       var changedAvatarJids = Array.isArray(frame.changed_jids)
         ? copyArray(frame.changed_jids) : avatarJids
       var revision = Number(frame.revision || 0)
-      for (var changedIndex = 0; changedIndex < changedAvatarJids.length; changedIndex++)
+      for (var changedIndex = 0; changedIndex < changedAvatarJids.length; changedIndex++) {
         revisions[String(changedAvatarJids[changedIndex])] = revision
+        delete avatarRequests[String(changedAvatarJids[changedIndex])]
+      }
       avatarAvailable = available
       avatarRevisions = revisions
+      avatarRequestTimes = avatarRequests
     } else if (frame.event === "error") {
       lastError = String(frame.message || "WhatsApp command failed")
       lastErrorRequestId = frameId

@@ -76,6 +76,13 @@ TestCase {
     return frames[frames.length - 1]
   }
 
+  function lastFrameFor(command) {
+    var frames = sentFrames()
+    for (var i = frames.length - 1; i >= 0; i--)
+      if (frames[i].command === command) return frames[i]
+    return null
+  }
+
   function test_paths_and_manifest() {
     compare(service.pluginId, "test.whatsapp")
     compare(service.socketPath, "/tmp/omarchy-whatsapp-qml-tests/runtime/omarchy-whatsapp/daemon.sock")
@@ -248,11 +255,11 @@ TestCase {
     service.mediaRevision = 9
     compare(service.fileUrl("/tmp/file"), "file:///tmp/file?v=9")
 
-    service.requestAvatar("me")
-    compare(lastFrame().jid, "self@s.whatsapp.net")
     TestIo.socketWrites = []
-    service.requestAvatar("contact")
+    compare(service.requestAvatar("me"), false)
+    compare(service.requestAvatar("contact"), true)
     compare(lastFrame().command, "request_avatar")
+    compare(lastFrame().jid, "contact")
 
     service.openMap("bad", 1)
     service.openMap(523700000, 48900000)
@@ -267,6 +274,37 @@ TestCase {
     service.saveFile("/tmp/document", "name.pdf")
     compare(Quickshell.detachedCommands.length, 2)
     compare(Quickshell.detachedCommands[1][5], "name.pdf")
+  }
+
+  function test_avatar_requests_skip_cached_and_in_flight_jids() {
+    compare(service.requestAvatar(""), false)
+    compare(service.requestAvatar("alice@s.whatsapp.net"), true)
+    compare(lastFrame().command, "request_avatar")
+    compare(lastFrame().jid, "alice@s.whatsapp.net")
+    verify(Number(service.avatarRequestTimes["alice@s.whatsapp.net"]) > 0)
+    // Every messages response and poll-voter delegate asks again; only the
+    // first attempt may occupy a daemon command slot.
+    TestIo.socketWrites = []
+    compare(service.requestAvatar("alice@s.whatsapp.net"), false)
+    compare(sentFrames().length, 0)
+
+    service.handleLine(JSON.stringify({
+      event: "avatars", jids: [], changed_jids: ["alice@s.whatsapp.net"],
+      revision: 3
+    }))
+    compare(service.avatarRequestTimes["alice@s.whatsapp.net"], undefined)
+    compare(service.requestAvatar("alice@s.whatsapp.net"), true)
+
+    service.handleLine(JSON.stringify({
+      event: "avatars", jids: ["alice@s.whatsapp.net"], revision: 4
+    }))
+    compare(service.avatarRequestTimes["alice@s.whatsapp.net"], undefined)
+    compare(service.requestAvatar("alice@s.whatsapp.net"), false)
+
+    compare(service.requestAvatar("bob@s.whatsapp.net"), true)
+    service.resetRequestState("")
+    compare(Object.keys(service.avatarRequestTimes).length, 0)
+    compare(service.requestAvatar("bob@s.whatsapp.net"), true)
   }
 
   function test_message_request_deduplication_and_stale_responses() {
@@ -858,6 +896,7 @@ TestCase {
     compare(service.discardTextMessage(failed), true)
     compare(lastFrame().command, "discard_text_message")
     compare(service.textOutboxEntries.length, 0)
+    TestIo.socketWrites = []
     service.handleLine(JSON.stringify({
       event: "text_delivery",
       delivery_id: request.delivery_id,
@@ -865,7 +904,20 @@ TestCase {
       error: "synthetic delivery failure"
     }))
     compare(service.lastError, "synthetic delivery failure")
-    compare(lastFrame().command, "list_text_outbox")
+    // The daemon broadcasts text_outbox after every delivery transition, so the
+    // shell must not spend a command slot asking for the same snapshot.
+    compare(sentFrames().length, 0)
+    service.handleLine(JSON.stringify({
+      event: "text_outbox",
+      entries: [{
+        delivery_id: request.delivery_id,
+        chat_jid: "chat",
+        text: "keep this draft",
+        status: "failed",
+        error: "synthetic delivery failure"
+      }]
+    }))
+    compare(service.textOutboxEntries.length, 1)
   }
 
   function test_generation_and_resource_sequences_prevent_regression() {
@@ -893,6 +945,77 @@ TestCase {
     compare(service.chats[0].jid, "next-generation")
   }
 
+  function test_stale_responses_clear_request_state_without_reporting_errors() {
+    service.selectedChatJid = "chat"
+    // The daemon stamps a response before the invalidation for the same chat
+    // but writes the invalidation first, so the answer arrives as stale.
+    service.handleLine(JSON.stringify({
+      event: "invalidated", resource: "messages", key: "chat",
+      generation: 1, sequence: 8
+    }))
+    var requestId = Number(service.messagesRequestIds.chat)
+    verify(requestId > 0)
+    TestIo.socketWrites = []
+    service.handleLine(JSON.stringify({
+      id: requestId, event: "messages", chat_jid: "chat",
+      generation: 1, sequence: 7, messages: [{ id: "stale" }]
+    }))
+    compare(service.messages.length, 0)
+    compare(service.lastError, "")
+    compare(service.requestCommands[String(requestId)], undefined)
+    compare(service.messagesRequestJids[String(requestId)], undefined)
+    compare(lastFrame().command, "get_messages")
+    verify(Number(service.messagesRequestIds.chat) > requestId)
+
+    // A conversation the user is not looking at is cleared but not refetched.
+    service.handleLine(JSON.stringify({
+      event: "invalidated", resource: "messages", key: "other",
+      generation: 1, sequence: 20
+    }))
+    var otherId = service.requestMessages("other")
+    verify(otherId > 0)
+    TestIo.socketWrites = []
+    service.handleLine(JSON.stringify({
+      id: otherId, event: "messages", chat_jid: "other",
+      generation: 1, sequence: 19, messages: []
+    }))
+    compare(service.messagesRequestIds.other, undefined)
+    compare(service.requestCommands[String(otherId)], undefined)
+    compare(service.lastError, "")
+    compare(sentFrames().length, 0)
+
+    // A stale error response releases its command slot silently.
+    service.handleLine(JSON.stringify({
+      event: "unread", total: 1, generation: 2, sequence: 1
+    }))
+    compare(service.daemonGeneration, 2)
+    var voteId = service.send("vote_poll", { chat_jid: "chat" })
+    verify(voteId > 0)
+    TestIo.socketWrites = []
+    service.handleLine(JSON.stringify({
+      id: voteId, event: "error", generation: 1, message: "stale failure"
+    }))
+    compare(service.requestCommands[String(voteId)], undefined)
+    compare(service.lastError, "")
+    compare(service.lastErrorRequestId, "")
+    compare(sentFrames().length, 0)
+  }
+
+  function test_queued_message_refresh_survives_a_request_timeout() {
+    service.selectedChatJid = "chat"
+    var requestId = service.requestMessages("chat")
+    verify(requestId > 0)
+    compare(service.requestMessages("chat", true), requestId)
+    compare(service.messagesQueuedRequests.chat, true)
+    service.requestDeadlines[String(requestId)] = 1
+    TestIo.socketWrites = []
+    compare(service.expireRequests(2), 1)
+    verify(service.lastError.indexOf("get messages timed out") >= 0)
+    compare(service.messagesQueuedRequests.chat, undefined)
+    compare(lastFrame().command, "get_messages")
+    verify(Number(service.messagesRequestIds.chat) > requestId)
+  }
+
   function test_invalidations_refresh_only_the_affected_resource() {
     service.selectedChatJid = "chat"
     TestIo.socketWrites = []
@@ -911,6 +1034,89 @@ TestCase {
     }))
     compare(lastFrame().command, "get_messages")
     compare(service.handleInvalidation({ resource: "unknown" }), false)
+  }
+
+  function messagePage(prefix, count) {
+    var page = []
+    for (var i = 0; i < count; i++)
+      page.push({ id: prefix + i, sender_jid: "me" })
+    return page
+  }
+
+  function test_message_pagination_loads_older_history_on_demand() {
+    compare(service.messagesLimit, 300)
+    compare(service.messagesLimitStep, 300)
+    compare(service.messagesLimitMax, 1000)
+    compare(service.canLoadOlderMessages, false)
+    compare(service.loadOlderMessages(), false)
+
+    service.chats = [{ jid: "chat", is_group: false }]
+    TestIo.socketWrites = []
+    service.selectChat("chat")
+    compare(lastFrameFor("get_messages").limit, 300)
+    compare(service.canLoadOlderMessages, false)
+
+    var requestId = Number(service.messagesRequestIds.chat)
+    service.handleLine(JSON.stringify({
+      id: requestId, event: "messages", chat_jid: "chat",
+      messages: messagePage("m", 300)
+    }))
+    compare(service.messages.length, 300)
+    compare(service.canLoadOlderMessages, true)
+
+    var navigationSerial = service.messagesNavigationSerial
+    messagesWillChangeCount = 0
+    TestIo.socketWrites = []
+    compare(service.loadOlderMessages(), true)
+    compare(service.messagesLimit, 600)
+    compare(lastFrameFor("get_messages").limit, 600)
+    // A second page is already in flight, so the view cannot ask again.
+    compare(service.canLoadOlderMessages, false)
+
+    requestId = Number(service.messagesRequestIds.chat)
+    service.handleLine(JSON.stringify({
+      id: requestId, event: "messages", chat_jid: "chat",
+      messages: messagePage("m", 420)
+    }))
+    compare(service.messages.length, 420)
+    compare(messagesWillChangeCount, 1)
+    // Loading older history is not navigation: the panel keeps its anchor.
+    compare(lastPreservePosition, true)
+    compare(service.messagesNavigationSerial, navigationSerial)
+    compare(service.canLoadOlderMessages, false)
+
+    // The last page stops at the retention the daemon actually keeps.
+    service.messages = messagePage("f", 900)
+    service.messagesLimit = 900
+    compare(service.canLoadOlderMessages, true)
+    TestIo.socketWrites = []
+    compare(service.loadOlderMessages(), true)
+    compare(service.messagesLimit, 1000)
+    compare(lastFrameFor("get_messages").limit, 1000)
+    service.messages = messagePage("f", 1000)
+    compare(service.canLoadOlderMessages, false)
+    compare(service.loadOlderMessages(), false)
+
+    // Selecting another conversation starts again at the first page.
+    service.messagesLimit = 600
+    TestIo.socketWrites = []
+    service.selectChat("other")
+    compare(service.messagesLimit, 300)
+    compare(lastFrameFor("get_messages").limit, 300)
+    service.messagesLimit = 600
+    service.selectChat("other")
+    compare(service.messagesLimit, 600)
+
+    // Without a usable socket the page request cannot be sent, so the limit
+    // stays where the last successful snapshot left it.
+    service.selectedChatJid = "chat"
+    service.messagesChatJid = "chat"
+    service.messages = messagePage("f", 600)
+    compare(service.canLoadOlderMessages, true)
+    var socket = TestIo.sockets[TestIo.sockets.length - 1]
+    socket.connected = false
+    compare(service.loadOlderMessages(), false)
+    compare(service.messagesLimit, 600)
   }
 
   function test_read_intent_requires_visible_focus() {
@@ -951,12 +1157,14 @@ TestCase {
     service.mediaDownloadRequestIds = ({ "999": "chat\nm1" })
     service.messagesRequestIds = ({ chat: 998 })
     service.messagesRequestJids = ({ "998": "chat" })
+    service.avatarRequestTimes = ({ "alice@s.whatsapp.net": Date.now() })
     var socket = TestIo.sockets[TestIo.sockets.length - 1]
     socket.connected = false
     compare(Object.keys(service.mediaDownloadRequests).length, 0)
     compare(Object.keys(service.mediaDownloadRequestIds).length, 0)
     compare(Object.keys(service.messagesRequestIds).length, 0)
     compare(Object.keys(service.messagesRequestJids).length, 0)
+    compare(Object.keys(service.avatarRequestTimes).length, 0)
   }
 
   function test_unrelated_frames_do_not_clear_action_error() {
