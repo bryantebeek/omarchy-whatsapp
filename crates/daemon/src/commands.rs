@@ -39,7 +39,6 @@ pub(crate) async fn canonical_requested_jid(shared: &Shared, raw: &str) -> Strin
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 async fn media_download_payload(
     shared: &Arc<Shared>,
     transport: &Arc<dyn Transport>,
@@ -115,7 +114,6 @@ impl MediaDownloadKind {
 /// job so the command acks without holding a connection permit across network
 /// I/O. Every client learns the outcome through a `media_downloaded` or
 /// `media_download_failed` broadcast.
-#[cfg_attr(coverage_nightly, coverage(off))]
 async fn start_media_download(
     shared: &Arc<Shared>,
     chat_jid: String,
@@ -186,7 +184,19 @@ async fn start_media_download(
     Ok(ServerEvent::Ack)
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
+// A downloaded video is usable without its poster frame, so a failed or
+// panicking preview worker is only logged. Naming the outcomes keeps that
+// decision testable without spawning `ffmpeg`.
+fn log_video_preview_result(result: std::result::Result<Result<bool>, tokio::task::JoinError>) {
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            warn!(%error, "could not generate downloaded video preview");
+        }
+        Err(error) => warn!(%error, "video preview worker panicked"),
+    }
+}
+
 async fn perform_media_download(
     shared: &Arc<Shared>,
     transport: Arc<dyn Transport>,
@@ -302,13 +312,7 @@ async fn perform_media_download(
                 assets::ensure_message_video_thumbnail(&path, &thumbnail_path)
             })
             .await;
-            match preview_result {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    warn!(%error, "could not generate downloaded video preview");
-                }
-                Err(error) => warn!(%error, "video preview worker panicked"),
-            }
+            log_video_preview_result(preview_result);
             if let MessageMedia::Video { downloaded, .. } = &mut media {
                 *downloaded = true;
             }
@@ -349,7 +353,6 @@ async fn perform_media_download(
 // broadcast that `refresh_avatar` publishes. The caller resolves the canonical
 // identity so the in-flight set already deduplicates a contact's LID and
 // phone-number forms.
-#[cfg_attr(coverage_nightly, coverage(off))]
 async fn fetch_requested_avatar(
     shared: &Arc<Shared>,
     transport: Arc<dyn Transport>,
@@ -370,7 +373,6 @@ async fn fetch_requested_avatar(
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 async fn request_exact_message(
     transport: &dyn Transport,
     cursor: &database::HistoryCursor,
@@ -417,7 +419,6 @@ async fn finish_recovery_attempt(shared: &Shared, recovery_key: &str, succeeded:
         .remove(recovery_key)
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 fn schedule_message_recovery(
     shared: &Arc<Shared>,
     transport: Arc<dyn Transport>,
@@ -528,9 +529,9 @@ fn validate_poll_request(
     })
 }
 
-// Upload-and-send adapter for one recording. The durable job transitions, the
-// outbox bounds, and the resulting snapshots are measured in `voice_outbox`.
-#[cfg_attr(coverage_nightly, coverage(off))]
+// Drives one recording through the durable outbox: prepare, assign a delivery
+// identity, upload, send, cache, and record the outcome. The job transitions
+// and the outbox retention bounds themselves live in `voice_outbox`.
 async fn send_voice_message(
     shared: &Arc<Shared>,
     chat_jid: String,
@@ -729,7 +730,6 @@ async fn send_voice_message(
 
 // Voice outbox writes fsync a job file and rename it, so they run on the
 // blocking pool instead of stalling an async worker.
-#[cfg_attr(coverage_nightly, coverage(off))]
 async fn persist_voice_job<F>(
     shared: &Arc<Shared>,
     mut job: voice_outbox::VoiceJob,
@@ -744,10 +744,9 @@ where
         .context("voice outbox write task failed")?
 }
 
-// IPC command-to-SDK dispatch is the outbound transport adapter. Command
-// identity, deadlines, serialization, durable state machines, and response
-// convergence are covered in their dedicated modules and IPC tests.
-#[cfg_attr(coverage_nightly, coverage(off))]
+// IPC command-to-`WhatsApp` dispatch. Command identity, deadlines,
+// serialization, and response convergence belong to `ipc`; every arm below owns
+// only its validation, its outbound calls, and the local state it publishes.
 pub(crate) async fn handle_command(
     command: Command,
     shared: &Arc<Shared>,
@@ -1279,7 +1278,14 @@ mod tests {
     use super::*;
     use crate::state::write_private_marker;
     use crate::test_support::test_shared;
+    use crate::transport::fake::{
+        Call, CallKind, FakeTransport, MediaKind, transport as fake_transport,
+    };
+    use omarchy_whatsapp_protocol::{Resource, TextOutboxStatus, VoiceOutboxStatus};
     use std::collections::HashSet;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+    use whatsapp_rust::GroupMetadata;
 
     #[tokio::test]
     async fn offline_presence_and_active_chat_intent_are_retained() {
@@ -1503,5 +1509,2113 @@ mod tests {
         assert!(validate_poll_request("q", options(), 0, None).is_err());
         assert!(validate_poll_request("q", options(), 3, None).is_err());
         assert!(validate_poll_request("q", options(), 1, Some(2)).is_err());
+    }
+
+    // --- shared fixtures -------------------------------------------------
+
+    fn shared_with_dirs(directory: &tempfile::TempDir) -> Arc<Shared> {
+        let shared = Arc::new(test_shared(directory));
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        assets::private_dir(&shared.media_dir).unwrap();
+        assets::private_dir(&shared.voice_outbox_dir).unwrap();
+        shared
+    }
+
+    async fn attach(shared: &Arc<Shared>, fake: &Arc<FakeTransport>) {
+        *shared.client.write().await = Some(fake_transport(fake));
+    }
+
+    async fn run(shared: &Arc<Shared>, command: Command) -> Result<ServerEvent> {
+        handle_command(command, shared, 0).await
+    }
+
+    fn stored_message(chat_jid: &str, id: &str, media: Option<MessageMedia>) -> Message {
+        Message {
+            id: id.to_owned(),
+            chat_jid: chat_jid.to_owned(),
+            sender_jid: chat_jid.to_owned(),
+            sender_name: "Ada".into(),
+            text: "synthetic".into(),
+            timestamp: 1_700_000_000,
+            from_me: false,
+            receipt: 0,
+            delivered_at: None,
+            read_at: None,
+            delivered_to: Vec::new(),
+            read_by: Vec::new(),
+            media,
+            reactions: Vec::new(),
+        }
+    }
+
+    /// Lets already-spawned background jobs finish; the fake transport never
+    /// blocks, so a bounded number of yields is enough.
+    async fn settle() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Synthetic Ogg Opus, mirroring the generator in `voice_outbox`'s tests so
+    // that no captured recording enters these fixtures.
+    fn ogg_page(sequence: u32, granule: u64, body: &[u8]) -> Vec<u8> {
+        let mut page = Vec::with_capacity(28 + body.len());
+        page.extend_from_slice(b"OggS");
+        page.push(0);
+        page.push(if sequence == 0 { 2 } else { 0 });
+        page.extend_from_slice(&granule.to_le_bytes());
+        page.extend_from_slice(&7u32.to_le_bytes());
+        page.extend_from_slice(&sequence.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes());
+        page.push(1);
+        page.push(u8::try_from(body.len()).unwrap());
+        page.extend_from_slice(body);
+        page
+    }
+
+    fn recording(duration_ms: u64) -> Vec<u8> {
+        let pre_skip = 312u16;
+        let mut opus_head = b"OpusHead".to_vec();
+        opus_head.extend_from_slice(&[1, 1]);
+        opus_head.extend_from_slice(&pre_skip.to_le_bytes());
+        opus_head.extend_from_slice(&48_000u32.to_le_bytes());
+        opus_head.extend_from_slice(&0u16.to_le_bytes());
+        opus_head.push(0);
+        let mut bytes = ogg_page(0, 0, &opus_head);
+        bytes.extend(ogg_page(
+            1,
+            duration_ms * 48 + u64::from(pre_skip),
+            b"synthetic opus packet",
+        ));
+        bytes
+    }
+
+    fn write_recording(shared: &Arc<Shared>, recording_id: &str, duration_ms: u64) {
+        let path = voice_outbox::recording_path(&shared.voice_outbox_dir, recording_id).unwrap();
+        std::fs::write(path, recording(duration_ms)).unwrap();
+    }
+
+    fn seed_media(shared: &Arc<Shared>, chat: &str, id: &str, media: MessageMedia, payload: &[u8]) {
+        let message = stored_message(chat, id, Some(media));
+        shared
+            .database
+            .insert_message(&message, "Ada", false, false)
+            .unwrap();
+        shared
+            .database
+            .store_media_download(chat, id, payload)
+            .unwrap();
+    }
+
+    async fn download_outcome(shared: &Arc<Shared>, chat: &str, id: &str) -> ServerEvent {
+        let mut events = shared.events.subscribe();
+        let command = Command::DownloadMedia {
+            chat_jid: chat.to_owned(),
+            message_id: id.to_owned(),
+        };
+        assert_eq!(run(shared, command).await.unwrap(), ServerEvent::Ack);
+        loop {
+            let frame = events.recv().await.unwrap();
+            if matches!(
+                frame.event,
+                ServerEvent::MediaDownloaded { .. } | ServerEvent::MediaDownloadFailed { .. }
+            ) {
+                return frame.event;
+            }
+        }
+    }
+
+    // --- dispatch ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn commands_that_talk_to_whatsapp_are_rejected_while_unlinked() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let chat = "1@s.whatsapp.net";
+        for command in [
+            Command::GetGroupParticipants {
+                chat_jid: "123-456@g.us".into(),
+            },
+            Command::CreatePoll {
+                chat_jid: chat.into(),
+                question: "Lunch?".into(),
+                options: vec!["Soup".into(), "Salad".into()],
+                selectable_count: 1,
+                correct_option_index: None,
+            },
+            Command::VotePoll {
+                chat_jid: chat.into(),
+                message_id: "poll".into(),
+                selected_options: Vec::new(),
+            },
+            Command::DownloadMedia {
+                chat_jid: chat.into(),
+                message_id: "image".into(),
+            },
+            Command::React {
+                chat_jid: chat.into(),
+                message_id: "image".into(),
+                sender_jid: chat.into(),
+                target_from_me: false,
+                emoji: "👍".into(),
+            },
+            Command::SetChatPinned {
+                chat_jid: chat.into(),
+                pinned: true,
+            },
+            Command::RequestAvatar { jid: chat.into() },
+            Command::SetChatState {
+                chat_jid: chat.into(),
+                state: ChatState::Typing,
+            },
+            Command::Logout,
+        ] {
+            assert_eq!(
+                run(&shared, command).await.unwrap_err().to_string(),
+                "WhatsApp is not connected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_queries_answer_without_a_linked_device() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+
+        assert!(matches!(
+            run(&shared, Command::GetState).await.unwrap(),
+            ServerEvent::State { .. }
+        ));
+        assert_eq!(
+            run(&shared, Command::Ping).await.unwrap(),
+            ServerEvent::Pong
+        );
+        assert_eq!(
+            run(&shared, Command::ListChats { limit: 10 })
+                .await
+                .unwrap(),
+            ServerEvent::Chats { chats: Vec::new() }
+        );
+        assert_eq!(
+            run(&shared, Command::ListVoiceOutbox).await.unwrap(),
+            ServerEvent::VoiceOutbox {
+                entries: Vec::new()
+            }
+        );
+        assert_eq!(
+            run(&shared, Command::ListTextOutbox).await.unwrap(),
+            ServerEvent::TextOutbox {
+                entries: Vec::new()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn participant_lists_are_only_available_for_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let group = "123-456@g.us";
+        let fake = Arc::new(FakeTransport::new().with_group_metadata(
+            group,
+            GroupMetadata {
+                subject: "Garden".into(),
+                ..GroupMetadata::default()
+            },
+        ));
+        attach(&shared, &fake).await;
+
+        assert!(
+            run(
+                &shared,
+                Command::GetGroupParticipants {
+                    chat_jid: "not a jid".into(),
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            run(
+                &shared,
+                Command::GetGroupParticipants {
+                    chat_jid: "1@s.whatsapp.net".into(),
+                }
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "participant lists are only available for group chats"
+        );
+        assert_eq!(
+            run(
+                &shared,
+                Command::GetGroupParticipants {
+                    chat_jid: group.into(),
+                }
+            )
+            .await
+            .unwrap(),
+            ServerEvent::GroupParticipants {
+                chat_jid: group.into(),
+                participants: Vec::new(),
+            }
+        );
+        assert_eq!(
+            fake.calls_of(CallKind::GroupMetadata),
+            vec![Call::GroupMetadata(group.into())]
+        );
+
+        fake.fail(CallKind::GroupMetadata, "offline");
+        assert_eq!(
+            run(
+                &shared,
+                Command::GetGroupParticipants {
+                    chat_jid: group.into(),
+                }
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "loading WhatsApp group participants"
+        );
+    }
+
+    #[tokio::test]
+    async fn getting_messages_schedules_media_and_poll_recovery_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new().with_history_request_id("request-1"));
+        attach(&shared, &fake).await;
+        let _ = shared.clock.begin_generation();
+        let chat = "1@s.whatsapp.net";
+
+        let mut image = stored_message(chat, "image-1", None);
+        image.text = "[Image]".into();
+        shared
+            .database
+            .insert_message(&image, "Ada", false, false)
+            .unwrap();
+        let mut poll = stored_message(
+            chat,
+            "poll-1",
+            Some(MessageMedia::Poll {
+                question: "Lunch?".into(),
+                options: vec![PollOption {
+                    name: "Soup".into(),
+                    votes: 0,
+                    selected_by_me: false,
+                    voter_jids: Vec::new(),
+                }],
+                selectable_count: 1,
+                total_voters: 0,
+                quiz: false,
+                correct_option_index: None,
+                end_timestamp: 0,
+            }),
+        );
+        poll.timestamp += 1;
+        shared
+            .database
+            .insert_message(&poll, "Ada", false, false)
+            .unwrap();
+
+        let event = run(
+            &shared,
+            Command::GetMessages {
+                chat_jid: "1:2@s.whatsapp.net".into(),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        let ServerEvent::Messages {
+            chat_jid, messages, ..
+        } = event
+        else {
+            panic!("expected a message list");
+        };
+        assert_eq!(chat_jid, chat);
+        assert_eq!(messages.len(), 2);
+        settle().await;
+
+        assert_eq!(fake.calls_of(CallKind::FetchMessageHistory).len(), 2);
+        assert_eq!(fake.calls_of(CallKind::RequestPlaceholderResend).len(), 2);
+        let requested = shared.media_recovery_requested.read().await.clone();
+        assert_eq!(
+            requested,
+            HashSet::from([chat.to_owned(), format!("poll:{chat}")])
+        );
+
+        // A successful attempt is remembered, so a refresh does not re-request.
+        fake.clear_calls();
+        run(
+            &shared,
+            Command::GetMessages {
+                chat_jid: chat.into(),
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+        settle().await;
+        assert!(fake.calls_of(CallKind::FetchMessageHistory).is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_is_rearmed_after_a_total_failure_and_after_a_client_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let _ = shared.clock.begin_generation();
+        let cursor = database::HistoryCursor {
+            chat_jid: "1@s.whatsapp.net".into(),
+            message_id: "image-1".into(),
+            sender_jid: "1@s.whatsapp.net".into(),
+            from_me: false,
+            timestamp_ms: 1_700_000_000_000,
+        };
+
+        // Neither request reached WhatsApp, so the next refresh may retry.
+        let broken = Arc::new(
+            FakeTransport::new()
+                .failing(CallKind::RequestPlaceholderResend, "no primary device")
+                .failing(CallKind::FetchMessageHistory, "offline"),
+        );
+        shared
+            .media_recovery_requested
+            .write()
+            .await
+            .insert("failed".into());
+        schedule_message_recovery(
+            &shared,
+            fake_transport(&broken),
+            cursor.clone(),
+            "failed".into(),
+            "media",
+        );
+        settle().await;
+        assert!(
+            !shared
+                .media_recovery_requested
+                .read()
+                .await
+                .contains("failed")
+        );
+
+        // An unparsable chat cannot even build the history request.
+        let unusable = database::HistoryCursor {
+            chat_jid: "not a jid".into(),
+            ..cursor.clone()
+        };
+        shared
+            .media_recovery_requested
+            .write()
+            .await
+            .insert("unusable".into());
+        schedule_message_recovery(
+            &shared,
+            fake_transport(&Arc::new(FakeTransport::new())),
+            unusable,
+            "unusable".into(),
+            "media",
+        );
+        settle().await;
+        assert!(
+            !shared
+                .media_recovery_requested
+                .read()
+                .await
+                .contains("unusable")
+        );
+
+        // A result that belongs to a retired client is dropped rather than
+        // recorded as a completed attempt.
+        let stale = Arc::new(FakeTransport::new());
+        shared
+            .media_recovery_requested
+            .write()
+            .await
+            .insert("stale".into());
+        schedule_message_recovery(
+            &shared,
+            fake_transport(&stale),
+            cursor,
+            "stale".into(),
+            "poll metadata",
+        );
+        let _ = shared.clock.begin_generation();
+        settle().await;
+        assert!(
+            !shared
+                .media_recovery_requested
+                .read()
+                .await
+                .contains("stale")
+        );
+        assert_eq!(stale.calls_of(CallKind::FetchMessageHistory).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_request_names_the_exact_message_and_its_author() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        drop(shared);
+        let fake = Arc::new(FakeTransport::new());
+        let transport = fake_transport(&fake);
+        let mine = database::HistoryCursor {
+            chat_jid: "1@s.whatsapp.net".into(),
+            message_id: "mine".into(),
+            sender_jid: "unused".into(),
+            from_me: true,
+            timestamp_ms: 1_700_000_000_000,
+        };
+        let theirs = database::HistoryCursor {
+            message_id: "theirs".into(),
+            sender_jid: "1@s.whatsapp.net".into(),
+            from_me: false,
+            ..mine.clone()
+        };
+
+        request_exact_message(transport.as_ref(), &mine)
+            .await
+            .unwrap();
+        request_exact_message(transport.as_ref(), &theirs)
+            .await
+            .unwrap();
+        let broken = database::HistoryCursor {
+            sender_jid: "not a jid".into(),
+            ..theirs
+        };
+        assert!(
+            request_exact_message(transport.as_ref(), &broken)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            fake.calls_of(CallKind::RequestPlaceholderResend),
+            vec![
+                Call::RequestPlaceholderResend {
+                    chat: "1@s.whatsapp.net".into(),
+                    message_id: "mine".into(),
+                },
+                Call::RequestPlaceholderResend {
+                    chat: "1@s.whatsapp.net".into(),
+                    message_id: "theirs".into(),
+                },
+            ]
+        );
+    }
+
+    // --- text outbox ------------------------------------------------------
+
+    #[tokio::test]
+    async fn text_messages_are_validated_queued_retried_and_discarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let accepted = ServerEvent::TextAccepted {
+            delivery_id: "d1".into(),
+        };
+
+        assert_eq!(
+            run(
+                &shared,
+                Command::SendMessage {
+                    chat_jid: "1@s.whatsapp.net".into(),
+                    text: "hi".into(),
+                    delivery_id: String::new(),
+                }
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "delivery ID cannot be empty"
+        );
+        assert!(
+            run(
+                &shared,
+                Command::SendMessage {
+                    chat_jid: "not a jid".into(),
+                    text: "hi".into(),
+                    delivery_id: "d1".into(),
+                }
+            )
+            .await
+            .is_err()
+        );
+
+        let send = || Command::SendMessage {
+            chat_jid: "1:2@s.whatsapp.net".into(),
+            text: "  hi  ".into(),
+            delivery_id: "d1".into(),
+        };
+        assert_eq!(run(&shared, send()).await.unwrap(), accepted);
+        assert_eq!(run(&shared, send()).await.unwrap(), accepted);
+        assert!(
+            run(
+                &shared,
+                Command::SendMessage {
+                    chat_jid: "1@s.whatsapp.net".into(),
+                    text: "different".into(),
+                    delivery_id: "d1".into(),
+                }
+            )
+            .await
+            .is_err()
+        );
+
+        let ServerEvent::TextOutbox { entries } =
+            run(&shared, Command::ListTextOutbox).await.unwrap()
+        else {
+            panic!("expected the text outbox");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].chat_jid, "1@s.whatsapp.net");
+        assert_eq!(entries[0].text, "hi");
+        assert_eq!(entries[0].status, TextOutboxStatus::Queued);
+
+        let retry = || Command::RetryTextMessage {
+            delivery_id: "d1".into(),
+        };
+        let discard = || Command::DiscardTextMessage {
+            delivery_id: "d1".into(),
+        };
+        assert_eq!(
+            run(&shared, retry()).await.unwrap_err().to_string(),
+            "text message is not waiting for retry"
+        );
+        shared.database.claim_text_message().unwrap().unwrap();
+        assert_eq!(
+            run(&shared, discard()).await.unwrap_err().to_string(),
+            "text message is sending or is not in the outbox"
+        );
+        shared.database.fail_text_message("d1", "offline").unwrap();
+        assert_eq!(run(&shared, retry()).await.unwrap(), accepted);
+        assert_eq!(run(&shared, discard()).await.unwrap(), ServerEvent::Ack);
+        assert!(shared.database.text_outbox().unwrap().is_empty());
+    }
+
+    // --- polls ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn creating_a_poll_stores_its_secret_and_sends_exactly_one_card() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_pn("31600000000@s.whatsapp.net")
+                .with_poll_secret(&[7u8; 32])
+                .with_message_ids(["POLL-1", "QUIZ-1"]),
+        );
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let mut events = shared.events.subscribe();
+        let poll = |question: &str, correct: Option<u32>| Command::CreatePoll {
+            chat_jid: chat.to_owned(),
+            question: question.to_owned(),
+            options: vec!["Soup".into(), " Salad ".into()],
+            selectable_count: 2,
+            correct_option_index: correct,
+        };
+
+        assert!(run(&shared, poll("   ", None)).await.is_err());
+        assert!(
+            run(
+                &shared,
+                Command::CreatePoll {
+                    chat_jid: "not a jid".into(),
+                    question: "Lunch?".into(),
+                    options: vec!["Soup".into(), "Salad".into()],
+                    selectable_count: 1,
+                    correct_option_index: None,
+                }
+            )
+            .await
+            .is_err()
+        );
+
+        let ServerEvent::Sent { message } = run(&shared, poll(" Lunch? ", None)).await.unwrap()
+        else {
+            panic!("expected the poll card");
+        };
+        assert_eq!(message.id, "POLL-1");
+        assert_eq!(message.text, "[Poll] Lunch?");
+        assert_eq!(message.sender_jid, "me");
+        assert_eq!(
+            fake.calls_of(CallKind::CreatePoll),
+            vec![Call::CreatePoll {
+                chat: chat.into(),
+                question: "Lunch?".into(),
+                options: vec!["Soup".into(), "Salad".into()],
+                selectable_count: 2,
+            }]
+        );
+        let stored = shared
+            .database
+            .poll_for_voting(chat, "POLL-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.creator_jid, "31600000000@s.whatsapp.net");
+        assert_eq!(stored.message_secret, [7u8; 32]);
+
+        let ServerEvent::Sent { message } = run(&shared, poll("Capital?", Some(1))).await.unwrap()
+        else {
+            panic!("expected the quiz card");
+        };
+        assert!(matches!(
+            message.media,
+            Some(MessageMedia::Poll {
+                quiz: true,
+                selectable_count: 1,
+                correct_option_index: Some(1),
+                ..
+            })
+        ));
+        assert_eq!(fake.calls_of(CallKind::CreateQuiz).len(), 1);
+
+        // Other clients only receive a refresh, never a second copy of the card.
+        let published = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|frame| frame.event)
+            .collect::<Vec<_>>();
+        assert!(
+            !published
+                .iter()
+                .any(|event| matches!(event, ServerEvent::Sent { .. }))
+        );
+        assert!(published.iter().any(|event| matches!(
+            event,
+            ServerEvent::Invalidated {
+                resource: Resource::Messages,
+                ..
+            }
+        )));
+
+        fake.fail(CallKind::CreatePoll, "offline");
+        assert!(run(&shared, poll("Dinner?", None)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn voting_is_validated_against_the_stored_poll_card() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_pn("31600000000@s.whatsapp.net")
+                .with_poll_secret(&[9u8; 32])
+                .with_message_ids(["POLL-9"]),
+        );
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        run(
+            &shared,
+            Command::CreatePoll {
+                chat_jid: chat.into(),
+                question: "Lunch?".into(),
+                options: vec!["Soup".into(), "Salad".into(), "Stew".into()],
+                selectable_count: 2,
+                correct_option_index: None,
+            },
+        )
+        .await
+        .unwrap();
+        let vote = |message_id: &str, options: &[&str]| Command::VotePoll {
+            chat_jid: chat.to_owned(),
+            message_id: message_id.to_owned(),
+            selected_options: options.iter().map(|name| (*name).to_owned()).collect(),
+        };
+
+        for invalid in [String::new(), "x".repeat(513)] {
+            assert_eq!(
+                run(&shared, vote(&invalid, &[]))
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "invalid poll message ID"
+            );
+        }
+        assert_eq!(
+            run(&shared, vote("missing", &[]))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "poll details are unavailable; its history may need to be recovered"
+        );
+        assert_eq!(
+            run(&shared, vote("POLL-9", &["Pizza"]))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "poll vote contains an unknown option"
+        );
+        assert_eq!(
+            run(&shared, vote("POLL-9", &["Soup", "Salad", "Stew"]))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "poll vote selects more options than the poll allows"
+        );
+
+        assert_eq!(
+            run(&shared, vote("POLL-9", &["Soup", "Soup", "Salad"]))
+                .await
+                .unwrap(),
+            ServerEvent::Ack
+        );
+        assert_eq!(
+            fake.calls_of(CallKind::VotePoll),
+            vec![Call::VotePoll {
+                chat: chat.into(),
+                poll_message_id: "POLL-9".into(),
+                creator_jid: "31600000000@s.whatsapp.net".into(),
+                message_secret: vec![9u8; 32],
+                option_names: vec!["Soup".into(), "Salad".into()],
+            }]
+        );
+        let stored = shared
+            .database
+            .message_by_id(chat, "POLL-9")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stored.media,
+            Some(MessageMedia::Poll {
+                total_voters: 1,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_closed_poll_no_longer_accepts_votes() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let message = stored_message(
+            chat,
+            "ended",
+            Some(MessageMedia::Poll {
+                question: "Lunch?".into(),
+                options: vec![PollOption {
+                    name: "Soup".into(),
+                    votes: 0,
+                    selected_by_me: false,
+                    voter_jids: Vec::new(),
+                }],
+                selectable_count: 1,
+                total_voters: 0,
+                quiz: false,
+                correct_option_index: None,
+                end_timestamp: 1,
+            }),
+        );
+        shared
+            .database
+            .insert_message(&message, "Ada", false, false)
+            .unwrap();
+        shared
+            .database
+            .store_poll_secret(chat, "ended", "31600000000@s.whatsapp.net", &[3u8; 32])
+            .unwrap();
+
+        assert_eq!(
+            run(
+                &shared,
+                Command::VotePoll {
+                    chat_jid: chat.into(),
+                    message_id: "ended".into(),
+                    selected_options: vec!["Soup".into()],
+                }
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "this poll has ended"
+        );
+        assert!(fake.calls_of(CallKind::VotePoll).is_empty());
+    }
+
+    // --- reactions, receipts, pins ----------------------------------------
+
+    #[tokio::test]
+    async fn reacting_to_a_direct_message_needs_no_participant_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        shared
+            .database
+            .insert_message(&stored_message(chat, "m1", None), "Ada", false, false)
+            .unwrap();
+        let react = |chat_jid: &str, message_id: &str, emoji: &str| Command::React {
+            chat_jid: chat_jid.to_owned(),
+            message_id: message_id.to_owned(),
+            sender_jid: chat.to_owned(),
+            target_from_me: false,
+            emoji: emoji.to_owned(),
+        };
+
+        assert_eq!(
+            run(&shared, react(chat, "", "👍"))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "reaction target is missing"
+        );
+        assert_eq!(
+            run(&shared, react(chat, "m1", "\u{1}"))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "reaction must be a short emoji"
+        );
+        assert!(run(&shared, react("not a jid", "m1", "👍")).await.is_err());
+
+        assert_eq!(
+            run(&shared, react("1:2@s.whatsapp.net", "m1", "👍"))
+                .await
+                .unwrap(),
+            ServerEvent::Ack
+        );
+
+        let reactions = fake.calls_of(CallKind::SendReaction);
+        let [
+            Call::SendReaction {
+                chat: reacted_chat,
+                target_key,
+                emoji,
+            },
+        ] = reactions.as_slice()
+        else {
+            panic!("expected exactly one reaction");
+        };
+        assert_eq!(reacted_chat, chat);
+        assert_eq!(emoji, "👍");
+        assert_eq!(target_key.participant, None);
+        assert_eq!(target_key.from_me, Some(false));
+        assert_eq!(target_key.id.as_deref(), Some("m1"));
+        assert_eq!(target_key.remote_jid.as_deref(), Some(chat));
+        let stored = shared.database.message_by_id(chat, "m1").unwrap().unwrap();
+        assert_eq!(stored.reactions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_group_reaction_addresses_the_original_author() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let group = "123-456@g.us";
+        let fake = Arc::new(FakeTransport::new().with_lid("100000000000000@lid"));
+        attach(&shared, &fake).await;
+        let react = |from_me: bool, sender: &str| Command::React {
+            chat_jid: group.to_owned(),
+            message_id: "m1".into(),
+            sender_jid: sender.to_owned(),
+            target_from_me: from_me,
+            emoji: "👍".into(),
+        };
+
+        assert!(run(&shared, react(false, "not a jid")).await.is_err());
+        run(&shared, react(false, "31600000000:3@s.whatsapp.net"))
+            .await
+            .unwrap();
+        run(&shared, react(true, "unused")).await.unwrap();
+
+        let participants = fake
+            .calls_of(CallKind::SendReaction)
+            .into_iter()
+            .map(|call| match call {
+                Call::SendReaction { target_key, .. } => target_key.participant.clone(),
+                _ => unreachable!("filtered by call kind"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            participants,
+            vec![
+                Some("31600000000@s.whatsapp.net".to_owned()),
+                Some("100000000000000@lid".to_owned()),
+            ]
+        );
+
+        // Without a LID the phone-number identity is used instead.
+        let phone_only = Arc::new(FakeTransport::new().with_pn("31600000000@s.whatsapp.net"));
+        attach(&shared, &phone_only).await;
+        run(&shared, react(true, "unused")).await.unwrap();
+        let phone_reactions = phone_only.calls_of(CallKind::SendReaction);
+        let [Call::SendReaction { target_key, .. }] = phone_reactions.as_slice() else {
+            panic!("expected exactly one reaction");
+        };
+        assert_eq!(
+            target_key.participant.as_deref(),
+            Some("31600000000@s.whatsapp.net")
+        );
+
+        // An unpaired device has no identity to react with at all.
+        let anonymous = Arc::new(FakeTransport::new());
+        attach(&shared, &anonymous).await;
+        assert_eq!(
+            run(&shared, react(true, "unused"))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "WhatsApp identity is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn marking_a_chat_read_queues_receipts_and_republishes_the_total() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let chat = "1@s.whatsapp.net";
+        shared
+            .database
+            .insert_message(&stored_message(chat, "m1", None), "Ada", false, true)
+            .unwrap();
+        assert_eq!(shared.database.unread_total().unwrap(), 1);
+        let mut events = shared.events.subscribe();
+
+        assert_eq!(
+            run(
+                &shared,
+                Command::MarkRead {
+                    chat_jid: chat.into(),
+                }
+            )
+            .await
+            .unwrap(),
+            ServerEvent::Ack
+        );
+
+        assert_eq!(shared.database.unread_total().unwrap(), 0);
+        let batch = shared.database.next_read_batch().unwrap().unwrap();
+        assert_eq!(batch.chat_jid, chat);
+        assert_eq!(batch.receipts.len(), 1);
+        let published = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|frame| frame.event)
+            .collect::<Vec<_>>();
+        assert!(published.contains(&ServerEvent::Unread { total: 0 }));
+    }
+
+    #[tokio::test]
+    async fn pinning_a_chat_updates_whatsapp_and_the_local_chat_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let pin = |pinned: bool| Command::SetChatPinned {
+            chat_jid: chat.to_owned(),
+            pinned,
+        };
+
+        assert!(
+            run(
+                &shared,
+                Command::SetChatPinned {
+                    chat_jid: "not a jid".into(),
+                    pinned: true,
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(run(&shared, pin(true)).await.unwrap(), ServerEvent::Ack);
+        assert_eq!(run(&shared, pin(false)).await.unwrap(), ServerEvent::Ack);
+        assert_eq!(
+            fake.calls_of(CallKind::PinChat),
+            vec![Call::PinChat(chat.into())]
+        );
+        assert_eq!(
+            fake.calls_of(CallKind::UnpinChat),
+            vec![Call::UnpinChat(chat.into())]
+        );
+
+        fake.fail(CallKind::PinChat, "offline");
+        assert_eq!(
+            run(&shared, pin(true)).await.unwrap_err().to_string(),
+            "offline"
+        );
+    }
+
+    // --- presence, chat state, session ------------------------------------
+
+    #[tokio::test]
+    async fn connected_presence_intent_subscribes_and_unsubscribes_the_active_chat() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new().with_push_name("Ada"));
+        attach(&shared, &fake).await;
+        let connection_id = shared.open_connection();
+
+        for command in [
+            Command::SetPresence { available: true },
+            Command::SetActiveChat {
+                chat_jid: Some("1@s.whatsapp.net".into()),
+            },
+            Command::SetActiveChat { chat_jid: None },
+            Command::SetPresence { available: false },
+        ] {
+            assert_eq!(
+                handle_command(command, &shared, connection_id)
+                    .await
+                    .unwrap(),
+                ServerEvent::Ack
+            );
+        }
+
+        assert_eq!(
+            fake.calls_of(CallKind::SubscribePresence),
+            vec![Call::SubscribePresence("1@s.whatsapp.net".into())]
+        );
+        assert_eq!(
+            fake.calls_of(CallKind::UnsubscribePresence),
+            vec![Call::UnsubscribePresence("1@s.whatsapp.net".into())]
+        );
+        assert_eq!(fake.calls_of(CallKind::SetAvailable).len(), 1);
+        assert_eq!(fake.calls_of(CallKind::SetUnavailable).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_chat_state_reaches_whatsapp() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let typing = || Command::SetChatState {
+            chat_jid: chat.to_owned(),
+            state: ChatState::Typing,
+        };
+
+        for (state, kind) in [
+            (ChatState::Typing, CallKind::SendComposing),
+            (ChatState::Recording, CallKind::SendRecording),
+            (ChatState::Paused, CallKind::SendPaused),
+        ] {
+            assert_eq!(
+                run(
+                    &shared,
+                    Command::SetChatState {
+                        chat_jid: chat.into(),
+                        state,
+                    }
+                )
+                .await
+                .unwrap(),
+                ServerEvent::Ack
+            );
+            assert_eq!(fake.calls_of(kind).len(), 1);
+        }
+
+        assert!(
+            run(
+                &shared,
+                Command::SetChatState {
+                    chat_jid: "not a jid".into(),
+                    state: ChatState::Typing,
+                }
+            )
+            .await
+            .is_err()
+        );
+        fake.fail(CallKind::SendComposing, "offline");
+        assert!(run(&shared, typing()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_chat_state_resync_that_cannot_be_armed_reports_the_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut shared = test_shared(&directory);
+        shared.event_sync_marker = directory.path().join("marker-directory");
+        std::fs::create_dir(&shared.event_sync_marker).unwrap();
+        let shared = Arc::new(shared);
+        *shared.status.write().await = ConnectionStatus::Connected;
+        let mut events = shared.events.subscribe();
+
+        assert_eq!(
+            run(&shared, Command::ResyncChatState)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "arming WhatsApp chat-state resync"
+        );
+
+        assert!(!shared.chat_state_resync_requested.load(Ordering::SeqCst));
+        assert_eq!(
+            events.recv().await.unwrap().event,
+            ServerEvent::ChatStateResync {
+                status: ChatStateResyncStatus::Failed,
+                message: Some("Could not schedule the WhatsApp chat-state replay".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn logging_out_unlinks_once_and_stops_the_run_loop() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let mut signal = shared.arm_logout();
+
+        assert_eq!(
+            run(&shared, Command::Logout).await.unwrap(),
+            ServerEvent::Ack
+        );
+
+        assert!(shared.logout_requested.load(Ordering::SeqCst));
+        assert!(signal.try_recv().is_ok());
+        assert_eq!(fake.call_kinds(), vec![CallKind::Logout]);
+        assert_eq!(
+            run(&shared, Command::Logout).await.unwrap_err().to_string(),
+            "a WhatsApp logout is already in progress"
+        );
+    }
+
+    // --- avatars ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn avatar_requests_are_deduplicated_by_canonical_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let jid = "1@s.whatsapp.net";
+
+        assert!(
+            run(
+                &shared,
+                Command::RequestAvatar {
+                    jid: "not a jid".into(),
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            run(
+                &shared,
+                Command::RequestAvatar {
+                    jid: "1:2@s.whatsapp.net".into(),
+                }
+            )
+            .await
+            .unwrap(),
+            ServerEvent::Ack
+        );
+        settle().await;
+
+        assert!(shared.avatar_fetches.lock().await.is_empty());
+        assert!(assets::avatar_missing_path(&shared.avatar_dir, jid).exists());
+        assert_eq!(
+            fake.calls_of(CallKind::ProfilePicture),
+            vec![Call::ProfilePicture(jid.into())]
+        );
+
+        // A fetch already in flight for the same identity is acked, not repeated.
+        shared.avatar_fetches.lock().await.insert(jid.to_owned());
+        fake.clear_calls();
+        assert_eq!(
+            run(&shared, Command::RequestAvatar { jid: jid.into() })
+                .await
+                .unwrap(),
+            ServerEvent::Ack
+        );
+        settle().await;
+        assert!(fake.calls_of(CallKind::ProfilePicture).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_avatar_fetch_gives_up_on_a_slow_answer_or_a_closed_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_delay(CallKind::ProfilePicture, jobs::AVATAR_FETCH_TIMEOUT * 2),
+        );
+        let transport = fake_transport(&fake);
+
+        fetch_requested_avatar(
+            &shared,
+            Arc::clone(&transport),
+            "1@s.whatsapp.net".parse().unwrap(),
+        )
+        .await;
+        assert!(!assets::avatar_missing_path(&shared.avatar_dir, "1@s.whatsapp.net").exists());
+
+        shared.avatar_fetch_permits.close();
+        fake.clear_calls();
+        fetch_requested_avatar(&shared, transport, "2@s.whatsapp.net".parse().unwrap()).await;
+        assert!(fake.calls().is_empty());
+    }
+
+    // --- media downloads --------------------------------------------------
+
+    #[tokio::test]
+    async fn downloading_an_image_writes_the_private_cache_and_broadcasts_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let bytes = b"\xff\xd8\xffsynthetic image".to_vec();
+        let fake = Arc::new(FakeTransport::new().with_download_bytes(&bytes));
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let payload = wa::message::ImageMessage {
+            mimetype: Some("image/jpeg".into()),
+            file_length: Some(u64::try_from(bytes.len()).unwrap()),
+            width: Some(2),
+            height: Some(3),
+            jpeg_thumbnail: Some(b"\xff\xd8\xffpreview".to_vec()),
+            ..wa::message::ImageMessage::default()
+        };
+        seed_media(
+            &shared,
+            chat,
+            "image-1",
+            MessageMedia::Image {
+                path: String::new(),
+                thumbnail_path: String::new(),
+                downloaded: false,
+                mime_type: "image/jpeg".into(),
+                width: 2,
+                height: 3,
+            },
+            &payload.encode_to_vec(),
+        );
+
+        let event = download_outcome(&shared, chat, "image-1").await;
+
+        let ServerEvent::MediaDownloaded {
+            media, message_id, ..
+        } = event
+        else {
+            panic!("expected a downloaded image, got {event:?}");
+        };
+        assert_eq!(message_id, "image-1");
+        let MessageMedia::Image {
+            path,
+            thumbnail_path,
+            downloaded,
+            ..
+        } = media
+        else {
+            panic!("expected image media");
+        };
+        assert!(downloaded);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(&thumbnail_path).unwrap(),
+            b"\xff\xd8\xffpreview"
+        );
+        assert_eq!(
+            fake.calls_of(CallKind::Download),
+            vec![Call::Download(MediaKind::Image)]
+        );
+        assert!(shared.media_downloads.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn downloading_a_sticker_requires_webp_and_refuses_lottie() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let bytes = b"RIFF\x08\0\0\0WEBPVP8 ".to_vec();
+        let fake = Arc::new(FakeTransport::new().with_download_bytes(&bytes));
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let sticker_media = MessageMedia::Sticker {
+            path: String::new(),
+            thumbnail_path: String::new(),
+            downloaded: false,
+            mime_type: "image/webp".into(),
+            width: 512,
+            height: 512,
+            animated: false,
+            lottie: false,
+            accessibility_label: String::new(),
+        };
+        let payload = wa::message::StickerMessage {
+            mimetype: Some("image/webp".into()),
+            file_length: Some(u64::try_from(bytes.len()).unwrap()),
+            width: Some(512),
+            height: Some(512),
+            png_thumbnail: Some(b"\x89PNG\r\n\x1a\npreview".to_vec()),
+            ..wa::message::StickerMessage::default()
+        };
+        seed_media(
+            &shared,
+            chat,
+            "sticker-1",
+            sticker_media.clone(),
+            &payload.encode_to_vec(),
+        );
+        let lottie = wa::message::StickerMessage {
+            is_lottie: Some(true),
+            ..payload
+        };
+        seed_media(
+            &shared,
+            chat,
+            "sticker-2",
+            sticker_media,
+            &lottie.encode_to_vec(),
+        );
+
+        let event = download_outcome(&shared, chat, "sticker-1").await;
+        let ServerEvent::MediaDownloaded { media, .. } = event else {
+            panic!("expected a downloaded sticker, got {event:?}");
+        };
+        let MessageMedia::Sticker {
+            path,
+            thumbnail_path,
+            downloaded,
+            ..
+        } = media
+        else {
+            panic!("expected sticker media");
+        };
+        assert!(downloaded);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(thumbnail_path).unwrap(),
+            b"\x89PNG\r\n\x1a\npreview"
+        );
+
+        assert_eq!(
+            download_outcome(&shared, chat, "sticker-2").await,
+            ServerEvent::MediaDownloadFailed {
+                chat_jid: chat.into(),
+                message_id: "sticker-2".into(),
+                message: "Lottie sticker animation is not supported safely".into(),
+            }
+        );
+        assert_eq!(
+            fake.calls_of(CallKind::Download),
+            vec![Call::Download(MediaKind::Sticker)]
+        );
+    }
+
+    #[tokio::test]
+    async fn downloading_a_video_keeps_its_embedded_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let bytes = b"\0\0\0\x18ftypisomsynthetic".to_vec();
+        let fake = Arc::new(FakeTransport::new().with_download_bytes(&bytes));
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let payload = wa::message::VideoMessage {
+            mimetype: Some("video/mp4".into()),
+            file_length: Some(u64::try_from(bytes.len()).unwrap()),
+            width: Some(4),
+            height: Some(2),
+            seconds: Some(9),
+            jpeg_thumbnail: Some(b"\xff\xd8\xffpreview".to_vec()),
+            ..wa::message::VideoMessage::default()
+        };
+        seed_media(
+            &shared,
+            chat,
+            "video-1",
+            MessageMedia::Video {
+                path: String::new(),
+                thumbnail_path: String::new(),
+                downloaded: false,
+                mime_type: "video/mp4".into(),
+                width: 4,
+                height: 2,
+                duration_seconds: 9,
+                gif_playback: false,
+            },
+            &payload.encode_to_vec(),
+        );
+
+        let event = download_outcome(&shared, chat, "video-1").await;
+
+        let ServerEvent::MediaDownloaded { media, .. } = event else {
+            panic!("expected a downloaded video, got {event:?}");
+        };
+        let MessageMedia::Video {
+            path,
+            thumbnail_path,
+            downloaded,
+            duration_seconds,
+            ..
+        } = media
+        else {
+            panic!("expected video media");
+        };
+        assert!(downloaded);
+        assert_eq!(duration_seconds, 9);
+        assert!(path.ends_with(".video.mp4"));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(thumbnail_path).unwrap(),
+            b"\xff\xd8\xffpreview"
+        );
+        assert_eq!(
+            fake.calls_of(CallKind::Download),
+            vec![Call::Download(MediaKind::Video)]
+        );
+    }
+
+    #[tokio::test]
+    async fn downloading_a_voice_note_writes_ogg_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let bytes = b"OggSsynthetic voice".to_vec();
+        let fake = Arc::new(FakeTransport::new().with_download_bytes(&bytes));
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let payload = wa::message::AudioMessage {
+            mimetype: Some("audio/ogg; codecs=opus".into()),
+            file_length: Some(u64::try_from(bytes.len()).unwrap()),
+            seconds: Some(4),
+            ptt: Some(true),
+            ..wa::message::AudioMessage::default()
+        };
+        seed_media(
+            &shared,
+            chat,
+            "audio-1",
+            MessageMedia::Audio {
+                path: String::new(),
+                downloaded: false,
+                mime_type: "audio/ogg; codecs=opus".into(),
+                duration_seconds: 4,
+                voice_message: true,
+            },
+            &payload.encode_to_vec(),
+        );
+
+        let event = download_outcome(&shared, chat, "audio-1").await;
+
+        let ServerEvent::MediaDownloaded { media, .. } = event else {
+            panic!("expected downloaded audio, got {event:?}");
+        };
+        let MessageMedia::Audio {
+            path,
+            downloaded,
+            voice_message,
+            ..
+        } = media
+        else {
+            panic!("expected audio media");
+        };
+        assert!(downloaded);
+        assert!(voice_message);
+        assert!(path.ends_with(".audio.ogg"));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            fake.calls_of(CallKind::Download),
+            vec![Call::Download(MediaKind::Audio)]
+        );
+    }
+
+    #[tokio::test]
+    async fn media_download_requests_are_validated_and_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let download = |message_id: &str| Command::DownloadMedia {
+            chat_jid: chat.to_owned(),
+            message_id: message_id.to_owned(),
+        };
+
+        for invalid in [String::new(), "x".repeat(513)] {
+            assert_eq!(
+                run(&shared, download(&invalid))
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "invalid media message ID"
+            );
+        }
+        assert_eq!(
+            run(&shared, download("unknown"))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "message does not contain downloadable media"
+        );
+
+        shared
+            .database
+            .insert_message(
+                &stored_message(
+                    chat,
+                    "document-1",
+                    Some(MessageMedia::Document {
+                        path: String::new(),
+                        file_name: "quote.pdf".into(),
+                        mime_type: "application/pdf".into(),
+                        file_size: 4,
+                        page_count: 1,
+                    }),
+                ),
+                "Ada",
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            run(&shared, download("document-1"))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "this media type does not require a download"
+        );
+
+        seed_media(
+            &shared,
+            chat,
+            "image-1",
+            MessageMedia::Image {
+                path: String::new(),
+                thumbnail_path: String::new(),
+                downloaded: false,
+                mime_type: "image/jpeg".into(),
+                width: 1,
+                height: 1,
+            },
+            b"payload",
+        );
+        // A transfer already queued for this message reports its own outcome.
+        let key = format!("{chat}\0image-1");
+        shared.media_downloads.lock().await.insert(key.clone());
+        assert_eq!(
+            run(&shared, download("image-1")).await.unwrap(),
+            ServerEvent::Ack
+        );
+
+        let mut downloads = shared.media_downloads.lock().await;
+        for index in 0..jobs::MAX_PENDING_MEDIA_DOWNLOADS {
+            downloads.insert(format!("queued-{index}"));
+        }
+        downloads.remove(&key);
+        drop(downloads);
+        assert_eq!(
+            run(&shared, download("image-1"))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "too many downloads are already queued"
+        );
+        assert!(fake.calls_of(CallKind::Download).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_download_that_cannot_be_decoded_or_finished_is_reported_as_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let bytes = b"\xff\xd8\xffsynthetic image".to_vec();
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_download_bytes(&bytes)
+                .with_delay(CallKind::Download, jobs::MEDIA_DOWNLOAD_TIMEOUT * 2),
+        );
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let image_media = MessageMedia::Image {
+            path: String::new(),
+            thumbnail_path: String::new(),
+            downloaded: false,
+            mime_type: "image/jpeg".into(),
+            width: 1,
+            height: 1,
+        };
+        seed_media(
+            &shared,
+            chat,
+            "corrupt",
+            image_media.clone(),
+            &[0xff, 0xff, 0xff, 0xff],
+        );
+        let payload = wa::message::ImageMessage {
+            mimetype: Some("image/jpeg".into()),
+            file_length: Some(u64::try_from(bytes.len()).unwrap()),
+            ..wa::message::ImageMessage::default()
+        };
+        seed_media(&shared, chat, "slow", image_media, &payload.encode_to_vec());
+
+        let ServerEvent::MediaDownloadFailed { message, .. } =
+            download_outcome(&shared, chat, "corrupt").await
+        else {
+            panic!("expected a decoding failure");
+        };
+        assert_eq!(message, "reading image download metadata");
+
+        let ServerEvent::MediaDownloadFailed { message, .. } =
+            download_outcome(&shared, chat, "slow").await
+        else {
+            panic!("expected a timeout failure");
+        };
+        assert_eq!(message, "image download timed out");
+        assert!(shared.media_downloads.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_download_without_a_private_cache_fails_before_any_transfer() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new().with_download_bytes(b"\xff\xd8\xffunreachable"));
+        attach(&shared, &fake).await;
+        let chat = "1@s.whatsapp.net";
+        let jpeg = b"\xff\xd8\xffpreview".to_vec();
+
+        let image = wa::message::ImageMessage {
+            file_length: Some(16),
+            jpeg_thumbnail: Some(jpeg.clone()),
+            ..wa::message::ImageMessage::default()
+        };
+        seed_media(
+            &shared,
+            chat,
+            "image-1",
+            MessageMedia::Image {
+                path: String::new(),
+                thumbnail_path: String::new(),
+                downloaded: false,
+                mime_type: "image/jpeg".into(),
+                width: 1,
+                height: 1,
+            },
+            &image.encode_to_vec(),
+        );
+        let sticker = wa::message::StickerMessage {
+            file_length: Some(16),
+            png_thumbnail: Some(b"\x89PNG\r\n\x1a\npreview".to_vec()),
+            ..wa::message::StickerMessage::default()
+        };
+        seed_media(
+            &shared,
+            chat,
+            "sticker-1",
+            MessageMedia::Sticker {
+                path: String::new(),
+                thumbnail_path: String::new(),
+                downloaded: false,
+                mime_type: "image/webp".into(),
+                width: 1,
+                height: 1,
+                animated: false,
+                lottie: false,
+                accessibility_label: String::new(),
+            },
+            &sticker.encode_to_vec(),
+        );
+        let video = wa::message::VideoMessage {
+            mimetype: Some("video/mp4".into()),
+            file_length: Some(16),
+            jpeg_thumbnail: Some(jpeg),
+            ..wa::message::VideoMessage::default()
+        };
+        seed_media(
+            &shared,
+            chat,
+            "video-1",
+            MessageMedia::Video {
+                path: String::new(),
+                thumbnail_path: String::new(),
+                downloaded: false,
+                mime_type: "video/mp4".into(),
+                width: 1,
+                height: 1,
+                duration_seconds: 1,
+                gif_playback: false,
+            },
+            &video.encode_to_vec(),
+        );
+        std::fs::remove_dir_all(&shared.media_dir).unwrap();
+
+        for message_id in ["image-1", "sticker-1", "video-1"] {
+            let outcome = download_outcome(&shared, chat, message_id).await;
+            assert!(
+                matches!(outcome, ServerEvent::MediaDownloadFailed { .. }),
+                "{message_id} reported {outcome:?}"
+            );
+        }
+        assert!(fake.calls_of(CallKind::Download).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_metadata_is_recovered_from_history_or_reported_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new().with_history_request_id("request-1"));
+        let transport = fake_transport(&fake);
+        let chat = "1@s.whatsapp.net";
+
+        assert_eq!(
+            media_download_payload(&shared, &transport, chat, "gone", "image")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "image message is no longer in local history"
+        );
+
+        for id in ["stored", "arriving", "missing"] {
+            shared
+                .database
+                .insert_message(&stored_message(chat, id, None), "Ada", false, false)
+                .unwrap();
+        }
+        shared
+            .database
+            .store_media_download(chat, "stored", b"payload")
+            .unwrap();
+        assert_eq!(
+            media_download_payload(&shared, &transport, chat, "stored", "image")
+                .await
+                .unwrap(),
+            b"payload".to_vec()
+        );
+        assert!(fake.calls().is_empty());
+
+        let arriving = Arc::clone(&shared);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            arriving
+                .database
+                .store_media_download("1@s.whatsapp.net", "arriving", b"recovered")
+                .unwrap();
+        });
+        assert_eq!(
+            media_download_payload(&shared, &transport, chat, "arriving", "image")
+                .await
+                .unwrap(),
+            b"recovered".to_vec()
+        );
+        assert_eq!(
+            fake.calls_of(CallKind::FetchMessageHistory),
+            vec![Call::FetchMessageHistory {
+                chat: chat.into(),
+                oldest_message_id: "arriving".into(),
+                oldest_message_from_me: false,
+                oldest_message_timestamp_ms: 1_700_000_000_000,
+                count: 3,
+            }]
+        );
+
+        assert_eq!(
+            media_download_payload(&shared, &transport, chat, "missing", "video")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "WhatsApp did not return download details for this video"
+        );
+
+        fake.fail(CallKind::FetchMessageHistory, "offline");
+        assert_eq!(
+            media_download_payload(&shared, &transport, chat, "missing", "image")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "requesting image download metadata"
+        );
+        fake.fail(CallKind::RequestPlaceholderResend, "no primary device");
+        assert_eq!(
+            media_download_payload(&shared, &transport, chat, "missing", "image")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "requesting exact image message"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_panicking_video_preview_only_warns() {
+        log_video_preview_result(Ok(Ok(true)));
+        log_video_preview_result(Ok(Err(anyhow!("ffmpeg is unavailable"))));
+        let panicked = tokio::spawn(async {
+            panic!("video preview worker");
+        })
+        .await
+        .unwrap_err();
+        log_video_preview_result(Err(panicked));
+    }
+
+    // --- voice messages ---------------------------------------------------
+
+    #[tokio::test]
+    async fn sending_a_recording_uploads_caches_and_completes_the_outbox_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new().with_message_ids(["VOICE-1"]));
+        attach(&shared, &fake).await;
+        write_recording(&shared, "voice-1", 2_400);
+        let mut events = shared.events.subscribe();
+
+        let event = run(
+            &shared,
+            Command::SendVoiceMessage {
+                chat_jid: "1:2@s.whatsapp.net".into(),
+                recording_id: "voice-1".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let ServerEvent::Sent { message } = event else {
+            panic!("expected the sent voice message");
+        };
+        assert_eq!(message.id, "VOICE-1");
+        assert_eq!(message.chat_jid, "1@s.whatsapp.net");
+        assert_eq!(message.text, "[Voice message]");
+        let Some(MessageMedia::Audio {
+            path,
+            downloaded,
+            duration_seconds,
+            voice_message,
+            ..
+        }) = message.media
+        else {
+            panic!("expected audio media");
+        };
+        assert!(downloaded);
+        assert!(voice_message);
+        assert_eq!(duration_seconds, 3);
+        assert_eq!(std::fs::read(path).unwrap(), recording(2_400));
+        assert_eq!(
+            fake.calls_of(CallKind::UploadAudioMessage),
+            vec![Call::UploadAudioMessage {
+                byte_count: recording(2_400).len(),
+                duration_seconds: Some(3),
+                ptt: Some(true),
+            }]
+        );
+        assert!(
+            shared
+                .database
+                .message_by_id("1@s.whatsapp.net", "VOICE-1")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            voice_outbox::entries(&shared.voice_outbox_dir)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !voice_outbox::recording_path(&shared.voice_outbox_dir, "voice-1")
+                .unwrap()
+                .exists()
+        );
+        let published = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|frame| frame.event)
+            .collect::<Vec<_>>();
+        assert!(
+            published
+                .iter()
+                .any(|event| matches!(event, ServerEvent::VoiceOutbox { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retried_recording_keeps_its_delivery_id_and_skips_a_second_upload() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_message_ids(["VOICE-9"])
+                .failing(CallKind::UploadAudioMessage, "upload rejected"),
+        );
+        attach(&shared, &fake).await;
+        write_recording(&shared, "voice-9", 1_000);
+        let send = || Command::SendVoiceMessage {
+            chat_jid: "1@s.whatsapp.net".into(),
+            recording_id: "voice-9".into(),
+        };
+
+        assert_eq!(
+            run(&shared, send()).await.unwrap_err().to_string(),
+            "uploading voice message"
+        );
+        let entries = voice_outbox::entries(&shared.voice_outbox_dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, VoiceOutboxStatus::Failed);
+        assert_eq!(entries[0].error.as_deref(), Some("uploading voice message"));
+
+        // The delivery already reached WhatsApp out of band, so the retry
+        // adopts the stored message instead of uploading a duplicate.
+        shared
+            .database
+            .insert_message(
+                &stored_message("1@s.whatsapp.net", "VOICE-9", None),
+                "Ada",
+                false,
+                false,
+            )
+            .unwrap();
+        fake.succeed(CallKind::UploadAudioMessage);
+
+        let ServerEvent::Sent { message } = run(&shared, send()).await.unwrap() else {
+            panic!("expected the sent voice message");
+        };
+        assert_eq!(message.id, "VOICE-9");
+        assert_eq!(fake.calls_of(CallKind::UploadAudioMessage).len(), 1);
+        assert_eq!(fake.calls_of(CallKind::GenerateMessageId).len(), 1);
+        assert!(
+            voice_outbox::entries(&shared.voice_outbox_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_sends_that_cannot_start_or_finish_fail_the_outbox_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let send = |recording_id: &str| Command::SendVoiceMessage {
+            chat_jid: "1@s.whatsapp.net".to_owned(),
+            recording_id: recording_id.to_owned(),
+        };
+
+        assert!(
+            run(
+                &shared,
+                Command::SendVoiceMessage {
+                    chat_jid: "not a jid".into(),
+                    recording_id: "voice-2".into(),
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(run(&shared, send("voice-2")).await.is_err());
+
+        // Without a linked device the job is retained as failed.
+        write_recording(&shared, "voice-2", 1_000);
+        assert_eq!(
+            run(&shared, send("voice-2")).await.unwrap_err().to_string(),
+            "WhatsApp is not connected"
+        );
+        let entries = voice_outbox::entries(&shared.voice_outbox_dir).unwrap();
+        assert_eq!(entries[0].status, VoiceOutboxStatus::Failed);
+
+        // WhatsApp must confirm the delivery identity this daemon assigned.
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_message_ids(["VOICE-2"])
+                .with_send_receipt_id("SOMETHING-ELSE"),
+        );
+        attach(&shared, &fake).await;
+        assert_eq!(
+            run(&shared, send("voice-2")).await.unwrap_err().to_string(),
+            "WhatsApp returned a different voice message ID"
+        );
+        let entries = voice_outbox::entries(&shared.voice_outbox_dir).unwrap();
+        assert_eq!(entries[0].status, VoiceOutboxStatus::Failed);
+        assert_eq!(
+            entries[0].error.as_deref(),
+            Some("WhatsApp returned a different voice message ID")
+        );
+
+        assert_eq!(
+            run(
+                &shared,
+                Command::DiscardVoiceRecording {
+                    recording_id: "voice-2".into(),
+                }
+            )
+            .await
+            .unwrap(),
+            ServerEvent::Ack
+        );
+        assert!(
+            voice_outbox::entries(&shared.voice_outbox_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_message_is_still_sent_when_the_private_cache_copy_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new().with_message_ids(["VOICE-3"]));
+        attach(&shared, &fake).await;
+        write_recording(&shared, "voice-3", 1_000);
+        std::fs::remove_dir_all(&shared.media_dir).unwrap();
+
+        let ServerEvent::Sent { message } = run(
+            &shared,
+            Command::SendVoiceMessage {
+                chat_jid: "1@s.whatsapp.net".into(),
+                recording_id: "voice-3".into(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("expected the sent voice message");
+        };
+
+        let Some(MessageMedia::Audio { downloaded, .. }) = message.media else {
+            panic!("expected audio media");
+        };
+        assert!(!downloaded);
+        assert_eq!(fake.calls_of(CallKind::SendMessage).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_outbox_never_loses_the_send_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_message_ids(["VOICE-4", "VOICE-5"])
+                .with_delay(CallKind::SendMessage, Duration::from_millis(1)),
+        );
+        attach(&shared, &fake).await;
+        write_recording(&shared, "sealed-1", 1_000);
+        write_recording(&shared, "sealed-2", 1_000);
+
+        for (recording_id, sent) in [("sealed-1", true), ("sealed-2", false)] {
+            if !sent {
+                fake.fail(CallKind::SendMessage, "WhatsApp rejected the send");
+            }
+            let sending = tokio::spawn({
+                let shared = Arc::clone(&shared);
+                let recording_id = recording_id.to_owned();
+                async move {
+                    handle_command(
+                        Command::SendVoiceMessage {
+                            chat_jid: "1@s.whatsapp.net".into(),
+                            recording_id,
+                        },
+                        &shared,
+                        0,
+                    )
+                    .await
+                }
+            });
+            // The upload is recorded immediately before the delayed send, so
+            // sealing the outbox here always lands between preparation and the
+            // job's final transition.
+            while fake.calls_of(CallKind::UploadAudioMessage).is_empty() {
+                tokio::task::yield_now().await;
+            }
+            std::fs::set_permissions(
+                &shared.voice_outbox_dir,
+                std::fs::Permissions::from_mode(0o500),
+            )
+            .unwrap();
+            let result = sending.await.unwrap();
+            std::fs::set_permissions(
+                &shared.voice_outbox_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            assert_eq!(result.is_ok(), sent, "{recording_id}");
+            fake.clear_calls();
+        }
+
+        // Neither transition reached the outbox, so both jobs stayed as sending.
+        let entries = voice_outbox::entries(&shared.voice_outbox_dir).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.status == VoiceOutboxStatus::Sending)
+        );
     }
 }

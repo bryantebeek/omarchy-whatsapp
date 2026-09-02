@@ -703,6 +703,13 @@ pub(crate) mod fake {
         pub(crate) errors: Mutex<HashMap<CallKind, String>>,
         pub(crate) calls: Mutex<Vec<Call>>,
         generated_ids: AtomicU64,
+        /// Per-method scripted delays. A caller's own timeout is only
+        /// observable when the answer arrives late, and under
+        /// `#[tokio::test(start_paused = true)]` that stays instant.
+        pub(crate) delays: Mutex<HashMap<CallKind, std::time::Duration>>,
+        /// Overrides the receipt `send_message` returns, so the daemon's
+        /// "`WhatsApp` answered with a different message ID" guard is reachable.
+        pub(crate) send_receipt_id: Mutex<Option<String>>,
     }
 
     impl FakeTransport {
@@ -857,6 +864,30 @@ pub(crate) mod fake {
                 None => Ok(()),
             }
         }
+
+        /// Makes every later call of `kind` answer only after `delay`, so a
+        /// caller's timeout is reachable under paused test time. Honored by
+        /// `profile_picture`, `send_message`, and `download`.
+        #[must_use]
+        pub(crate) fn with_delay(self, kind: CallKind, delay: std::time::Duration) -> Self {
+            Self::lock(&self.delays).insert(kind, delay);
+            self
+        }
+
+        /// Makes `send_message` answer with `message_id` instead of echoing
+        /// the requested one.
+        #[must_use]
+        pub(crate) fn with_send_receipt_id(self, message_id: &str) -> Self {
+            *Self::lock(&self.send_receipt_id) = Some(message_id.to_owned());
+            self
+        }
+
+        async fn wait(&self, kind: CallKind) {
+            let delay = Self::lock(&self.delays).get(&kind).copied();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+        }
     }
 
     /// Builds an `Arc<dyn Transport>` view of a fake a test still holds.
@@ -921,6 +952,7 @@ pub(crate) mod fake {
         }
 
         async fn profile_picture(&self, jid: &Jid) -> Result<Option<ProfilePicture>> {
+            self.wait(CallKind::ProfilePicture).await;
             let key = jid.to_string();
             self.record(Call::ProfilePicture(key.clone()))?;
             Ok(Self::lock(&self.profile_pictures)
@@ -935,14 +967,16 @@ pub(crate) mod fake {
             message: wa::Message,
             options: SendOptions,
         ) -> Result<SendReceipt> {
+            self.wait(CallKind::SendMessage).await;
             let message_id = options.message_id.clone();
             self.record(Call::SendMessage {
                 chat: chat.to_string(),
                 message: Box::new(message),
                 message_id: message_id.clone(),
             })?;
+            let forced = Self::lock(&self.send_receipt_id).clone();
             Ok(SendReceipt {
-                message_id: message_id.unwrap_or_else(|| self.next_id()),
+                message_id: forced.or(message_id).unwrap_or_else(|| self.next_id()),
             })
         }
 
@@ -1148,6 +1182,7 @@ pub(crate) mod fake {
             source: &MediaSource,
             mut file: std::fs::File,
         ) -> Result<std::fs::File> {
+            self.wait(CallKind::Download).await;
             self.record(Call::Download(media_kind(source)))?;
             file.write_all(&Self::lock(&self.download_bytes).clone())?;
             file.flush()?;

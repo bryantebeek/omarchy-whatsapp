@@ -775,7 +775,6 @@ pub(crate) async fn fetch_avatar(
     Ok(true)
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn download_message_image(
     transport: Arc<dyn Transport>,
     image: wa::message::ImageMessage,
@@ -812,7 +811,6 @@ pub(crate) async fn download_message_image(
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn download_message_sticker(
     transport: Arc<dyn Transport>,
     sticker: wa::message::StickerMessage,
@@ -854,7 +852,6 @@ pub(crate) async fn download_message_sticker(
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn download_message_video(
     transport: Arc<dyn Transport>,
     video: wa::message::VideoMessage,
@@ -891,7 +888,6 @@ pub(crate) async fn download_message_video(
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn download_message_audio(
     transport: Arc<dyn Transport>,
     audio: wa::message::AudioMessage,
@@ -928,7 +924,6 @@ pub(crate) async fn download_message_audio(
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn download_message_document(
     transport: Arc<dyn Transport>,
     document: wa::message::DocumentMessage,
@@ -965,7 +960,21 @@ pub(crate) async fn download_message_document(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::transport::fake::{CallKind, FakeTransport};
     use std::os::unix::ffi::OsStringExt;
+
+    /// A transport whose downloads write `bytes` into the caller's file.
+    fn scripted(bytes: &[u8]) -> Arc<dyn Transport> {
+        Arc::new(FakeTransport::new().with_download_bytes(bytes))
+    }
+
+    fn failing_download() -> Arc<dyn Transport> {
+        Arc::new(FakeTransport::new().failing(CallKind::Download, "media stream closed"))
+    }
+
+    fn private_mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
 
     #[test]
     fn cache_names_never_contain_jid_punctuation() {
@@ -1521,5 +1530,273 @@ mod tests {
         let file = File::create(&oversized).unwrap();
         file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
         assert!(!jpeg_file_is_valid(&oversized));
+    }
+
+    #[tokio::test]
+    async fn image_downloads_enforce_declared_size_and_raster_signatures() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path();
+        let bytes = b"\xff\xd8\xffsynthetic image".to_vec();
+        let declared = u64::try_from(bytes.len()).unwrap();
+        let image = |file_length: u64| wa::message::ImageMessage {
+            file_length: Some(file_length),
+            ..wa::message::ImageMessage::default()
+        };
+        let path = message_image_path(media, "chat", "image");
+
+        for invalid in [0, MAX_IMAGE_BYTES + 1] {
+            assert!(
+                download_message_image(scripted(&bytes), image(invalid), path.clone())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            download_message_image(failing_download(), image(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_image(scripted(b""), image(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_image(scripted(b"<svg xmlns='x'/>"), image(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+
+        assert!(
+            download_message_image(scripted(&bytes), image(declared), path.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(private_mode(&path), 0o600);
+        // A cached transfer of exactly the declared size is never repeated.
+        assert!(
+            !download_message_image(scripted(&bytes), image(declared), path)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn sticker_downloads_require_webp_of_the_declared_size_and_reject_lottie() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path();
+        let bytes = b"RIFF\x08\0\0\0WEBPVP8 ".to_vec();
+        let declared = u64::try_from(bytes.len()).unwrap();
+        let sticker = |file_length: u64| wa::message::StickerMessage {
+            file_length: Some(file_length),
+            ..wa::message::StickerMessage::default()
+        };
+        let path = message_sticker_path(media, "chat", "sticker");
+
+        for invalid in [0, MAX_STICKER_BYTES + 1] {
+            assert!(
+                download_message_sticker(scripted(&bytes), sticker(invalid), path.clone())
+                    .await
+                    .is_err()
+            );
+        }
+        let lottie = wa::message::StickerMessage {
+            is_lottie: Some(true),
+            ..sticker(declared)
+        };
+        assert!(
+            download_message_sticker(scripted(&bytes), lottie, path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_sticker(failing_download(), sticker(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_sticker(scripted(b"short"), sticker(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_sticker(
+                scripted(b"0123456789abcdef"),
+                sticker(declared),
+                path.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert!(!path.exists());
+
+        assert!(
+            download_message_sticker(scripted(&bytes), sticker(declared), path.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(private_mode(&path), 0o600);
+        assert!(
+            !download_message_sticker(scripted(&bytes), sticker(declared), path)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn video_downloads_require_a_container_signature_of_the_declared_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path();
+        let bytes = b"\0\0\0\x18ftypisomsynth".to_vec();
+        let declared = u64::try_from(bytes.len()).unwrap();
+        let video = |file_length: u64| wa::message::VideoMessage {
+            file_length: Some(file_length),
+            ..wa::message::VideoMessage::default()
+        };
+        let path = message_video_path(media, "chat", "clip", Some("video/mp4"));
+
+        for invalid in [0, MAX_VIDEO_BYTES + 1] {
+            assert!(
+                download_message_video(scripted(&bytes), video(invalid), path.clone())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            download_message_video(failing_download(), video(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_video(scripted(b"short"), video(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_video(
+                scripted(b"0123456789abcdefg"),
+                video(declared),
+                path.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert!(!path.exists());
+
+        assert!(
+            download_message_video(scripted(&bytes), video(declared), path.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(private_mode(&path), 0o600);
+        assert!(
+            !download_message_video(scripted(&bytes), video(declared), path)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_downloads_require_supported_audio_of_the_declared_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path();
+        let bytes = b"OggSsynthetic voice".to_vec();
+        let declared = u64::try_from(bytes.len()).unwrap();
+        let audio = |file_length: u64| wa::message::AudioMessage {
+            file_length: Some(file_length),
+            ..wa::message::AudioMessage::default()
+        };
+        let path = message_audio_path(media, "chat", "note", Some("audio/ogg"));
+
+        for invalid in [0, MAX_AUDIO_BYTES + 1] {
+            assert!(
+                download_message_audio(scripted(&bytes), audio(invalid), path.clone())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            download_message_audio(failing_download(), audio(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_audio(scripted(b"short"), audio(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_audio(
+                scripted(b"0123456789abcdefghi"),
+                audio(declared),
+                path.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert!(!path.exists());
+
+        assert!(
+            download_message_audio(scripted(&bytes), audio(declared), path.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(private_mode(&path), 0o600);
+        assert!(
+            !download_message_audio(scripted(&bytes), audio(declared), path)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn document_downloads_are_bounded_and_never_overwrite_a_cached_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path();
+        let bytes = b"%PDF-1.7 synthetic".to_vec();
+        let declared = u64::try_from(bytes.len()).unwrap();
+        let document = |file_length: u64| wa::message::DocumentMessage {
+            file_length: Some(file_length),
+            ..wa::message::DocumentMessage::default()
+        };
+        let path = message_document_path(media, "chat", "file", "quote.pdf");
+
+        for invalid in [0, MAX_DOCUMENT_BYTES + 1] {
+            assert!(
+                download_message_document(scripted(&bytes), document(invalid), path.clone())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            download_message_document(failing_download(), document(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            download_message_document(scripted(b""), document(declared), path.clone())
+                .await
+                .is_err()
+        );
+        assert!(!path.exists());
+
+        assert!(
+            download_message_document(scripted(&bytes), document(declared), path.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(private_mode(&path), 0o600);
+        // A cached document is kept as it is, whatever the sender re-declares.
+        assert!(
+            !download_message_document(scripted(b"replacement"), document(1), path)
+                .await
+                .unwrap()
+        );
     }
 }
