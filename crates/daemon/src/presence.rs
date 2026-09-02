@@ -45,10 +45,10 @@ async fn reconcile_connection_intent_inner(
             if client.push_name().is_empty() {
                 Ok(())
             } else {
-                client.presence().set_available().await
+                client.set_available().await
             }
         } else {
-            client.presence().set_unavailable().await
+            client.set_unavailable().await
         };
         if let Err(error) = result {
             warn!(%error, requested = after.available, available, "could not reconcile WhatsApp presence");
@@ -57,7 +57,7 @@ async fn reconcile_connection_intent_inner(
     for raw in before.active_chats.difference(&after.active_chats) {
         if let Ok(jid) = raw.parse::<Jid>()
             && !jid.is_group()
-            && let Err(error) = client.presence().unsubscribe(&jid).await
+            && let Err(error) = client.unsubscribe_presence(&jid).await
         {
             warn!(%error, %jid, "could not unsubscribe inactive-chat presence");
         }
@@ -65,7 +65,7 @@ async fn reconcile_connection_intent_inner(
     for raw in after.active_chats.difference(&before.active_chats) {
         if let Ok(jid) = raw.parse::<Jid>()
             && !jid.is_group()
-            && let Err(error) = client.presence().subscribe(jid.clone()).await
+            && let Err(error) = client.subscribe_presence(jid.clone()).await
         {
             warn!(%error, %jid, "could not subscribe active-chat presence");
         }

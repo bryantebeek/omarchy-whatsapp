@@ -2,6 +2,7 @@
 // coalescing broadcasters that publish revisioned snapshots, and the local
 // broadcast helpers built on top of them.
 
+use crate::transport::Transport;
 use crate::{assets, connections, database::Database, inbound, jobs, revisions, voice_outbox};
 use anyhow::{Result, bail};
 use omarchy_whatsapp_protocol::{
@@ -317,11 +318,13 @@ impl PhoneNumberMisses {
 pub(crate) enum MessageWork {
     Drain {
         generation: u64,
-        client: Arc<Client>,
+        transport: Arc<dyn Transport>,
     },
     Live {
         generation: u64,
-        context: Box<MessageContext>,
+        message: Arc<wa::Message>,
+        info: Box<MessageInfo>,
+        transport: Arc<dyn Transport>,
         key: inbound::InboundKey,
     },
     Barrier(oneshot::Sender<()>),
@@ -330,7 +333,7 @@ pub(crate) enum MessageWork {
 pub(crate) struct AppEventWork {
     pub(crate) generation: u64,
     pub(crate) event: Arc<Event>,
-    pub(crate) client: Arc<Client>,
+    pub(crate) transport: Arc<dyn Transport>,
     pub(crate) jobs: Arc<GenerationJobs>,
 }
 
@@ -374,7 +377,7 @@ impl GenerationJobs {
 pub(crate) struct Shared {
     pub(crate) database: Arc<Database>,
     pub(crate) status: RwLock<ConnectionStatus>,
-    pub(crate) client: RwLock<Option<Arc<Client>>>,
+    pub(crate) client: RwLock<Option<Arc<dyn Transport>>>,
     pub(crate) events: broadcast::Sender<ServerFrame>,
     pub(crate) clock: Arc<revisions::RevisionClock>,
     pub(crate) avatars: Arc<AvatarBroadcaster>,

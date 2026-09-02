@@ -8,6 +8,7 @@ use crate::messages::{
     video_message,
 };
 use crate::state::{Shared, broadcast_messages};
+use crate::transport::Transport;
 use crate::util::nonempty;
 use anyhow::Result;
 use buffa::Message as _;
@@ -333,11 +334,11 @@ pub(crate) fn history_lid_jids(
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn download_pending_media(
     shared: Arc<Shared>,
-    client: Arc<Client>,
+    transport: Arc<dyn Transport>,
     media: Vec<PendingMedia>,
 ) {
     let downloaded = futures::stream::iter(media.into_iter().map(|pending| {
-        let client = Arc::clone(&client);
+        let transport = Arc::clone(&transport);
         let shared = Arc::clone(&shared);
         async move {
             let result = match pending {
@@ -378,7 +379,7 @@ pub(crate) async fn download_pending_media(
                     &audio.encode_to_vec(),
                 ),
                 PendingMedia::Document { document, path } => {
-                    assets::download_message_document(client, document, path).await
+                    assets::download_message_document(transport, document, path).await
                 }
             };
             match result {

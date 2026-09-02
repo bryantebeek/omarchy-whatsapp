@@ -3,6 +3,7 @@
 
 use crate::assets;
 use crate::state::{Shared, broadcast_chats};
+use crate::transport::Transport;
 use crate::util::nonempty;
 use anyhow::{Result, anyhow};
 use omarchy_whatsapp_protocol::{Chat, ChatParticipant};
@@ -20,12 +21,16 @@ pub(crate) fn normalize_jid(value: &str) -> String {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub(crate) async fn canonical_contact_jid(shared: &Shared, client: &Client, jid: &Jid) -> String {
+pub(crate) async fn canonical_contact_jid(
+    shared: &Shared,
+    transport: &dyn Transport,
+    jid: &Jid,
+) -> String {
     let raw = jid.to_non_ad_string();
     if !jid.is_lid() && !jid.is_pn() {
         return raw;
     }
-    let mapping = match client.get_lid_pn_entry(jid).await {
+    let mapping = match transport.lid_pn_entry(jid).await {
         Ok(Some(mapping)) => mapping,
         Ok(None) => {
             if jid.is_pn()
@@ -83,30 +88,25 @@ pub(crate) async fn canonical_contact_jid(shared: &Shared, client: &Client, jid:
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub(crate) async fn own_poll_creator_jid(client: &Client, chat: &Jid) -> Result<Jid> {
+pub(crate) async fn own_poll_creator_jid(transport: &dyn Transport, chat: &Jid) -> Result<Jid> {
     if chat.is_group()
-        && client
-            .groups()
-            .get_metadata(chat)
-            .await
-            .is_ok_and(|metadata| {
-                metadata.addressing_mode
-                    == whatsapp_rust::wacore::types::message::AddressingMode::Lid
-            })
+        && transport.group_metadata(chat).await.is_ok_and(|metadata| {
+            metadata.addressing_mode == whatsapp_rust::wacore::types::message::AddressingMode::Lid
+        })
     {
-        return client
+        return transport
             .lid()
             .map(|jid| jid.to_non_ad())
             .ok_or_else(|| anyhow!("own LID is unavailable for this group poll"));
     }
-    client
+    transport
         .pn()
         .map(|jid| jid.to_non_ad())
         .ok_or_else(|| anyhow!("own WhatsApp JID is unavailable"))
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub(crate) async fn reconcile_direct_chat_aliases(shared: &Shared, client: &Client) {
+pub(crate) async fn reconcile_direct_chat_aliases(shared: &Shared, transport: &dyn Transport) {
     let jids = match shared.database.direct_chat_jids(CHAT_LIST_LIMIT) {
         Ok(jids) => jids,
         Err(error) => {
@@ -116,7 +116,7 @@ pub(crate) async fn reconcile_direct_chat_aliases(shared: &Shared, client: &Clie
     };
     for raw in jids {
         if let Ok(jid) = raw.parse::<Jid>() {
-            canonical_contact_jid(shared, client, &jid).await;
+            canonical_contact_jid(shared, transport, &jid).await;
         }
     }
 }
@@ -148,7 +148,7 @@ pub(crate) async fn list_chats_with_phone_numbers(
             if shared.phone_number_is_missing(&chat.jid) {
                 continue;
             }
-            match client.get_lid_pn_entry(&jid).await {
+            match client.lid_pn_entry(&jid).await {
                 Ok(Some(mapping)) => Some(mapping.phone_number.to_string()),
                 Ok(None) => {
                     shared.remember_missing_phone_number(&chat.jid);
@@ -211,11 +211,11 @@ pub(crate) fn group_participant_identity(
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn resolve_group_participants(
     shared: &Shared,
-    client: &Client,
+    transport: &dyn Transport,
     identities: Vec<GroupParticipantIdentity>,
 ) -> Vec<ChatParticipant> {
-    let own_pn = client.pn().map(|jid| jid.to_non_ad_string());
-    let own_lid = client.lid().map(|jid| jid.to_non_ad_string());
+    let own_pn = transport.pn().map(|jid| jid.to_non_ad_string());
+    let own_lid = transport.lid().map(|jid| jid.to_non_ad_string());
     let mut seen = HashSet::new();
     let mut participants = Vec::with_capacity(identities.len());
 
@@ -223,7 +223,7 @@ pub(crate) async fn resolve_group_participants(
         let is_me = identity.aliases.iter().any(|alias| {
             own_pn.as_deref() == Some(alias.as_str()) || own_lid.as_deref() == Some(alias.as_str())
         });
-        let jid = canonical_contact_jid(shared, client, &identity.jid).await;
+        let jid = canonical_contact_jid(shared, transport, &identity.jid).await;
         if !seen.insert(jid.clone()) {
             continue;
         }
