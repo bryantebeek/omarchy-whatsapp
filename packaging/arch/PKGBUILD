@@ -43,20 +43,15 @@ package() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 ARCHITECTURE.md "$pkgdir/usr/share/doc/$pkgname/ARCHITECTURE.md"
-  install -Dm644 manifest.json \
-    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/manifest.json"
-  install -Dm644 quickshell/BarWidget.qml \
-    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/BarWidget.qml"
-  install -Dm644 quickshell/Service.qml \
-    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/Service.qml"
-  install -Dm644 quickshell/Panel.qml \
-    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/Panel.qml"
-  install -Dm644 quickshell/Model.js \
-    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/Model.js"
-  install -Dm644 quickshell/licenses.json \
-    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/licenses.json"
-  install -Dm644 quickshell/icons/brand-whatsapp-filled.svg \
-    "$pkgdir/usr/share/omarchy/shell/plugins/whatsapp/quickshell/icons/brand-whatsapp-filled.svg"
+  local plugin_root="$pkgdir/usr/share/omarchy/shell/plugins/whatsapp"
+  install -Dm644 manifest.json "$plugin_root/manifest.json"
+  # Derived from the repository contents so a component extracted out of
+  # Panel.qml cannot be omitted from the package and break panel loading.
+  local plugin_file
+  for plugin_file in quickshell/*.qml quickshell/*.js quickshell/*.json \
+    quickshell/icons/*; do
+    install -Dm644 "$plugin_file" "$plugin_root/$plugin_file"
+  done
   install -Dm644 quickshell/icons/LICENSE.tabler \
     "$pkgdir/usr/share/licenses/$pkgname/LICENSE.tabler"
 }

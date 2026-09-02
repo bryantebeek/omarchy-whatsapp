@@ -1,7 +1,9 @@
 import QtQuick
 import QtTest
+import qs.Commons
 
 import "../../quickshell" as Whatsapp
+import "../../quickshell/DevicePixel.js" as DevicePixel
 import "fixtures"
 
 TestCase {
@@ -19,6 +21,23 @@ TestCase {
   }
 
   Component { id: serviceComponent; WorkflowService {} }
+  Component { id: avatarComponent; Whatsapp.Avatar {} }
+  Component { id: crispSurfaceComponent; Whatsapp.DevicePixelBorderSurface {} }
+  Component { id: crispTextFieldComponent; Whatsapp.DevicePixelTextField {} }
+  Component { id: documentCardComponent; Whatsapp.DocumentCard {} }
+  Component { id: locationCardComponent; Whatsapp.LocationCard {} }
+  Component { id: stickerCardComponent; Whatsapp.StickerCard {} }
+  Component { id: voiceMessageCardComponent; Whatsapp.VoiceMessageCard {} }
+  Component { id: mediaPreviewCardComponent; Whatsapp.MediaPreviewCard {} }
+  Component { id: pollCardComponent; Whatsapp.PollCard {} }
+  Component { id: reactionPickerComponent; Whatsapp.ReactionPicker {} }
+  Component { id: receiptTooltipComponent; Whatsapp.ReceiptTooltip {} }
+
+  function lastCall(service, name) {
+    for (var i = service.calls.length - 1; i >= 0; i--)
+      if (service.calls[i].name === name) return service.calls[i]
+    return null
+  }
 
   function init() {
     failOnWarning(/.*/)
@@ -136,6 +155,371 @@ TestCase {
     service.chatStateLabelResult = ""
     service.presenceLabelResult = ""
     compare(panel.conversationActivitySubtitle(), "+316123")
+  }
+
+  function test_device_pixel_border_snapping() {
+    var none = DevicePixel.borderSpec(Border.none(), 2)
+    compare(none.widths.top, 0)
+    compare(none.widths.left, 0)
+    var hairline = DevicePixel.borderSpec(Border.flat("#ff0000", 0.4), 2)
+    compare(hairline.widths.top, 0.5)
+    compare(hairline.widths.right, 0.5)
+    compare(String(hairline.color), "#ff0000")
+    compare(hairline.gradient.enabled, true)
+    compare(String(hairline.gradient.colors[0]), "#ff0000")
+    compare(DevicePixel.borderSpec(Border.flat("#ff0000", 3), 1).widths.top, 3)
+    compare(DevicePixel.borderSpec(Border.flat("#ff0000", 1), 0).widths.top, 1)
+
+    var surface = createTemporaryObject(crispSurfaceComponent, testCase, {
+      devicePixelRatio: 2,
+      sourceBorderSpec: Border.flat("#00ff00", 0.4)
+    })
+    verify(surface !== null)
+    compare(Border.top(surface.borderSpec), 0.5)
+    compare(Border.bottom(surface.borderSpec), 0.5)
+
+    var field = createTemporaryObject(crispTextFieldComponent, testCase, {
+      devicePixelRatio: 3
+    })
+    verify(field !== null)
+    compare(field.background.devicePixelRatio, 3)
+  }
+
+  function test_avatar_initials_fallback_and_preview_requests() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var avatar = createTemporaryObject(avatarComponent, testCase, {
+      service: service,
+      jid: "alice@s.whatsapp.net",
+      name: "Alice Smith",
+      size: 40,
+      imageObjectName: "componentAvatarImage"
+    })
+    verify(avatar !== null)
+    compare(avatar.width, 40)
+    compare(avatar.height, 40)
+    compare(avatar.radius, 20)
+    compare(avatar.initials, "AS")
+    compare(avatar.hasRenderedAvatar, false)
+
+    var image = findChild(avatar, "componentAvatarImage")
+    verify(image !== null)
+    compare(String(image.source), "")
+    compare(image.fillMode, Image.PreserveAspectCrop)
+
+    service.avatarUrls = ({
+      "alice@s.whatsapp.net": String(Qt.resolvedUrl("fixtures/pixel.svg"))
+    })
+    tryCompare(avatar, "hasRenderedAvatar", true)
+    service.avatarUrls = ({})
+    tryCompare(avatar, "hasRenderedAvatar", false)
+
+    var placeholder = createTemporaryObject(avatarComponent, testCase, {})
+    verify(placeholder !== null)
+    compare(placeholder.initials, "?")
+    compare(placeholder.hasRenderedAvatar, false)
+
+    compare(service.calls.length, 0)
+    var voter = createTemporaryObject(avatarComponent, testCase, {
+      service: service,
+      jid: "carol@s.whatsapp.net",
+      requestOnLoad: true
+    })
+    verify(voter !== null)
+    compare(service.calls.length, 1)
+    compare(service.calls[0].name, "requestAvatar")
+    compare(service.calls[0].value, "carol@s.whatsapp.net")
+  }
+
+  function test_document_card_opens_and_saves_the_cached_file() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var card = createTemporaryObject(documentCardComponent, testCase, {
+      service: service,
+      media: {
+        kind: "document",
+        path: "/synthetic/media/report.pdf",
+        file_name: "report.pdf",
+        mime_type: "application/pdf",
+        file_size: 2048,
+        page_count: 3
+      }
+    })
+    verify(card !== null)
+    compare(card.openButton.tooltipText, "Open document")
+    compare(card.saveButton.tooltipText, "Save to Downloads")
+
+    card.openButton.click()
+    compare(lastCall(service, "openFile").value, "/synthetic/media/report.pdf")
+    card.saveButton.click()
+    compare(lastCall(service, "saveFile").value, "/synthetic/media/report.pdf")
+  }
+
+  function test_location_card_reports_live_share_deadline() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var panel = createTemporaryObject(panelComponent, testCase, {
+      service: service
+    })
+    var card = createTemporaryObject(locationCardComponent, testCase, {
+      panel: panel,
+      service: service,
+      messageTimestamp: 1000,
+      media: {
+        kind: "location",
+        live: true,
+        updated_at: 1000,
+        duration_seconds: 600,
+        name: "Office",
+        address: "Main street 1",
+        latitude_e7: 521234567,
+        longitude_e7: 43210987
+      }
+    })
+    verify(card !== null)
+    compare(card.liveUntil, 1600)
+    compare(findChild(card, "locationName").text, "Office")
+    compare(findChild(card, "locationAddress").text, "Main street 1")
+    compare(findChild(card, "locationLiveRemaining").text,
+      panel.remainingTimeLabel(1600))
+
+    card.media = Object.assign({}, card.media, { live_until: 4000 })
+    compare(card.liveUntil, 4000)
+    card.media = Object.assign({}, card.media, { live: false })
+    compare(card.liveUntil, 0)
+    compare(findChild(card, "locationLiveRemaining").text, "")
+
+    card.openMapButton.click()
+    var mapCall = lastCall(service, "openMap")
+    compare(mapCall.value.latitude, 521234567)
+    compare(mapCall.value.longitude, 43210987)
+  }
+
+  function test_sticker_card_prefers_the_downloaded_file() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var preview = decodeURIComponent(
+      String(Qt.resolvedUrl("fixtures/pixel.svg")).substring("file://".length))
+    var card = createTemporaryObject(stickerCardComponent, testCase, {
+      service: service,
+      active: true,
+      aspectRatio: 1,
+      message: { id: "sticker-component" },
+      media: {
+        kind: "sticker",
+        path: preview + "#downloaded",
+        thumbnail_path: preview,
+        downloaded: false,
+        lottie: false
+      },
+      statusObjectName: "componentStickerStatus"
+    })
+    verify(card !== null)
+    compare(card.downloaded, false)
+    compare(card.lottie, false)
+    compare(card.displayPath, preview)
+    compare(findChild(card, "componentStickerStatus").active, false)
+
+    service.downloadMedia({ id: "sticker-component" })
+    compare(findChild(card, "componentStickerStatus").active, true)
+
+    card.media = Object.assign({}, card.media, { downloaded: true })
+    compare(card.displayPath, preview + "#downloaded")
+    compare(findChild(card, "componentStickerStatus").active, false)
+
+    card.media = Object.assign({}, card.media, { lottie: true })
+    compare(card.lottie, true)
+  }
+
+  function test_voice_message_card_labels_audio_and_duration() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var panel = createTemporaryObject(panelComponent, testCase, {
+      service: service
+    })
+    var card = createTemporaryObject(voiceMessageCardComponent, testCase, {
+      panel: panel,
+      service: service,
+      message: { id: "voice-component" },
+      media: {
+        kind: "audio",
+        path: "/synthetic/media/voice.ogg",
+        downloaded: true,
+        duration_seconds: 65
+      }
+    })
+    verify(card !== null)
+    compare(card.downloaded, true)
+    compare(card.totalSeconds, 65)
+    compare(card.active, false)
+    compare(card.playing, false)
+    compare(card.progress, 0)
+    compare(findChild(card, "voiceMessageTitle").text, "Voice message")
+    compare(findChild(card, "voiceMessageDuration").text, "1:05")
+    compare(card.playButton.tooltipText, "Play voice message")
+
+    card.media = Object.assign({}, card.media, { voice_message: false })
+    compare(findChild(card, "voiceMessageTitle").text, "Audio")
+    card.media = Object.assign({}, card.media, { downloaded: false })
+    compare(card.playButton.tooltipText, "Download voice message")
+  }
+
+  function test_media_preview_card_classifies_its_media() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var card = createTemporaryObject(mediaPreviewCardComponent, testCase, {
+      service: service,
+      message: { id: "media-component" },
+      mediaAspectRatio: 16 / 9,
+      media: {
+        kind: "video",
+        gif_playback: true,
+        path: "/synthetic/media/clip.mp4",
+        thumbnail_path: "/synthetic/media/clip.png",
+        downloaded: false,
+        width: 16,
+        height: 9
+      }
+    })
+    verify(card !== null)
+    compare(card.isVideo, true)
+    compare(card.isGif, true)
+    compare(card.isImage, false)
+    compare(card.inlineActive, false)
+    compare(card.inlinePlaying, false)
+    compare(card.topMargin, Style.space(8))
+    // A video always shows its cached thumbnail, downloaded or not.
+    compare(card.displayPath, "/synthetic/media/clip.png")
+    compare(card.imageAspectRatio, 16 / 9)
+
+    card.media = Object.assign({}, card.media, {
+      kind: "image",
+      gif_playback: false,
+      downloaded: true
+    })
+    compare(card.isImage, true)
+    compare(card.isVideo, false)
+    compare(card.displayPath, "/synthetic/media/clip.mp4")
+    card.media = Object.assign({}, card.media, { downloaded: false })
+    compare(card.displayPath, "/synthetic/media/clip.png")
+  }
+
+  function test_poll_card_replaces_or_extends_the_selection() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var panel = createTemporaryObject(panelComponent, testCase, {
+      service: service
+    })
+    var options = [
+      { name: "Soup", votes: 1, selected_by_me: false, voter_jids: [] },
+      { name: "Salad", votes: 1, selected_by_me: true, voter_jids: [] }
+    ]
+    var card = createTemporaryObject(pollCardComponent, testCase, {
+      panel: panel,
+      service: service,
+      active: true,
+      messageId: "poll-component",
+      message: { id: "poll-component" },
+      media: {
+        kind: "poll",
+        question: "Lunch?",
+        selectable_count: 1,
+        total_voters: 2,
+        end_timestamp: 0,
+        options: options
+      }
+    })
+    verify(card !== null)
+    compare(card.ended, false)
+    compare(card.totalVoters, 2)
+    compare(findChild(card, "pollQuestionLabel").text, "Lunch?")
+    compare(findChild(card, "pollSelectionHint").text, "Select one")
+    compare(findChild(card, "pollVoteTotal").text, "2 votes")
+    compare(card.selectedPollOptions().length, 1)
+    compare(card.selectedPollOptions()[0], "Salad")
+
+    // A single-answer poll replaces the previous selection.
+    card.togglePollOption(0)
+    compare(service.pollVotes.length, 1)
+    compare(service.pollVotes[0].selectedOptions.length, 1)
+    compare(service.pollVotes[0].selectedOptions[0], "Soup")
+
+    card.media = Object.assign({}, card.media, { selectable_count: 2 })
+    compare(findChild(card, "pollSelectionHint").text, "Select one or more")
+    card.togglePollOption(0)
+    compare(service.pollVotes.length, 2)
+    compare(service.pollVotes[1].selectedOptions.length, 2)
+    compare(service.pollVotes[1].selectedOptions[0], "Salad")
+    compare(service.pollVotes[1].selectedOptions[1], "Soup")
+
+    // An unnamed option cannot be voted for, and an ended poll accepts nothing.
+    card.media = Object.assign({}, card.media, {
+      options: [{ name: "", votes: 0, selected_by_me: false, voter_jids: [] }]
+    })
+    card.togglePollOption(0)
+    compare(service.pollVotes.length, 2)
+
+    card.media = Object.assign({}, card.media, {
+      end_timestamp: 1,
+      total_voters: 1,
+      options: options
+    })
+    compare(card.ended, true)
+    compare(findChild(card, "pollVoteTotal").text, "Poll ended")
+    card.togglePollOption(0)
+    compare(service.pollVotes.length, 2)
+  }
+
+  function test_reaction_picker_hands_back_a_pasted_emoji() {
+    var chosen = []
+    var picker = createTemporaryObject(reactionPickerComponent, testCase, {
+      ownReactionEmoji: "👍"
+    })
+    verify(picker !== null)
+    picker.reactionChosen.connect(function (emoji) {
+      chosen.push(emoji)
+    })
+    compare(findChild(picker, "reactionPickerHint").text,
+      "Tap selected to remove")
+    picker.ownReactionEmoji = ""
+    compare(findChild(picker, "reactionPickerHint").text, "Choose one")
+    compare(findChild(picker, "reactionPickerEmojiButton").text,
+      "Choose any emoji")
+
+    // Text that arrives without an outstanding request is not a reaction.
+    picker.pasteTarget.text = "🎉"
+    wait(20)
+    compare(chosen.length, 0)
+
+    picker.waitingForEmojiPicker = true
+    compare(findChild(picker, "reactionPickerEmojiButton").text,
+      "Choose an emoji…")
+    picker.pasteTarget.text = "🎊"
+    compare(picker.waitingForEmojiPicker, false)
+    tryVerify(function () {
+      return chosen.length === 1
+    })
+    compare(chosen[0], "🎊")
+  }
+
+  function test_receipt_tooltip_renders_one_section_per_group() {
+    var tooltip = createTemporaryObject(receiptTooltipComponent, testCase, {
+      text: "Read\nAlice\n\nDelivered\nBob",
+      groups: [
+        { label: "Read", entries: ["Alice"] },
+        { label: "Delivered", entries: ["Bob"] }
+      ]
+    })
+    verify(tooltip !== null)
+    compare(tooltip.delay, 400)
+    compare(tooltip.timeout, -1)
+    compare(tooltip.padding, 0)
+    compare(tooltip.background.color, Color.tooltip.background)
+    compare(tooltip.background.radius, 0)
+    compare(tooltip.contentItem.groups.length, 2)
+    compare(tooltip.contentItem.groups[0].label, "Read")
+    compare(tooltip.contentItem.groups[1].entries[0], "Bob")
+    compare(tooltip.contentItem.detailColor, Color.tooltip.text)
+    compare(tooltip.contentItem.headerColor, Qt.rgba(
+      Color.tooltip.text.r, Color.tooltip.text.g, Color.tooltip.text.b,
+      Color.tooltip.text.a * 0.72))
+    compare(tooltip.contentItem.leftInset,
+      Border.left(tooltip.tooltipBorderSpec) + Style.spacing.controlPaddingX)
+    compare(tooltip.contentItem.topInset,
+      Border.top(tooltip.tooltipBorderSpec) + Style.spacing.controlPaddingY)
   }
 
   function test_bar_widget_loads_and_formats_state() {

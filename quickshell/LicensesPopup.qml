@@ -2,7 +2,6 @@ import QtQuick
 import QtQuick.Controls as QQC
 import Quickshell.Io
 import qs.Commons
-import qs.Ui
 
 QQC.Popup {
   id: root
@@ -22,28 +21,6 @@ QQC.Popup {
     Border.localOrSurfaceSpec("popups", "border",
       Color.popups.border, Color.popups.border,
       Math.max(1, Style.normalBorderWidth))
-
-  function devicePixelBorderSpec(spec) {
-    var scale = Math.max(1, Number(devicePixelRatio) || 1)
-    function snappedWidth(value) {
-      var width = Math.max(0, Number(value) || 0)
-      return width > 0 ? Math.max(1, Math.round(width * scale)) / scale : 0
-    }
-    var borderColor = Border.color(spec)
-    var gradient = spec && spec.gradient && spec.gradient.enabled
-      ? spec.gradient
-      : { colors: [borderColor, borderColor], angle: 0, enabled: true }
-    return {
-      color: borderColor,
-      widths: {
-        top: snappedWidth(Border.top(spec)),
-        right: snappedWidth(Border.right(spec)),
-        bottom: snappedWidth(Border.bottom(spec)),
-        left: snappedWidth(Border.left(spec))
-      },
-      gradient: gradient
-    }
-  }
 
   function filtered(query) {
     var needle = String(query || "").trim().toLowerCase()
@@ -65,23 +42,16 @@ QQC.Popup {
     return "Rust package"
   }
 
-  component CrispBorderSurface: BorderSurface {
-    property var sourceBorderSpec: Border.none()
-    borderSpec: root.devicePixelBorderSpec(sourceBorderSpec)
+  component CrispBorderSurface: DevicePixelBorderSurface {
+    devicePixelRatio: root.devicePixelRatio
   }
 
-  component CrispButton: Button {
-    borderSpec: root.devicePixelBorderSpec(_borderSpec)
+  component CrispButton: DevicePixelButton {
+    devicePixelRatio: root.devicePixelRatio
   }
 
-  component CrispTextField: TextField {
-    id: crispTextField
-    background: CrispBorderSurface {
-      color: Style.controlFill(crispTextField._focused,
-        crispTextField._hot, crispTextField.foreground, crispTextField.accent)
-      sourceBorderSpec: crispTextField._borderSpec
-      radius: Style.cornerRadius
-    }
+  component CrispTextField: DevicePixelTextField {
+    devicePixelRatio: root.devicePixelRatio
   }
 
   FileView {

@@ -24,6 +24,13 @@ QtObject {
   property bool messagesResponseHasFollowup: false
   property int messagesResponseSerial: 0
   property int messagesNavigationSerial: 0
+  property int messagesLimit: 300
+  readonly property int messagesLimitStep: 300
+  readonly property int messagesLimitMax: 1000
+  readonly property bool canLoadOlderMessages: messagesChatJid !== ""
+    && messagesChatJid === selectedChatJid
+    && messages.length >= messagesLimit
+    && messagesLimit < messagesLimitMax
   property int messageSentSerial: 0
   property int incomingMessageSerial: 0
   property int pollCreateRequestId: 0
@@ -278,6 +285,13 @@ QtObject {
     }
   }
 
+  function loadOlderMessages() {
+    if (!canLoadOlderMessages) return false
+    messagesLimit = Math.min(messagesLimitMax, messagesLimit + messagesLimitStep)
+    record("loadOlderMessages", messagesLimit)
+    return true
+  }
+
   function replaceMessages(items, preservePosition) {
     messagesWillChange(preservePosition === true)
     messages = items.slice()
@@ -303,7 +317,9 @@ QtObject {
   function requestAvatar(jid) { record("requestAvatar", String(jid || "")) }
   function refreshSelectedGroupParticipants() { return false }
   function reactToMessage() { return true }
-  function openMap() {}
+  function openMap(latitude, longitude) {
+    record("openMap", { latitude: latitude, longitude: longitude })
+  }
   function openFile(path) { record("openFile", path) }
   function saveFile(path) { record("saveFile", path) }
   function unlinkDevice() { return connectionState === "connected" }

@@ -2,12 +2,9 @@
 set -euo pipefail
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-qml_files=(
-  "$repo_dir/quickshell/BarWidget.qml"
-  "$repo_dir/quickshell/LicensesPopup.qml"
-  "$repo_dir/quickshell/Panel.qml"
-  "$repo_dir/quickshell/Service.qml"
-)
+# Every shipped component is linted, so extracting one out of Panel.qml cannot
+# silently drop it from the gate.
+qml_files=("$repo_dir"/quickshell/*.qml)
 
 if command -v qmllint >/dev/null 2>&1; then
   qmllint_command=$(command -v qmllint)
