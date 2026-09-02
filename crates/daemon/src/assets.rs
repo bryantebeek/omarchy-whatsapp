@@ -184,10 +184,6 @@ pub fn avatar_fingerprints(directory: &Path) -> BTreeMap<String, AvatarFingerpri
         .collect()
 }
 
-pub fn available_avatar_jids(directory: &Path) -> Vec<String> {
-    avatar_fingerprints(directory).into_keys().collect()
-}
-
 pub fn message_image_path(directory: &Path, chat_jid: &str, message_id: &str) -> PathBuf {
     directory.join(format!("{}-{}.img", hex_key(chat_jid), hex_key(message_id)))
 }
@@ -1228,7 +1224,12 @@ mod tests {
             b"none\n",
         )
         .unwrap();
-        assert_eq!(available_avatar_jids(directory.path()), vec!["123-4@g.us"]);
+        assert_eq!(
+            avatar_fingerprints(directory.path())
+                .into_keys()
+                .collect::<Vec<_>>(),
+            vec!["123-4@g.us"]
+        );
     }
 
     #[test]
