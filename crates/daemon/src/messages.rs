@@ -18,9 +18,6 @@ use whatsapp_rust::wacore_binary::JidExt;
 
 impl Shared {
     // Adapter from upstream protobuf contexts into the durable local model.
-    // Its deterministic decoding helpers and every resulting database state
-    // transition are measured independently of the live SDK context.
-    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) async fn receive_message(
         self: &Arc<Self>,
         generation: u64,
@@ -814,8 +811,1145 @@ pub(crate) fn message_media(
 #[allow(clippy::default_trait_access)] // Generated protobuf fixture types are inferred by MessageField.
 mod tests {
     use super::*;
+    use crate::test_support::test_shared;
+    use crate::transport::fake::{Call, CallKind, FakeTransport, MediaKind};
     use buffa::MessageField;
+    use chrono::TimeZone;
     use std::os::unix::fs::PermissionsExt;
+    use whatsapp_rust::wacore::types::message::MessageSource;
+
+    const CHAT: &str = "31600000001@s.whatsapp.net";
+    const GROUP: &str = "120363000000000001@g.us";
+    const NOW: i64 = 1_700_000_000;
+
+    fn linked(directory: &tempfile::TempDir) -> (Arc<Shared>, u64, Arc<FakeTransport>) {
+        let shared = Arc::new(test_shared(directory));
+        assets::private_dir(&shared.media_dir).unwrap();
+        let generation = shared.clock.begin_generation();
+        (shared, generation, Arc::new(FakeTransport::new()))
+    }
+
+    fn wire(fake: &Arc<FakeTransport>) -> Arc<dyn Transport> {
+        crate::transport::fake::transport(fake)
+    }
+
+    fn info_at(chat: &str, sender: &str, id: &str, timestamp: i64) -> MessageInfo {
+        MessageInfo {
+            source: MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: sender.parse().unwrap(),
+                is_group: chat.ends_with("@g.us"),
+                ..MessageSource::default()
+            },
+            id: id.to_owned(),
+            timestamp: Utc.timestamp_opt(timestamp, 0).unwrap(),
+            ..MessageInfo::default()
+        }
+    }
+
+    fn info(chat: &str, id: &str) -> MessageInfo {
+        info_at(chat, chat, id, NOW)
+    }
+
+    fn stored_message(id: &str) -> Message {
+        Message {
+            id: id.to_owned(),
+            chat_jid: CHAT.into(),
+            sender_jid: CHAT.into(),
+            sender_name: "Ada".into(),
+            text: "parent".into(),
+            timestamp: NOW,
+            from_me: false,
+            receipt: 0,
+            delivered_at: None,
+            read_at: None,
+            delivered_to: Vec::new(),
+            read_by: Vec::new(),
+            media: None,
+            reactions: Vec::new(),
+        }
+    }
+
+    fn reaction(target: &str, emoji: &str, sender_timestamp_ms: Option<i64>) -> Arc<wa::Message> {
+        Arc::new(wa::Message {
+            reaction_message: MessageField::some(wa::message::ReactionMessage {
+                key: MessageField::some(wa::MessageKey {
+                    id: Some(target.to_owned()),
+                    ..Default::default()
+                }),
+                text: Some(emoji.to_owned()),
+                sender_timestamp_ms,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn poll_option(name: &str) -> wa::message::poll_creation_message::Option {
+        wa::message::poll_creation_message::Option {
+            option_name: Some(name.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn poll_creation(secret: Vec<u8>) -> Arc<wa::Message> {
+        Arc::new(wa::Message {
+            poll_creation_message_v3: MessageField::some(wa::message::PollCreationMessage {
+                name: Some("Lunch?".into()),
+                options: vec![poll_option("Soup"), poll_option("Salad")],
+                selectable_options_count: Some(1),
+                ..Default::default()
+            }),
+            message_context_info: MessageField::some(wa::MessageContextInfo {
+                message_secret: Some(secret),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// One incoming vote's `encPayload`/`encIv` pair, absent when the update
+    /// carried no `vote` at all.
+    type Ciphertext = Option<(Option<Vec<u8>>, Option<Vec<u8>>)>;
+
+    fn poll_vote(
+        target: Option<&str>,
+        ciphertext: Ciphertext,
+        sender_timestamp_ms: Option<i64>,
+    ) -> Arc<wa::Message> {
+        Arc::new(wa::Message {
+            poll_update_message: MessageField::some(wa::message::PollUpdateMessage {
+                poll_creation_message_key: target.map_or_else(MessageField::none, |id| {
+                    MessageField::some(wa::MessageKey {
+                        id: Some(id.to_owned()),
+                        ..Default::default()
+                    })
+                }),
+                vote: ciphertext.map_or_else(MessageField::none, |(enc_payload, enc_iv)| {
+                    MessageField::some(wa::message::PollEncValue {
+                        enc_payload,
+                        enc_iv,
+                    })
+                }),
+                sender_timestamp_ms,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn soup_hashes() -> Vec<Vec<u8>> {
+        vec![whatsapp_rust::wacore::poll::compute_option_hash("Soup").to_vec()]
+    }
+
+    /// Seeds one stored poll whose secret and options the vote paths read back.
+    async fn seed_poll(shared: &Arc<Shared>, generation: u64, fake: &Arc<FakeTransport>) {
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_creation(vec![7; 32]),
+                    info(CHAT, "POLL-1"),
+                    wire(fake),
+                )
+                .await
+        );
+        assert!(
+            shared
+                .database
+                .poll_for_voting(CHAT, "POLL-1")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn stored_votes(shared: &Arc<Shared>) -> Vec<PollOption> {
+        match shared.database.messages(CHAT, 10).unwrap()[0].media.clone() {
+            Some(MessageMedia::Poll { options, .. }) => options,
+            other => panic!("expected stored poll media, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_and_newsletter_chats_never_reach_the_local_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+
+        for chat in ["status@broadcast", "120363000000000009@newsletter"] {
+            assert!(
+                shared
+                    .receive_message(
+                        generation,
+                        Arc::new(wa::Message::text("hello")),
+                        info(chat, "M-1"),
+                        wire(&fake),
+                    )
+                    .await
+            );
+        }
+
+        assert!(fake.calls().is_empty());
+        assert!(shared.database.list_chats(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retired_generation_stops_before_the_message_is_modelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+
+        assert!(
+            !shared
+                .receive_message(
+                    generation.saturating_add(1),
+                    Arc::new(wa::Message::text("hello")),
+                    info(CHAT, "M-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+
+        assert!(shared.database.messages(CHAT, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incoming_reactions_are_applied_deduplicated_and_tombstoned() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        shared
+            .database
+            .insert_message(&stored_message("PARENT-1"), "Ada", false, false)
+            .unwrap();
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    reaction("PARENT-1", "👍", Some(1_700_000_500_000)),
+                    info(CHAT, "R-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+        let reactions = shared.database.messages(CHAT, 10).unwrap()[0]
+            .reactions
+            .clone();
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].emoji, "👍");
+        assert_eq!(reactions[0].count, 1);
+        assert!(!reactions[0].from_me);
+
+        // The same reaction replayed is idempotent rather than a failure.
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    reaction("PARENT-1", "👍", Some(1_700_000_500_000)),
+                    info(CHAT, "R-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+
+        // An own reaction without a sender timestamp falls back to the envelope.
+        let mut own = info_at(CHAT, CHAT, "R-2", 1_700_000_600);
+        own.source.is_from_me = true;
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    reaction("PARENT-1", "❤", None),
+                    own,
+                    wire(&fake)
+                )
+                .await
+        );
+        assert!(
+            shared.database.messages(CHAT, 10).unwrap()[0]
+                .reactions
+                .iter()
+                .any(|entry| entry.emoji == "❤" && entry.from_me)
+        );
+
+        // A removal tombstones the reaction, and an older one stays blocked.
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    reaction("PARENT-1", "", Some(1_700_000_900_000)),
+                    info(CHAT, "R-3"),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    reaction("PARENT-1", "🎉", Some(1_700_000_800_000)),
+                    info(CHAT, "R-4"),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert!(
+            !shared.database.messages(CHAT, 10).unwrap()[0]
+                .reactions
+                .iter()
+                .any(|entry| entry.emoji == "👍" || entry.emoji == "🎉")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstorable_reaction_is_not_acknowledged() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        shared
+            .database
+            .execute_test_sql(
+                "CREATE TRIGGER block_reaction BEFORE INSERT ON reactions
+                 WHEN NEW.emoji = '💥'
+                 BEGIN SELECT RAISE(ABORT, 'synthetic reaction failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            !shared
+                .receive_message(
+                    generation,
+                    reaction("PARENT-1", "💥", Some(1_700_000_500_000)),
+                    info(CHAT, "R-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_poll_votes_are_validated_before_they_are_applied() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        seed_poll(&shared, generation, &fake).await;
+
+        // A vote without a parent key is acknowledged and dropped.
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_vote(None, None, None),
+                    info(CHAT, "V-0"),
+                    wire(&fake)
+                )
+                .await
+        );
+        // An unknown parent poll is retried later instead of acknowledged.
+        assert!(
+            !shared
+                .receive_message(
+                    generation,
+                    poll_vote(Some("MISSING"), None, None),
+                    info(CHAT, "V-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+        // A vote whose encrypted payload never arrived is dropped.
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_vote(Some("POLL-1"), None, None),
+                    info(CHAT, "V-2"),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_vote(Some("POLL-1"), Some((None, Some(b"iv".to_vec()))), None),
+                    info(CHAT, "V-3"),
+                    wire(&fake),
+                )
+                .await
+        );
+
+        // A vote WhatsApp cannot decrypt is dropped rather than retried.
+        fake.fail(CallKind::DecryptPollVote, "synthetic decrypt failure");
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_vote(
+                        Some("POLL-1"),
+                        Some((Some(b"payload".to_vec()), Some(b"iv".to_vec()))),
+                        None,
+                    ),
+                    info(CHAT, "V-4"),
+                    wire(&fake),
+                )
+                .await
+        );
+        fake.succeed(CallKind::DecryptPollVote);
+
+        // A decrypted vote for an option the stored poll does not know is dropped.
+        *fake.poll_vote_hashes.lock().unwrap() = vec![vec![0; 32]];
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_vote(
+                        Some("POLL-1"),
+                        Some((Some(b"payload".to_vec()), Some(b"iv".to_vec()))),
+                        None,
+                    ),
+                    info(CHAT, "V-5"),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert!(stored_votes(&shared).iter().all(|option| option.votes == 0));
+
+        // A stored poll whose creator JID cannot be parsed is dropped.
+        shared
+            .database
+            .execute_test_sql("UPDATE poll_secrets SET creator_jid = 'not a jid'")
+            .unwrap();
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_vote(
+                        Some("POLL-1"),
+                        Some((Some(b"payload".to_vec()), Some(b"iv".to_vec()))),
+                        None,
+                    ),
+                    info(CHAT, "V-6"),
+                    wire(&fake),
+                )
+                .await
+        );
+
+        // An unreadable poll store is retried rather than acknowledged.
+        shared
+            .database
+            .execute_test_sql("DROP TABLE poll_secrets")
+            .unwrap();
+        assert!(
+            !shared
+                .receive_message(
+                    generation,
+                    poll_vote(
+                        Some("POLL-1"),
+                        Some((Some(b"payload".to_vec()), Some(b"iv".to_vec()))),
+                        None,
+                    ),
+                    info(CHAT, "V-7"),
+                    wire(&fake),
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decrypted_poll_vote_updates_the_stored_tally() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        seed_poll(&shared, generation, &fake).await;
+        *fake.poll_vote_hashes.lock().unwrap() = soup_hashes();
+        let ciphertext = Some((Some(b"payload".to_vec()), Some(b"iv".to_vec())));
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_vote(Some("POLL-1"), ciphertext.clone(), Some(1_700_000_500_000)),
+                    info(CHAT, "V-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+        let options = stored_votes(&shared);
+        assert_eq!(options[0].name, "Soup");
+        assert_eq!(options[0].votes, 1);
+        assert_eq!(options[0].voter_jids, vec![CHAT.to_owned()]);
+        assert_eq!(
+            fake.calls_of(CallKind::DecryptPollVote)
+                .into_iter()
+                .map(|call| match call {
+                    Call::DecryptPollVote {
+                        message_secret,
+                        poll_message_id,
+                        creator_jid,
+                        ..
+                    } => (message_secret, poll_message_id, creator_jid),
+                    other => panic!("unexpected call {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            vec![(vec![7; 32], "POLL-1".to_owned(), CHAT.to_owned())]
+        );
+
+        // Replaying the same vote is idempotent.
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_vote(Some("POLL-1"), ciphertext.clone(), Some(1_700_000_500_000)),
+                    info(CHAT, "V-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert_eq!(stored_votes(&shared)[0].votes, 1);
+
+        // An own vote without a sender timestamp is attributed to this device.
+        let mut own = info_at(CHAT, CHAT, "V-2", 1_700_000_600);
+        own.source.is_from_me = true;
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_vote(Some("POLL-1"), ciphertext.clone(), None),
+                    own.clone(),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert!(stored_votes(&shared)[0].selected_by_me);
+
+        // A vote the database refuses is retried instead of acknowledged.
+        shared
+            .database
+            .execute_test_sql(
+                "CREATE TRIGGER block_vote BEFORE INSERT ON poll_votes
+                 WHEN NEW.voter_jid = 'me'
+                 BEGIN SELECT RAISE(ABORT, 'synthetic vote failure'); END;",
+            )
+            .unwrap();
+        let mut later = own;
+        later.timestamp = Utc.timestamp_opt(1_700_000_700, 0).unwrap();
+        assert!(
+            !shared
+                .receive_message(
+                    generation,
+                    poll_vote(Some("POLL-1"), ciphertext, None),
+                    later,
+                    wire(&fake),
+                )
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_retired_while_decrypting_a_vote_discards_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        seed_poll(&shared, generation, &fake).await;
+        *fake.poll_vote_hashes.lock().unwrap() = soup_hashes();
+        let clock = Arc::clone(&shared.clock);
+        fake.on_call(move |kind| {
+            if kind == CallKind::DecryptPollVote {
+                clock.retire_generation(generation);
+            }
+        });
+
+        assert!(
+            !shared
+                .receive_message(
+                    generation,
+                    poll_vote(
+                        Some("POLL-1"),
+                        Some((Some(b"payload".to_vec()), Some(b"iv".to_vec()))),
+                        Some(1_700_000_500_000),
+                    ),
+                    info(CHAT, "V-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+
+        assert!(stored_votes(&shared).iter().all(|option| option.votes == 0));
+    }
+
+    #[tokio::test]
+    async fn control_messages_without_renderable_text_are_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message {
+                        protocol_message: MessageField::some(Default::default()),
+                        ..Default::default()
+                    }),
+                    info(CHAT, "CTRL-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+
+        assert!(shared.database.messages(CHAT, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unfocused_message_is_stored_unread_and_announced() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let mut events = shared.events.subscribe();
+        let mut incoming = info(CHAT, "M-1");
+        incoming.push_name = "Ada".into();
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("hello there")),
+                    incoming,
+                    wire(&fake),
+                )
+                .await
+        );
+
+        let published = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|frame| frame.event)
+            .collect::<Vec<_>>();
+        assert!(published.iter().any(|event| matches!(
+            event,
+            ServerEvent::Message { message } if message.text == "hello there"
+                && message.sender_name == "Ada"
+        )));
+        assert!(
+            published
+                .iter()
+                .any(|event| matches!(event, ServerEvent::Unread { total: 1 }))
+        );
+        let chats = shared.database.list_chats(10).unwrap();
+        assert_eq!(chats[0].name, "Ada");
+        assert_eq!(chats[0].unread, 1);
+        assert_eq!(
+            shared.database.contact_name(CHAT).unwrap().as_deref(),
+            Some("Ada")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_focused_message_queues_a_read_receipt_instead_of_unread() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let connection = shared.open_connection();
+        shared
+            .set_connection_active_chat(connection, Some(CHAT.to_owned()))
+            .unwrap();
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("focused")),
+                    info(CHAT, "M-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+
+        assert_eq!(shared.database.list_chats(10).unwrap()[0].unread, 0);
+        assert_eq!(
+            shared.database.next_read_batch().unwrap().unwrap().receipts[0].message_id,
+            "M-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn muted_offline_and_own_messages_are_stored_without_a_notification() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        shared.database.apply_mute(CHAT, true, 0).unwrap();
+
+        let mut offline = info_at(CHAT, CHAT, "M-1", NOW);
+        offline.is_offline = true;
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("offline replay")),
+                    offline,
+                    wire(&fake),
+                )
+                .await
+        );
+
+        let mut muted = info_at(CHAT, CHAT, "M-2", NOW + 1);
+        muted.push_name = "Ada".into();
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("muted")),
+                    muted,
+                    wire(&fake),
+                )
+                .await
+        );
+
+        let mut own = info_at(CHAT, CHAT, "M-3", NOW + 2);
+        own.source.is_from_me = true;
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("from this device")),
+                    own,
+                    wire(&fake),
+                )
+                .await
+        );
+
+        let messages = shared.database.messages(CHAT, 10).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].receipt, 1);
+        assert_eq!(shared.database.list_chats(10).unwrap()[0].unread, 2);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_message_refreshes_only_its_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let image = Arc::new(wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                mimetype: Some("image/jpeg".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::clone(&image),
+                    info(CHAT, "IMG-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert!(matches!(
+            shared.database.messages(CHAT, 10).unwrap()[0].media,
+            Some(MessageMedia::Image {
+                downloaded: false,
+                ..
+            })
+        ));
+
+        // The cached file arriving later is the only change a replay applies.
+        std::fs::write(
+            assets::message_image_path(&shared.media_dir, CHAT, "IMG-1"),
+            b"image",
+        )
+        .unwrap();
+        assert!(
+            shared
+                .receive_message(generation, image, info(CHAT, "IMG-1"), wire(&fake))
+                .await
+        );
+
+        let messages = shared.database.messages(CHAT, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages[0].media,
+            Some(MessageMedia::Image {
+                downloaded: true,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn download_metadata_is_persisted_for_every_media_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let message = Arc::new(wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                mimetype: Some("image/jpeg".into()),
+                ..Default::default()
+            }),
+            video_message: MessageField::some(wa::message::VideoMessage {
+                mimetype: Some("video/mp4".into()),
+                ..Default::default()
+            }),
+            audio_message: MessageField::some(wa::message::AudioMessage {
+                mimetype: Some("audio/ogg".into()),
+                ..Default::default()
+            }),
+            sticker_message: MessageField::some(wa::message::StickerMessage {
+                mimetype: Some("image/webp".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert!(
+            shared
+                .receive_message(generation, message, info(CHAT, "MEDIA-1"), wire(&fake))
+                .await
+        );
+
+        assert!(
+            !shared
+                .database
+                .media_download(CHAT, "MEDIA-1")
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            shared.database.messages(CHAT, 10).unwrap()[0].text,
+            "[Image]"
+        );
+    }
+
+    #[tokio::test]
+    async fn lottie_stickers_are_recorded_with_their_animation_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let message = Arc::new(wa::Message {
+            lottie_sticker_message: MessageField::some(wa::message::FutureProofMessage {
+                message: MessageField::some(wa::Message {
+                    sticker_message: MessageField::some(wa::message::StickerMessage::default()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        });
+
+        assert!(
+            shared
+                .receive_message(generation, message, info(CHAT, "STICKER-1"), wire(&fake))
+                .await
+        );
+
+        let payload = shared
+            .database
+            .media_download(CHAT, "STICKER-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            wa::message::StickerMessage::decode_from_slice(&payload)
+                .unwrap()
+                .is_lottie,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn group_subjects_come_from_metadata_and_then_from_the_stored_chat() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, _) = linked(&directory);
+        let fake = Arc::new(FakeTransport::new().with_group_metadata(
+            GROUP,
+            whatsapp_rust::GroupMetadata {
+                subject: "Garden".into(),
+                ..whatsapp_rust::GroupMetadata::default()
+            },
+        ));
+        let member = "31600000002@s.whatsapp.net";
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("first")),
+                    info_at(GROUP, member, "G-1", NOW),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert_eq!(
+            shared.database.chat_name(GROUP).unwrap().as_deref(),
+            Some("Garden")
+        );
+
+        // The stored subject is reused instead of querying WhatsApp again.
+        fake.clear_calls();
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("second")),
+                    info_at(GROUP, member, "G-2", NOW + 1),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert!(fake.calls_of(CallKind::GroupMetadata).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_group_subject_falls_back_to_the_chat_identifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, _) = linked(&directory);
+        let fake = Arc::new(
+            FakeTransport::new().failing(CallKind::GroupMetadata, "synthetic metadata failure"),
+        );
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("first")),
+                    info_at(GROUP, "31600000002@s.whatsapp.net", "G-1", NOW),
+                    wire(&fake),
+                )
+                .await
+        );
+
+        assert_eq!(shared.database.chat_name(GROUP).unwrap(), None);
+        assert_eq!(
+            fake.calls_of(CallKind::GroupMetadata),
+            vec![Call::GroupMetadata(GROUP.to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstorable_group_subject_still_keeps_the_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, _) = linked(&directory);
+        let fake = Arc::new(FakeTransport::new().with_group_metadata(
+            GROUP,
+            whatsapp_rust::GroupMetadata {
+                subject: "Garden".into(),
+                ..whatsapp_rust::GroupMetadata::default()
+            },
+        ));
+        shared
+            .database
+            .execute_test_sql(
+                "CREATE TRIGGER block_group_subject BEFORE UPDATE ON chats
+                 WHEN NEW.name_source = 30
+                 BEGIN SELECT RAISE(ABORT, 'synthetic subject failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("first")),
+                    info_at(GROUP, "31600000002@s.whatsapp.net", "G-1", NOW),
+                    wire(&fake),
+                )
+                .await
+        );
+
+        assert_eq!(shared.database.messages(GROUP, 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn documents_are_cached_after_the_message_is_stored() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, _) = linked(&directory);
+        let fake = Arc::new(FakeTransport::new().with_download_bytes(b"%PDF-1.7 synthetic"));
+        let document = |file_length| {
+            Arc::new(wa::Message {
+                document_message: MessageField::some(wa::message::DocumentMessage {
+                    mimetype: Some("application/pdf".into()),
+                    file_name: Some("quote.pdf".into()),
+                    file_length,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let path = assets::message_document_path(&shared.media_dir, CHAT, "DOC-1", "quote.pdf");
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    document(Some(18)),
+                    info(CHAT, "DOC-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"%PDF-1.7 synthetic");
+        assert_eq!(
+            fake.calls_of(CallKind::Download),
+            vec![Call::Download(MediaKind::Document)]
+        );
+
+        // A cached document is not downloaded twice.
+        fake.clear_calls();
+        std::fs::write(
+            assets::message_document_path(&shared.media_dir, CHAT, "DOC-2", "quote.pdf"),
+            b"already cached",
+        )
+        .unwrap();
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    document(Some(18)),
+                    info(CHAT, "DOC-2"),
+                    wire(&fake),
+                )
+                .await
+        );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(fake.calls_of(CallKind::Download).is_empty());
+
+        // A document declaring no size is reported instead of cached.
+        assert!(
+            shared
+                .receive_message(generation, document(None), info(CHAT, "DOC-3"), wire(&fake),)
+                .await
+        );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(shared.database.messages(CHAT, 10).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn persistence_failures_degrade_without_acknowledging_the_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        shared
+            .database
+            .execute_test_sql(
+                "CREATE TRIGGER block_contact BEFORE INSERT ON contacts
+                 WHEN NEW.name = 'Blocked'
+                 BEGIN SELECT RAISE(ABORT, 'synthetic contact failure'); END;",
+            )
+            .unwrap();
+        let mut blocked = info(CHAT, "M-1");
+        blocked.push_name = "Blocked".into();
+
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text("hello")),
+                    blocked,
+                    wire(&fake),
+                )
+                .await
+        );
+        assert_eq!(
+            shared.database.messages(CHAT, 10).unwrap()[0].sender_name,
+            "Blocked"
+        );
+
+        // A poll secret WhatsApp did not size correctly is reported and skipped.
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    poll_creation(vec![1, 2, 3]),
+                    info(CHAT, "POLL-1"),
+                    wire(&fake),
+                )
+                .await
+        );
+        assert!(
+            shared
+                .database
+                .poll_for_voting(CHAT, "POLL-1")
+                .unwrap()
+                .is_none()
+        );
+
+        // Without the message store nothing can be persisted or acknowledged.
+        shared
+            .database
+            .execute_test_sql("DROP TABLE messages")
+            .unwrap();
+        let media = Arc::new(wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage::default()),
+            video_message: MessageField::some(wa::message::VideoMessage::default()),
+            audio_message: MessageField::some(wa::message::AudioMessage::default()),
+            sticker_message: MessageField::some(wa::message::StickerMessage::default()),
+            ..Default::default()
+        });
+        assert!(
+            !shared
+                .receive_message(generation, media, info(CHAT, "MEDIA-1"), wire(&fake))
+                .await
+        );
+    }
+
+    /// The reducer runs while the daemon's run loop may retire the client
+    /// generation, so the checkpoint just before the durable write has to be
+    /// observed with the clock moving mid-call. A thread-local subscriber
+    /// retires it from the one diagnostic the modelling step emits, which keeps
+    /// the observation deterministic instead of racing a second thread.
+    struct RetireOnDiagnostic {
+        clock: Arc<crate::revisions::RevisionClock>,
+        generation: u64,
+    }
+
+    impl tracing::Subscriber for RetireOnDiagnostic {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.clock.retire_generation(self.generation);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn a_generation_retired_while_modelling_media_discards_the_message() {
+        let directory = tempfile::tempdir().unwrap();
+        // A thumbnail cache the daemon cannot write is the modelling step's one
+        // diagnostic, and the subscriber retires the generation from it.
+        let mut shared = test_shared(&directory);
+        shared.media_dir = directory.path().join("missing-media");
+        let shared = Arc::new(shared);
+        let generation = shared.clock.begin_generation();
+        let fake = Arc::new(FakeTransport::new());
+
+        let guard = tracing::subscriber::set_default(RetireOnDiagnostic {
+            clock: Arc::clone(&shared.clock),
+            generation,
+        });
+        let stored = shared
+            .receive_message(
+                generation,
+                Arc::new(wa::Message {
+                    image_message: MessageField::some(wa::message::ImageMessage {
+                        jpeg_thumbnail: Some(b"\xff\xd8\xffpreview".to_vec()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                info(CHAT, "IMG-1"),
+                wire(&fake),
+            )
+            .await;
+        drop(guard);
+
+        assert!(!stored);
+        assert!(shared.database.messages(CHAT, 10).unwrap().is_empty());
+    }
 
     #[test]
     fn poll_creation_payload_becomes_interactive_ui_media() {

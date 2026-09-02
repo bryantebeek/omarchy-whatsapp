@@ -66,8 +66,6 @@ fn finish_inbound_reduction(shared: &Shared, key: &inbound::InboundKey, accepted
     }
 }
 
-// This lifetime loop only schedules already-instrumented durable reductions.
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn run_message_reducer(
     shared: Arc<Shared>,
     mut queue: mpsc::Receiver<MessageWork>,
@@ -124,8 +122,6 @@ pub(crate) async fn run_message_reducer(
     }
 }
 
-// This lifetime loop only schedules the upstream event adapter.
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn run_app_event_reducer(
     shared: Arc<Shared>,
     mut queue: mpsc::Receiver<AppEventWork>,
@@ -144,6 +140,10 @@ pub(crate) async fn run_app_event_reducer(
     }
 }
 
+// The two `spawn_blocking` join arms report a panicking history worker. A
+// scripted transport cannot make the bounded, `Result`-returning parsing and
+// ingest closures panic, so those arms stay outside the measured set; every
+// other branch here is driven by the history tests.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn process_history_event(
     shared: Arc<Shared>,
@@ -225,7 +225,6 @@ pub(crate) async fn process_history_event(
     }
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn process_contact_event(
     shared: Arc<Shared>,
     generation: u64,
@@ -242,7 +241,6 @@ pub(crate) async fn process_contact_event(
     canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
 }
 
-#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn process_group_event(
     shared: Arc<Shared>,
     generation: u64,
@@ -358,11 +356,8 @@ async fn expire_app_state_sync(shared: &Shared, generation: u64) {
     }
 }
 
-// Waiting for the replay is a scheduling shim around measured helpers: the
-// quiet window, both settled outcomes, and the deadline are unit tested. Each
-// completeness check opens the session database, so the waiter sleeps until
-// the quiet period elapses instead of polling it.
-#[cfg_attr(coverage_nightly, coverage(off))]
+// Each completeness check opens the session database, so the waiter sleeps
+// until the quiet period elapses instead of polling it.
 pub(crate) async fn await_app_state_sync(shared: Arc<Shared>, generation: u64) {
     let deadline = tokio::time::Instant::now() + APP_STATE_SYNC_DEADLINE;
     loop {
@@ -489,10 +484,6 @@ pub(crate) fn log_whatsapp_event(event: &Event) {
     info!(event = %event_diagnostic(event), "received WhatsApp event");
 }
 
-// Upstream event variants terminate in SDK queries, acknowledgements, and
-// transport writes. Pure decoding, durable reduction, identity, and state
-// transition helpers used by this adapter remain instrumented and unit tested.
-#[cfg_attr(coverage_nightly, coverage(off))]
 async fn handle_app_event(
     shared: Arc<Shared>,
     generation: u64,
@@ -951,12 +942,1547 @@ mod tests {
         unread_message,
     };
     use crate::transport::ClientTransport;
+    use crate::transport::fake::{Call, CallKind, FakeTransport};
     use buffa::MessageField;
+    use chrono::TimeZone;
+    use omarchy_whatsapp_protocol::Resource;
     use tokio::sync::{broadcast, oneshot};
+    use whatsapp_rust::types::events as sdk;
     use whatsapp_rust::wacore::types::{
-        events::Receipt, message::MessageSource, presence::ReceiptType,
+        call::{
+            CallAction, CallEndedElsewhere, ElsewhereOutcome, IncomingCall, MissedCall,
+            MissedReason,
+        },
+        events::{DecryptFailMode, Receipt, UnavailableType},
+        message::MessageSource,
+        presence::{ChatPresence, ChatPresenceMedia, ReceiptType},
     };
     use whatsapp_rust::wacore_binary::builder::NodeBuilder;
+
+    const CHAT: &str = "31600000001@s.whatsapp.net";
+    const OTHER: &str = "31600000002@s.whatsapp.net";
+    const GROUP: &str = "120363000000000001@g.us";
+    const NOW: i64 = 1_700_000_000;
+
+    fn stamp(seconds: i64) -> chrono::DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0).unwrap()
+    }
+
+    fn jid(value: &str) -> Jid {
+        value.parse().unwrap()
+    }
+
+    fn linked(directory: &tempfile::TempDir) -> (Arc<Shared>, u64, Arc<FakeTransport>) {
+        let shared = Arc::new(test_shared(directory));
+        assets::private_dir(&shared.avatar_dir).unwrap();
+        assets::private_dir(&shared.media_dir).unwrap();
+        let generation = shared.clock.begin_generation();
+        (shared, generation, Arc::new(FakeTransport::new()))
+    }
+
+    /// Reports every diagnostic as enabled without recording it, so the
+    /// adapter's structured fields are evaluated the way they are under the
+    /// daemon's own subscriber instead of being skipped as disabled.
+    struct DiagnosticsEnabled;
+
+    impl tracing::Subscriber for DiagnosticsEnabled {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    async fn apply(
+        shared: &Arc<Shared>,
+        generation: u64,
+        event: Event,
+        fake: &Arc<FakeTransport>,
+        jobs: &Arc<GenerationJobs>,
+    ) {
+        let _diagnostics = tracing::subscriber::set_default(DiagnosticsEnabled);
+        handle_app_event(
+            Arc::clone(shared),
+            generation,
+            Arc::new(event),
+            crate::transport::fake::transport(fake),
+            Arc::clone(jobs),
+        )
+        .await;
+    }
+
+    fn stored_message(id: &str, chat: &str, from_me: bool) -> omarchy_whatsapp_protocol::Message {
+        omarchy_whatsapp_protocol::Message {
+            id: id.to_owned(),
+            chat_jid: chat.to_owned(),
+            sender_jid: if from_me {
+                "me".to_owned()
+            } else {
+                chat.to_owned()
+            },
+            sender_name: "Ada".into(),
+            text: "synthetic".into(),
+            timestamp: NOW,
+            from_me,
+            receipt: u8::from(from_me),
+            delivered_at: None,
+            read_at: None,
+            delivered_to: Vec::new(),
+            read_by: Vec::new(),
+            media: None,
+            reactions: Vec::new(),
+        }
+    }
+
+    fn receipt(chat: &str, sender: &str, kind: ReceiptType, ids: &[&str]) -> Event {
+        Event::Receipt(
+            Receipt::builder()
+                .source(MessageSource {
+                    chat: jid(chat),
+                    sender: jid(sender),
+                    is_group: chat.ends_with("@g.us"),
+                    ..Default::default()
+                })
+                .message_ids(ids.iter().map(|id| (*id).to_owned()).collect())
+                .timestamp(stamp(NOW + 10))
+                .r#type(kind)
+                .offline(false)
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_retired_generation_stops_the_event_adapter() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+
+        apply(
+            &shared,
+            generation.saturating_add(1),
+            Event::StreamReplaced(sdk::StreamReplaced::builder().build()),
+            &fake,
+            &jobs,
+        )
+        .await;
+
+        assert_eq!(shared.app_state_activity_ms.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            *shared.status.read().await,
+            ConnectionStatus::Starting
+        ));
+    }
+
+    #[tokio::test]
+    async fn cross_device_read_receipts_reconcile_the_local_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        shared
+            .database
+            .insert_message(&stored_message("M-1", CHAT, false), "Ada", false, true)
+            .unwrap();
+        let mut events = shared.events.subscribe();
+
+        apply(
+            &shared,
+            generation,
+            receipt(CHAT, CHAT, ReceiptType::ReadSelf, &["M-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(shared.database.unread_total().unwrap(), 0);
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(|frame| matches!(
+                frame.event,
+                ServerEvent::Invalidated {
+                    resource: Resource::Chats,
+                    ..
+                }
+            ))
+        );
+
+        // Replaying the same watermark changes nothing.
+        apply(
+            &shared,
+            generation,
+            receipt(CHAT, CHAT, ReceiptType::PlayedSelf, &["M-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE messages")
+            .unwrap();
+        apply(
+            &shared,
+            generation,
+            receipt(CHAT, CHAT, ReceiptType::ReadSelf, &["M-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert!(shared.app_state_activity_ms.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn delivery_and_read_receipts_advance_stored_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        shared
+            .database
+            .insert_message(&stored_message("M-1", CHAT, true), "Ada", false, false)
+            .unwrap();
+        shared
+            .database
+            .insert_message(&stored_message("G-1", GROUP, true), "Garden", true, false)
+            .unwrap();
+
+        apply(
+            &shared,
+            generation,
+            receipt(CHAT, CHAT, ReceiptType::Delivered, &["M-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(shared.database.messages(CHAT, 10).unwrap()[0].receipt, 2);
+
+        // The same receipt again is a no-op rather than a broadcast.
+        apply(
+            &shared,
+            generation,
+            receipt(CHAT, CHAT, ReceiptType::Delivered, &["M-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+        apply(
+            &shared,
+            generation,
+            receipt(CHAT, CHAT, ReceiptType::Read, &["M-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(shared.database.messages(CHAT, 10).unwrap()[0].receipt, 3);
+
+        // A group receipt names the participant that reported it.
+        apply(
+            &shared,
+            generation,
+            receipt(GROUP, OTHER, ReceiptType::Played, &["G-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(
+            shared.database.messages(GROUP, 10).unwrap()[0]
+                .read_by
+                .iter()
+                .map(|reader| reader.jid.clone())
+                .collect::<Vec<_>>(),
+            vec![OTHER.to_owned()]
+        );
+
+        // A group-wide receipt carries no participant, and a plain send ack
+        // never resolves one.
+        apply(
+            &shared,
+            generation,
+            receipt(GROUP, GROUP, ReceiptType::Read, &["G-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+        apply(
+            &shared,
+            generation,
+            receipt(CHAT, CHAT, ReceiptType::Sender, &["M-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+        // An unknown receipt type is ignored entirely.
+        apply(
+            &shared,
+            generation,
+            receipt(CHAT, CHAT, ReceiptType::Other("synthetic".into()), &["M-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE messages")
+            .unwrap();
+        apply(
+            &shared,
+            generation,
+            receipt(CHAT, CHAT, ReceiptType::Read, &["M-1"]),
+            &fake,
+            &jobs,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn presence_and_chat_state_updates_are_published_with_a_display_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        let mut events = shared.events.subscribe();
+        let chat_presence = |state, media| {
+            Event::ChatPresence(
+                sdk::ChatPresenceUpdate::builder()
+                    .source(MessageSource {
+                        chat: jid(GROUP),
+                        sender: jid(CHAT),
+                        is_group: true,
+                        ..Default::default()
+                    })
+                    .state(state)
+                    .media(media)
+                    .build(),
+            )
+        };
+
+        // Without a stored name the update still names the sender's JID only.
+        apply(
+            &shared,
+            generation,
+            chat_presence(ChatPresence::Composing, ChatPresenceMedia::Text),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::ChatState {
+                chat_jid: GROUP.into(),
+                sender_jid: CHAT.into(),
+                sender_name: String::new(),
+                state: ChatState::Typing,
+            }
+        );
+
+        shared
+            .database
+            .update_address_book_name(CHAT, "Ada")
+            .unwrap();
+        apply(
+            &shared,
+            generation,
+            chat_presence(ChatPresence::Composing, ChatPresenceMedia::Audio),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::ChatState {
+                chat_jid: GROUP.into(),
+                sender_jid: CHAT.into(),
+                sender_name: "Ada".into(),
+                state: ChatState::Recording,
+            }
+        );
+
+        apply(
+            &shared,
+            generation,
+            chat_presence(ChatPresence::Paused, ChatPresenceMedia::Text),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert!(matches!(
+            events.try_recv().unwrap().event,
+            ServerEvent::ChatState {
+                state: ChatState::Paused,
+                ..
+            }
+        ));
+
+        apply(
+            &shared,
+            generation,
+            Event::Presence(
+                sdk::PresenceUpdate::builder()
+                    .from(jid(CHAT))
+                    .unavailable(false)
+                    .last_seen(stamp(NOW))
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            ServerEvent::Presence {
+                jid: CHAT.into(),
+                available: true,
+                last_seen: Some(NOW),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn undecryptable_messages_and_call_events_only_notify() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+
+        apply(
+            &shared,
+            generation,
+            Event::UndecryptableMessage(
+                sdk::UndecryptableMessage::builder()
+                    .info(Arc::new(MessageInfo {
+                        source: MessageSource {
+                            chat: jid(CHAT),
+                            sender: jid(CHAT),
+                            ..Default::default()
+                        },
+                        id: "M-1".into(),
+                        timestamp: stamp(NOW),
+                        ..Default::default()
+                    }))
+                    .is_unavailable(true)
+                    .unavailable_type(UnavailableType::Unknown)
+                    .decrypt_fail_mode(DecryptFailMode::Show)
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+
+        let offer = |offline: bool, notify: Option<&str>| {
+            let mut call = IncomingCall::new_for_test(
+                jid(CHAT),
+                "stanza-1".into(),
+                stamp(NOW),
+                CallAction::OfferNotice {
+                    call_id: "call-1".into(),
+                    call_creator: jid(CHAT),
+                    is_video: false,
+                    is_group: false,
+                },
+            );
+            call.offline = offline;
+            call.notify = notify.map(str::to_owned);
+            Event::IncomingCall(call)
+        };
+        apply(&shared, generation, offer(false, Some("Ada")), &fake, &jobs).await;
+        apply(&shared, generation, offer(false, None), &fake, &jobs).await;
+        // A replayed offer from the offline queue must never ring.
+        apply(&shared, generation, offer(true, None), &fake, &jobs).await;
+        apply(
+            &shared,
+            generation,
+            Event::IncomingCall(IncomingCall::new_for_test(
+                jid(CHAT),
+                "stanza-2".into(),
+                stamp(NOW),
+                CallAction::Reject {
+                    call_id: "call-1".into(),
+                    call_creator: jid(CHAT),
+                    reason: None,
+                },
+            )),
+            &fake,
+            &jobs,
+        )
+        .await;
+
+        apply(
+            &shared,
+            generation,
+            Event::MissedCall(MissedCall::new(
+                jid(CHAT),
+                "call-2".into(),
+                stamp(NOW),
+                MissedReason::Offline,
+            )),
+            &fake,
+            &jobs,
+        )
+        .await;
+        apply(
+            &shared,
+            generation,
+            Event::CallEndedElsewhere(CallEndedElsewhere::new(
+                jid(CHAT),
+                "call-3".into(),
+                stamp(NOW),
+                ElsewhereOutcome::Accepted,
+            )),
+            &fake,
+            &jobs,
+        )
+        .await;
+        apply(
+            &shared,
+            generation,
+            Event::IdentityChange(
+                sdk::IdentityChange::builder()
+                    .user(jid(CHAT))
+                    .implicit(true)
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+
+        // None of these touch local state beyond the app-state heartbeat.
+        assert!(shared.database.list_chats(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn picture_updates_remove_the_cached_avatar_or_refresh_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        let picture = |removed| {
+            Event::PictureUpdate(
+                sdk::PictureUpdate::builder()
+                    .jid(jid(CHAT))
+                    .timestamp(stamp(NOW))
+                    .removed(removed)
+                    .build(),
+            )
+        };
+        assets::write_private_bytes(&assets::avatar_path(&shared.avatar_dir, CHAT), b"avatar")
+            .unwrap();
+
+        apply(&shared, generation, picture(true), &fake, &jobs).await;
+        assert!(!assets::avatar_path(&shared.avatar_dir, CHAT).exists());
+        assert!(assets::avatar_missing_path(&shared.avatar_dir, CHAT).exists());
+
+        apply(&shared, generation, picture(false), &fake, &jobs).await;
+        jobs.abort_all();
+
+        // An unwritable avatar directory is reported instead of panicking.
+        let mut blocked = test_shared(&directory);
+        blocked.avatar_dir = directory.path().join("avatars/marker/blocked");
+        let blocked = Arc::new(blocked);
+        let blocked_generation = blocked.clock.begin_generation();
+        apply(&blocked, blocked_generation, picture(true), &fake, &jobs).await;
+        assert!(!assets::avatar_missing_path(&blocked.avatar_dir, CHAT).exists());
+    }
+
+    #[tokio::test]
+    async fn contact_notifications_refresh_names_avatars_and_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+
+        apply(
+            &shared,
+            generation,
+            Event::ContactUpdated(
+                sdk::ContactUpdated::builder()
+                    .jid(jid(CHAT))
+                    .timestamp(stamp(NOW))
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        apply(
+            &shared,
+            generation,
+            Event::ContactSyncRequested(
+                sdk::ContactSyncRequested::builder()
+                    .timestamp(stamp(NOW))
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+
+        shared
+            .database
+            .update_address_book_name(CHAT, "Ada")
+            .unwrap();
+        shared
+            .database
+            .update_address_book_name("100000000000001@lid", "Ada")
+            .unwrap();
+        apply(
+            &shared,
+            generation,
+            Event::ContactNumberChanged(
+                sdk::ContactNumberChanged::builder()
+                    .old_jid(jid(CHAT))
+                    .new_jid(jid(OTHER))
+                    .old_lid(jid("100000000000001@lid"))
+                    .new_lid(jid("100000000000002@lid"))
+                    .timestamp(stamp(NOW))
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(
+            shared.database.contact_name(OTHER).unwrap().as_deref(),
+            Some("Ada")
+        );
+        assert_eq!(shared.database.contact_name(CHAT).unwrap(), None);
+
+        // Without LIDs only the phone number is migrated, and an unusable store
+        // is reported instead of dropping the notification.
+        shared
+            .database
+            .update_address_book_name("100000000000003@lid", "Ada")
+            .unwrap();
+        shared
+            .database
+            .execute_test_sql("DROP TABLE message_tombstones")
+            .unwrap();
+        apply(
+            &shared,
+            generation,
+            Event::ContactNumberChanged(
+                sdk::ContactNumberChanged::builder()
+                    .old_jid(jid(OTHER))
+                    .new_jid(jid("31600000003@s.whatsapp.net"))
+                    .timestamp(stamp(NOW))
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        apply(
+            &shared,
+            generation,
+            Event::ContactNumberChanged(
+                sdk::ContactNumberChanged::builder()
+                    .old_jid(jid(OTHER))
+                    .new_jid(jid("31600000003@s.whatsapp.net"))
+                    .old_lid(jid("100000000000003@lid"))
+                    .new_lid(jid("100000000000004@lid"))
+                    .timestamp(stamp(NOW))
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(
+            shared.database.contact_name(OTHER).unwrap().as_deref(),
+            Some("Ada")
+        );
+        jobs.abort_all();
+    }
+
+    #[tokio::test]
+    async fn push_and_business_names_are_stored_or_reported() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        let push_name = |name: &str| {
+            Event::PushNameUpdate(
+                sdk::PushNameUpdate::builder()
+                    .jid(jid(CHAT))
+                    .message(Box::new(MessageInfo {
+                        source: MessageSource {
+                            chat: jid(CHAT),
+                            sender: jid(CHAT),
+                            ..Default::default()
+                        },
+                        id: "M-1".into(),
+                        timestamp: stamp(NOW),
+                        ..Default::default()
+                    }))
+                    .old_push_name(String::new())
+                    .new_push_name(name.to_owned())
+                    .build(),
+            )
+        };
+        let business = |name: Option<&str>| {
+            Event::BusinessStatusUpdate(
+                sdk::BusinessStatusUpdate::builder()
+                    .jid(jid(OTHER))
+                    .update_type(sdk::BusinessUpdateType::VerifiedNameChanged)
+                    .timestamp(stamp(NOW))
+                    .maybe_verified_name(name.map(str::to_owned))
+                    .product_ids(Vec::new())
+                    .collection_ids(Vec::new())
+                    .subscriptions(Vec::new())
+                    .build(),
+            )
+        };
+
+        apply(&shared, generation, push_name("Ada"), &fake, &jobs).await;
+        assert_eq!(
+            shared.database.contact_name(CHAT).unwrap().as_deref(),
+            Some("Ada")
+        );
+        apply(
+            &shared,
+            generation,
+            business(Some("Ada's Flowers")),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(
+            shared.database.contact_name(OTHER).unwrap().as_deref(),
+            Some("Ada's Flowers")
+        );
+        apply(&shared, generation, business(None), &fake, &jobs).await;
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE contacts")
+            .unwrap();
+        apply(&shared, generation, push_name("Grace"), &fake, &jobs).await;
+        apply(
+            &shared,
+            generation,
+            business(Some("Grace's Garden")),
+            &fake,
+            &jobs,
+        )
+        .await;
+        jobs.abort_all();
+    }
+
+    #[tokio::test]
+    async fn a_restored_profile_name_re_applies_the_deferred_presence() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        let renamed = |name: &str| {
+            Event::SelfPushNameUpdated(
+                sdk::SelfPushNameUpdated::builder()
+                    .from_server(true)
+                    .old_name(String::new())
+                    .new_name(name.to_owned())
+                    .build(),
+            )
+        };
+
+        // Nothing is requested while the shell has not asked to be available.
+        apply(&shared, generation, renamed("Ada"), &fake, &jobs).await;
+        assert!(fake.calls_of(CallKind::SetAvailable).is_empty());
+
+        let connection = shared.open_connection();
+        shared.set_connection_available(connection, true).unwrap();
+        // An empty replacement name still cannot restore presence.
+        apply(&shared, generation, renamed(""), &fake, &jobs).await;
+        assert!(fake.calls_of(CallKind::SetAvailable).is_empty());
+
+        apply(&shared, generation, renamed("Ada"), &fake, &jobs).await;
+        assert_eq!(
+            fake.calls_of(CallKind::SetAvailable),
+            vec![Call::SetAvailable]
+        );
+
+        fake.fail(CallKind::SetAvailable, "synthetic presence failure");
+        apply(&shared, generation, renamed("Ada"), &fake, &jobs).await;
+        assert_eq!(fake.calls_of(CallKind::SetAvailable).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cross_device_chat_settings_are_applied_with_their_timestamps() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        shared
+            .database
+            .insert_message(&stored_message("M-1", CHAT, false), "Ada", false, true)
+            .unwrap();
+        let pin = |pinned: Option<bool>| {
+            Event::PinUpdate(
+                sdk::PinUpdate::builder()
+                    .jid(jid(CHAT))
+                    .timestamp(stamp(NOW))
+                    .action(Box::new(wa::sync_action_value::PinAction { pinned }))
+                    .from_full_sync(false)
+                    .build(),
+            )
+        };
+        let mute = |muted: Option<bool>| {
+            Event::MuteUpdate(
+                sdk::MuteUpdate::builder()
+                    .jid(jid(CHAT))
+                    .timestamp(stamp(NOW))
+                    .action(Box::new(wa::sync_action_value::MuteAction {
+                        muted,
+                        mute_end_timestamp: None,
+                        ..Default::default()
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            )
+        };
+        let archive = |archived: Option<bool>| {
+            Event::ArchiveUpdate(
+                sdk::ArchiveUpdate::builder()
+                    .jid(jid(CHAT))
+                    .timestamp(stamp(NOW))
+                    .action(Box::new(wa::sync_action_value::ArchiveChatAction {
+                        archived,
+                        ..Default::default()
+                    }))
+                    .from_full_sync(false)
+                    .build(),
+            )
+        };
+        let read = |value: Option<bool>| {
+            Event::MarkChatAsReadUpdate(
+                sdk::MarkChatAsReadUpdate::builder()
+                    .jid(jid(CHAT))
+                    .timestamp(stamp(NOW))
+                    .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                        read: value,
+                        message_range: MessageField::some(
+                            wa::sync_action_value::SyncActionMessageRange {
+                                last_message_timestamp: Some(NOW),
+                                messages: vec![wa::sync_action_value::SyncActionMessage {
+                                    key: MessageField::some(wa::MessageKey {
+                                        id: Some("M-1".into()),
+                                        ..Default::default()
+                                    }),
+                                    timestamp: Some(NOW),
+                                }],
+                                ..Default::default()
+                            },
+                        ),
+                    }))
+                    .from_full_sync(true)
+                    .build(),
+            )
+        };
+
+        apply(&shared, generation, pin(Some(true)), &fake, &jobs).await;
+        apply(&shared, generation, pin(None), &fake, &jobs).await;
+        apply(&shared, generation, mute(Some(true)), &fake, &jobs).await;
+        apply(&shared, generation, mute(None), &fake, &jobs).await;
+        apply(&shared, generation, archive(Some(true)), &fake, &jobs).await;
+        apply(&shared, generation, archive(None), &fake, &jobs).await;
+        apply(&shared, generation, read(Some(true)), &fake, &jobs).await;
+        apply(&shared, generation, read(None), &fake, &jobs).await;
+
+        let chats = shared.database.list_chats(10).unwrap();
+        assert!(chats[0].pinned);
+        assert!(chats[0].muted);
+        assert_eq!(chats[0].unread, 0);
+        assert!(shared.database.is_muted(CHAT, NOW).unwrap());
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chat_settings")
+            .unwrap();
+        apply(&shared, generation, pin(Some(false)), &fake, &jobs).await;
+        apply(&shared, generation, mute(Some(false)), &fake, &jobs).await;
+        apply(&shared, generation, archive(Some(false)), &fake, &jobs).await;
+        apply(&shared, generation, read(Some(false)), &fake, &jobs).await;
+    }
+
+    #[tokio::test]
+    async fn cross_device_deletions_remove_messages_and_their_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        for id in ["M-1", "M-2", "M-3"] {
+            shared
+                .database
+                .insert_message(&stored_message(id, CHAT, false), "Ada", false, true)
+                .unwrap();
+        }
+        std::fs::write(
+            assets::message_image_path(&shared.media_dir, CHAT, "M-1"),
+            b"image",
+        )
+        .unwrap();
+
+        apply(
+            &shared,
+            generation,
+            Event::DeleteMessageForMeUpdate(
+                sdk::DeleteMessageForMeUpdate::builder()
+                    .chat_jid(jid(CHAT))
+                    .message_id("M-1".to_owned())
+                    .from_me(false)
+                    .timestamp(stamp(NOW + 1))
+                    .action(Box::new(
+                        wa::sync_action_value::DeleteMessageForMeAction::default(),
+                    ))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert!(!assets::message_image_path(&shared.media_dir, CHAT, "M-1").exists());
+        assert_eq!(shared.database.messages(CHAT, 10).unwrap().len(), 2);
+
+        apply(
+            &shared,
+            generation,
+            Event::ClearChatUpdate(
+                sdk::ClearChatUpdate::builder()
+                    .jid(jid(CHAT))
+                    .delete_starred(false)
+                    .delete_media(true)
+                    .timestamp(stamp(NOW + 2))
+                    .action(Box::new(wa::sync_action_value::ClearChatAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert!(shared.database.messages(CHAT, 10).unwrap().is_empty());
+
+        apply(
+            &shared,
+            generation,
+            Event::DeleteChatUpdate(
+                sdk::DeleteChatUpdate::builder()
+                    .jid(jid(CHAT))
+                    .delete_media(true)
+                    .timestamp(stamp(NOW + 3))
+                    .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert!(shared.database.list_chats(10).unwrap().is_empty());
+
+        shared
+            .database
+            .execute_test_sql("DROP TABLE chat_settings; DROP TABLE messages;")
+            .unwrap();
+        apply(
+            &shared,
+            generation,
+            Event::DeleteMessageForMeUpdate(
+                sdk::DeleteMessageForMeUpdate::builder()
+                    .chat_jid(jid(CHAT))
+                    .message_id("M-2".to_owned())
+                    .from_me(false)
+                    .timestamp(stamp(NOW + 4))
+                    .action(Box::new(
+                        wa::sync_action_value::DeleteMessageForMeAction::default(),
+                    ))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        apply(
+            &shared,
+            generation,
+            Event::ClearChatUpdate(
+                sdk::ClearChatUpdate::builder()
+                    .jid(jid(CHAT))
+                    .delete_starred(false)
+                    .delete_media(false)
+                    .timestamp(stamp(NOW + 5))
+                    .action(Box::new(wa::sync_action_value::ClearChatAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        apply(
+            &shared,
+            generation,
+            Event::DeleteChatUpdate(
+                sdk::DeleteChatUpdate::builder()
+                    .jid(jid(CHAT))
+                    .delete_media(false)
+                    .timestamp(stamp(NOW + 6))
+                    .action(Box::new(wa::sync_action_value::DeleteChatAction::default()))
+                    .from_full_sync(false)
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn offline_sync_and_dirty_state_schedule_the_recovery_passes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        shared.begin_presence_sync(generation);
+
+        apply(
+            &shared,
+            generation,
+            Event::OfflineSyncCompleted(sdk::OfflineSyncCompleted::builder().count(3).build()),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert!(!shared.presence_sync_pending());
+
+        // A second completion has no deferred presence left to reconcile.
+        apply(
+            &shared,
+            generation,
+            Event::OfflineSyncCompleted(sdk::OfflineSyncCompleted::builder().count(0).build()),
+            &fake,
+            &jobs,
+        )
+        .await;
+
+        apply(
+            &shared,
+            generation,
+            Event::DirtyState(
+                sdk::DirtyState::builder()
+                    .dirty_type(whatsapp_rust::wacore::iq::dirty::DirtyType::Groups)
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        jobs.abort_all();
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_events_move_the_connection_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        *shared.client.write().await = Some(crate::transport::fake::transport(&fake));
+
+        apply(
+            &shared,
+            generation,
+            Event::StreamReplaced(sdk::StreamReplaced::builder().build()),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert!(shared.client.read().await.is_none());
+        assert!(matches!(
+            *shared.status.read().await,
+            ConnectionStatus::Disconnected { .. }
+        ));
+
+        apply(
+            &shared,
+            generation,
+            Event::TemporaryBan(
+                sdk::TemporaryBan::builder()
+                    .code(sdk::TempBanReason::BlockedByUsers)
+                    .expire(chrono::Duration::seconds(3_600))
+                    .message("Synthetic restriction".to_owned())
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert_eq!(
+            *shared.status.read().await,
+            ConnectionStatus::Error {
+                message: "Synthetic restriction".into(),
+            }
+        );
+
+        apply(
+            &shared,
+            generation,
+            Event::TemporaryBan(
+                sdk::TemporaryBan::builder()
+                    .code(sdk::TempBanReason::BroadcastList)
+                    .expire(chrono::Duration::seconds(60))
+                    .build(),
+            ),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert!(matches!(
+            *shared.status.read().await,
+            ConnectionStatus::Error { ref message }
+                if message.starts_with("Temporary WhatsApp restriction")
+        ));
+
+        for (event, expected) in [
+            (
+                Event::PairError(
+                    sdk::PairError::builder()
+                        .id(jid(CHAT))
+                        .lid(jid("100000000000001@lid"))
+                        .business_name(String::new())
+                        .platform("android".to_owned())
+                        .error("synthetic".to_owned())
+                        .build(),
+                ),
+                ConnectionStatus::Error {
+                    message: "WhatsApp device pairing failed; retrying".into(),
+                },
+            ),
+            (
+                Event::QrScannedWithoutMultidevice(
+                    sdk::QrScannedWithoutMultidevice::builder().build(),
+                ),
+                ConnectionStatus::Error {
+                    message: "Enable multi-device WhatsApp and scan the new QR code".into(),
+                },
+            ),
+            (
+                Event::ClientOutdated(sdk::ClientOutdated::builder().build()),
+                ConnectionStatus::Error {
+                    message: "This WhatsApp client version is no longer accepted".into(),
+                },
+            ),
+            (
+                Event::PairingQrCodesExhausted(
+                    sdk::PairingQrCodesExhausted::builder()
+                        .disconnected(true)
+                        .build(),
+                ),
+                ConnectionStatus::Disconnected {
+                    reason: "Pairing QR expired; generating a new code".into(),
+                },
+            ),
+        ] {
+            apply(&shared, generation, event, &fake, &jobs).await;
+            assert_eq!(*shared.status.read().await, expected);
+        }
+
+        // Server acks are observed; only a rejected message is surfaced.
+        for ack in [
+            sdk::ServerAck::builder()
+                .id("M-1".to_owned())
+                .class("message".to_owned())
+                .error("479".to_owned())
+                .build(),
+            sdk::ServerAck::builder()
+                .id("R-1".to_owned())
+                .class("receipt".to_owned())
+                .error("500".to_owned())
+                .build(),
+            sdk::ServerAck::builder().id("M-2".to_owned()).build(),
+        ] {
+            apply(&shared, generation, Event::ServerAck(ack), &fake, &jobs).await;
+        }
+
+        // An event this adapter does not subscribe to is ignored.
+        apply(
+            &shared,
+            generation,
+            Event::Connected(sdk::Connected::builder().build()),
+            &fake,
+            &jobs,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_app_state_sync_reports_and_disarms_the_resync() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let jobs = Arc::new(GenerationJobs::default());
+        crate::state::write_private_marker(&shared.event_sync_marker).unwrap();
+        let mut events = shared.events.subscribe();
+        let failure = |fatal: Vec<String>, connected: bool| {
+            Event::AppStateSyncFailed(
+                sdk::AppStateSyncFailed::builder()
+                    .fatal(fatal)
+                    .retryable(Vec::new())
+                    .skipped(Vec::new())
+                    .connected(connected)
+                    .build(),
+            )
+        };
+
+        // A retryable failure on a connected client keeps the status.
+        apply(&shared, generation, failure(Vec::new(), true), &fake, &jobs).await;
+        assert!(!shared.event_sync_marker.exists());
+        assert!(shared.app_state_failed.load(Ordering::Relaxed));
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|frame| matches!(frame.event, ServerEvent::State { .. }))
+        );
+
+        shared
+            .chat_state_resync_requested
+            .store(true, Ordering::SeqCst);
+        apply(
+            &shared,
+            generation,
+            failure(vec!["regular".to_owned()], true),
+            &fake,
+            &jobs,
+        )
+        .await;
+        let published = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|frame| frame.event)
+            .collect::<Vec<_>>();
+        assert!(published.iter().any(|event| matches!(
+            event,
+            ServerEvent::ChatStateResync {
+                status: ChatStateResyncStatus::Failed,
+                ..
+            }
+        )));
+        assert!(
+            published
+                .iter()
+                .any(|event| matches!(event, ServerEvent::State { .. }))
+        );
+
+        // A disconnected failure also surfaces as a connection error.
+        apply(
+            &shared,
+            generation,
+            failure(Vec::new(), false),
+            &fake,
+            &jobs,
+        )
+        .await;
+        assert!(matches!(
+            *shared.status.read().await,
+            ConnectionStatus::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn contact_update_events_ingest_names_and_reconcile_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let update = Arc::new(Event::ContactUpdate(
+            whatsapp_rust::types::events::ContactUpdate::builder()
+                .jid(jid(CHAT))
+                .timestamp(stamp(NOW))
+                .action(Box::new(wa::sync_action_value::ContactAction {
+                    full_name: Some("Ada Lovelace".into()),
+                    ..Default::default()
+                }))
+                .from_full_sync(false)
+                .build(),
+        ));
+
+        // Another event kind is not this handler's work.
+        process_contact_event(
+            Arc::clone(&shared),
+            generation,
+            Arc::new(Event::StreamReplaced(
+                sdk::StreamReplaced::builder().build(),
+            )),
+            crate::transport::fake::transport(&fake),
+        )
+        .await;
+        // A retired generation stops before any local write.
+        process_contact_event(
+            Arc::clone(&shared),
+            generation.saturating_add(1),
+            Arc::clone(&update),
+            crate::transport::fake::transport(&fake),
+        )
+        .await;
+        assert_eq!(shared.database.contact_name(CHAT).unwrap(), None);
+
+        process_contact_event(
+            Arc::clone(&shared),
+            generation,
+            update,
+            crate::transport::fake::transport(&fake),
+        )
+        .await;
+        assert_eq!(
+            shared.database.contact_name(CHAT).unwrap().as_deref(),
+            Some("Ada Lovelace")
+        );
+    }
+
+    #[tokio::test]
+    async fn group_update_events_refresh_the_subject_and_participants() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, _) = linked(&directory);
+        let fake = Arc::new(FakeTransport::new().with_group_metadata(
+            GROUP,
+            whatsapp_rust::GroupMetadata {
+                subject: "Garden".into(),
+                ..whatsapp_rust::GroupMetadata::default()
+            },
+        ));
+        let update = Arc::new(Event::GroupUpdate(
+            sdk::GroupUpdate::builder()
+                .group_jid(jid(GROUP))
+                .timestamp(stamp(NOW))
+                .is_lid_addressing_mode(false)
+                .action(whatsapp_rust::wacore::stanza::groups::GroupNotificationAction::Unlocked)
+                .build(),
+        ));
+        shared
+            .database
+            .insert_message(&stored_message("G-1", GROUP, false), "", true, false)
+            .unwrap();
+        let mut events = shared.events.subscribe();
+
+        // Another event kind is not this handler's work.
+        process_group_event(
+            Arc::clone(&shared),
+            generation,
+            Arc::new(Event::StreamReplaced(
+                sdk::StreamReplaced::builder().build(),
+            )),
+            crate::transport::fake::transport(&fake),
+        )
+        .await;
+
+        process_group_event(
+            Arc::clone(&shared),
+            generation,
+            Arc::clone(&update),
+            crate::transport::fake::transport(&fake),
+        )
+        .await;
+        assert_eq!(
+            shared.database.chat_name(GROUP).unwrap().as_deref(),
+            Some("Garden")
+        );
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(|frame| matches!(
+                frame.event,
+                ServerEvent::GroupParticipants { ref chat_jid, .. } if chat_jid == GROUP
+            ))
+        );
+
+        // A repeated refresh changes nothing.
+        process_group_event(
+            Arc::clone(&shared),
+            generation,
+            Arc::clone(&update),
+            crate::transport::fake::transport(&fake),
+        )
+        .await;
+
+        // A refused update is reported and a retired generation stops early.
+        process_group_event(
+            Arc::clone(&shared),
+            generation.saturating_add(1),
+            Arc::clone(&update),
+            crate::transport::fake::transport(&fake),
+        )
+        .await;
+        shared
+            .database
+            .execute_test_sql(
+                "CREATE TRIGGER block_group_subject BEFORE UPDATE ON chats
+                 WHEN NEW.name_source = 30
+                 BEGIN SELECT RAISE(ABORT, 'synthetic subject failure'); END;",
+            )
+            .unwrap();
+        shared
+            .database
+            .execute_test_sql("UPDATE chats SET name = '', name_source = 0")
+            .unwrap();
+        process_group_event(
+            Arc::clone(&shared),
+            generation,
+            Arc::clone(&update),
+            crate::transport::fake::transport(&fake),
+        )
+        .await;
+
+        let unavailable = Arc::new(FakeTransport::new());
+        process_group_event(
+            Arc::clone(&shared),
+            generation,
+            update,
+            crate::transport::fake::transport(&unavailable),
+        )
+        .await;
+        assert_eq!(
+            unavailable.calls_of(CallKind::GroupMetadata),
+            vec![Call::GroupMetadata(GROUP.to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_app_event_reducer_runs_current_work_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let (app_sender, app_queue) = mpsc::channel(8);
+        let jobs = Arc::new(GenerationJobs::default());
+        shared
+            .database
+            .insert_message(&stored_message("M-1", CHAT, true), "Ada", false, false)
+            .unwrap();
+
+        for work_generation in [generation, generation.saturating_add(1)] {
+            app_sender
+                .send(AppEventWork {
+                    generation: work_generation,
+                    event: Arc::new(receipt(CHAT, CHAT, ReceiptType::Delivered, &["M-1"])),
+                    transport: crate::transport::fake::transport(&fake),
+                    jobs: Arc::clone(&jobs),
+                })
+                .await
+                .unwrap();
+        }
+        drop(app_sender);
+        run_app_event_reducer(Arc::clone(&shared), app_queue).await;
+
+        assert_eq!(shared.database.messages(CHAT, 10).unwrap()[0].receipt, 2);
+        assert_eq!(fake.calls_of(CallKind::LidPnEntry).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_message_reducer_drains_the_durable_inbox_until_it_is_stale() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let (message_sender, message_queue) = mpsc::channel(8);
+        let record = |id: &str, committed_at: i64| inbound::DurableInbound {
+            key: inbound::InboundKey {
+                chat_jid: CHAT.into(),
+                sender_jid: CHAT.into(),
+                message_id: id.into(),
+            },
+            message: buffa::Message::encode_to_vec(&wa::Message::text("durable")),
+            push_name: "Ada".into(),
+            timestamp: NOW,
+            media_type: "text".into(),
+            is_from_me: false,
+            is_group: false,
+            is_offline: true,
+            committed_at,
+        };
+        let mut corrupt = record("CORRUPT", 1);
+        corrupt.message = vec![0xff];
+        shared
+            .database
+            .commit_inbound_batch(&[corrupt, record("M-1", 2), record("M-2", 3)])
+            .unwrap();
+        // The first reduced message retires the generation, exactly as the run
+        // loop can while the reducer is mid-drain.
+        let clock = Arc::clone(&shared.clock);
+        fake.on_call(move |kind| {
+            if kind == CallKind::LidPnEntry {
+                clock.retire_generation(generation);
+            }
+        });
+
+        // Stale work is dropped before the inbox is even read.
+        message_sender
+            .send(MessageWork::Drain {
+                generation: generation.saturating_add(5),
+                transport: crate::transport::fake::transport(&fake),
+            })
+            .await
+            .unwrap();
+        message_sender
+            .send(MessageWork::Drain {
+                generation,
+                transport: crate::transport::fake::transport(&fake),
+            })
+            .await
+            .unwrap();
+        drop(message_sender);
+        run_message_reducer(Arc::clone(&shared), message_queue).await;
+
+        // Nothing was acknowledged: the retired generation stopped the drain.
+        assert_eq!(shared.database.pending_inbound(10).unwrap().len(), 3);
+        assert!(shared.database.messages(CHAT, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_durable_inbox_is_reported_and_skipped() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        let (message_sender, message_queue) = mpsc::channel(8);
+        shared
+            .database
+            .execute_test_sql("DROP TABLE inbound_inbox")
+            .unwrap();
+
+        message_sender
+            .send(MessageWork::Drain {
+                generation,
+                transport: crate::transport::fake::transport(&fake),
+            })
+            .await
+            .unwrap();
+        drop(message_sender);
+        run_message_reducer(Arc::clone(&shared), message_queue).await;
+
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_app_state_waiter_settles_expires_and_stops_on_a_retired_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, _) = linked(&directory);
+
+        // A retired generation and a failed replay both stop immediately.
+        await_app_state_sync(Arc::clone(&shared), generation.saturating_add(1)).await;
+        shared.app_state_failed.store(true, Ordering::Relaxed);
+        await_app_state_sync(Arc::clone(&shared), generation).await;
+        shared.app_state_failed.store(false, Ordering::Relaxed);
+        assert!(!shared.event_sync_marker.exists());
+
+        // A replay that never reports a complete quiet checkpoint expires.
+        rusqlite::Connection::open(directory.path().join("session.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE app_state_versions (other TEXT NOT NULL);")
+            .unwrap();
+        await_app_state_sync(Arc::clone(&shared), generation).await;
+        assert!(!shared.event_sync_marker.exists());
+
+        // A replay that keeps mutating restarts its quiet window until the
+        // deadline.
+        shared.app_state_activity_ms.store(
+            u64::try_from(Utc::now().timestamp_millis()).unwrap(),
+            Ordering::Relaxed,
+        );
+        await_app_state_sync(Arc::clone(&shared), generation).await;
+
+        // A settled, complete replay reconciles and marks the sync done.
+        shared.app_state_activity_ms.store(0, Ordering::Relaxed);
+        std::fs::remove_file(directory.path().join("session.db")).unwrap();
+        seed_completed_app_state(&directory);
+        await_app_state_sync(Arc::clone(&shared), generation).await;
+        assert!(shared.event_sync_marker.exists());
+    }
 
     #[test]
     fn app_state_quiet_period_restarts_with_every_mutation() {
@@ -1211,8 +2737,6 @@ mod tests {
 
     #[test]
     fn incoming_chat_presence_maps_text_audio_and_pause() {
-        use whatsapp_rust::wacore::types::presence::{ChatPresence, ChatPresenceMedia};
-
         assert_eq!(
             protocol_chat_state(ChatPresence::Composing, ChatPresenceMedia::Text),
             ChatState::Typing

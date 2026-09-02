@@ -703,6 +703,12 @@ pub(crate) mod fake {
         pub(crate) errors: Mutex<HashMap<CallKind, String>>,
         pub(crate) calls: Mutex<Vec<Call>>,
         generated_ids: AtomicU64,
+        /// Runs after a call is recorded and before its scripted answer, so a
+        /// test can mutate daemon state exactly while one transport call is in
+        /// flight. Unset by default, which keeps every existing scenario
+        /// unchanged.
+        #[allow(clippy::type_complexity)]
+        pub(crate) call_hook: Mutex<Option<Box<dyn Fn(CallKind) + Send + Sync>>>,
     }
 
     impl FakeTransport {
@@ -852,10 +858,23 @@ pub(crate) mod fake {
         fn record(&self, call: Call) -> Result<()> {
             let kind = call.kind();
             Self::lock(&self.calls).push(call);
+            if let Some(hook) = Self::lock(&self.call_hook).as_ref() {
+                hook(kind);
+            }
             match Self::lock(&self.errors).get(&kind) {
                 Some(message) => Err(anyhow!(message.clone())),
                 None => Ok(()),
             }
+        }
+
+        /// Installs the [`FakeTransport::call_hook`] closure. A daemon function
+        /// that re-checks shared state across an `await` can only be observed
+        /// doing so if that state changes while one call is in flight.
+        pub(crate) fn on_call<F>(&self, hook: F)
+        where
+            F: Fn(CallKind) + Send + Sync + 'static,
+        {
+            *Self::lock(&self.call_hook) = Some(Box::new(hook));
         }
     }
 
