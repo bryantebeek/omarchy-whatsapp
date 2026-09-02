@@ -138,6 +138,13 @@ MUTATIONS = [
         'if (panelVisible || panelFocused)\n      send("mark_read"',
     ),
     Mutation(
+        "stale-response-bookkeeping",
+        S,
+        TS,
+        "if (frameId) finishStaleResponse(frame)",
+        "if (!frameId) finishStaleResponse(frame)",
+    ),
+    Mutation(
         "message-invalidation-target",
         S,
         TS,
