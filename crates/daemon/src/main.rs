@@ -498,7 +498,7 @@ async fn run_daemon() -> Result<()> {
                     let key = inbound::InboundKey {
                         chat_jid: info.source.chat.to_string(),
                         sender_jid: info.source.sender.to_string(),
-                        message_id: info.id.clone(),
+                        message_id: info.id.to_string(),
                     };
                     if let Err(error) = shared
                         .message_reducer

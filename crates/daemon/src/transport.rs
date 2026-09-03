@@ -1192,7 +1192,7 @@ pub(crate) mod fake {
         async fn request_placeholder_resend(&self, info: &Arc<MessageInfo>) -> Result<()> {
             self.record(Call::RequestPlaceholderResend {
                 chat: info.source.chat.to_string(),
-                message_id: info.id.clone(),
+                message_id: info.id.to_string(),
             })
         }
 

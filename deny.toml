@@ -27,8 +27,7 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# The only permitted git source is the whatsapp-rust fork pinned in Cargo.toml;
-# it carries daemon-required patches that upstream (oxidezap/whatsapp-rust)
-# lacks. Read the comment above that dependency before pointing this anywhere
-# else.
-allow-git = ["https://github.com/bryantebeek/whatsapp-rust"]
+# The only permitted git source is upstream whatsapp-rust, pinned in Cargo.toml
+# to a pull-request commit the daemon depends on. Read the comment above that
+# dependency before pointing this anywhere else.
+allow-git = ["https://github.com/oxidezap/whatsapp-rust"]

@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{error, warn};
 use whatsapp_rust::prelude::*;
+use whatsapp_rust::wacore::types::message::EncMediaType;
 use whatsapp_rust::wacore_binary::JidExt;
 
 impl Shared {
@@ -207,14 +208,19 @@ impl Shared {
             .text_content()
             .map(str::to_owned)
             .or_else(|| base.get_caption().map(str::to_owned))
-            .or_else(|| media_text(base, &info.media_type))
+            .or_else(|| {
+                media_text(
+                    base,
+                    info.media_type.as_ref().map_or("", EncMediaType::as_str),
+                )
+            })
         else {
-            tracing::debug!(message_id = %info.id, media_type = %info.media_type,
+            tracing::debug!(message_id = %info.id, media_type = ?info.media_type,
                 "ignored non-renderable WhatsApp control message");
             return true;
         };
         let persisted_message = Message {
-            id: info.id.clone(),
+            id: info.id.to_string(),
             chat_jid: chat_jid.clone(),
             sender_jid,
             sender_name,
@@ -441,8 +447,8 @@ fn media_placeholder(media_type: &str) -> Option<String> {
             "audio" | "ptt" => "[Voice message]",
             "document" => "[Document]",
             "sticker" => "[Sticker]",
-            "contact" => "[Contact]",
-            "location" | "live_location" => "[Location]",
+            "contact" | "vcard" | "contact_array" => "[Contact]",
+            "location" | "live_location" | "livelocation" => "[Location]",
             "poll" => "[Poll]",
             _ => return None,
         }
@@ -841,7 +847,7 @@ mod tests {
                 is_group: chat.ends_with("@g.us"),
                 ..MessageSource::default()
             },
-            id: id.to_owned(),
+            id: id.into(),
             timestamp: Utc.timestamp_opt(timestamp, 0).unwrap(),
             ..MessageInfo::default()
         }

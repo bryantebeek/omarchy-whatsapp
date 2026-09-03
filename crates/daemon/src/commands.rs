@@ -399,7 +399,7 @@ async fn request_exact_message(
             is_group: chat.is_group(),
             ..Default::default()
         },
-        id: cursor.message_id.clone(),
+        id: cursor.message_id.clone().into(),
         timestamp,
         ..Default::default()
     });

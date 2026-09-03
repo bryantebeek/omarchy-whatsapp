@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use whatsapp_rust::InboundDurabilityHook;
 use whatsapp_rust::prelude::{Client, InboundMessage};
-use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
+use whatsapp_rust::wacore::types::message::{EncMediaType, MessageInfo, MessageSource};
 use whatsapp_rust::waproto::whatsapp as wa;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -36,12 +36,16 @@ impl DurableInbound {
             key: InboundKey {
                 chat_jid: inbound.info.source.chat.to_string(),
                 sender_jid: inbound.info.source.sender.to_string(),
-                message_id: inbound.info.id.clone(),
+                message_id: inbound.info.id.to_string(),
             },
             message: inbound.message.encode_to_vec(),
-            push_name: inbound.info.push_name.clone(),
+            push_name: inbound.info.push_name.to_string(),
             timestamp: inbound.info.timestamp.timestamp(),
-            media_type: inbound.info.media_type.clone(),
+            media_type: inbound
+                .info
+                .media_type
+                .as_ref()
+                .map_or_else(String::new, |media_type| media_type.as_str().to_owned()),
             is_from_me: inbound.info.source.is_from_me,
             is_group: inbound.info.source.is_group,
             is_offline: inbound.info.is_offline,
@@ -77,10 +81,11 @@ impl DurableInbound {
                 is_group: self.is_group,
                 ..MessageSource::default()
             },
-            id: self.key.message_id.clone(),
-            push_name: self.push_name.clone(),
+            id: self.key.message_id.as_str().into(),
+            push_name: self.push_name.as_str().into(),
             timestamp,
-            media_type: self.media_type.clone(),
+            media_type: (!self.media_type.is_empty())
+                .then(|| EncMediaType::from(self.media_type.as_str())),
             is_offline: self.is_offline,
             ..MessageInfo::default()
         };
@@ -160,7 +165,7 @@ mod tests {
                 id: "same-id".into(),
                 push_name: "Synthetic".into(),
                 timestamp: Utc.timestamp_opt(42, 0).unwrap(),
-                media_type: "text".into(),
+                media_type: Some(EncMediaType::from("text")),
                 is_offline: true,
                 ..MessageInfo::default()
             }))

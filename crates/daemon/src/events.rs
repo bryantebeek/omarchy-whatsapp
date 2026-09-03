@@ -426,7 +426,6 @@ pub(crate) const APP_EVENT_KINDS: &[EventKind] = &[
     EventKind::IncomingCall,
     EventKind::MissedCall,
     EventKind::CallEndedElsewhere,
-    EventKind::PushNameUpdate,
     EventKind::SelfPushNameUpdated,
     EventKind::PinUpdate,
     EventKind::MuteUpdate,
@@ -505,9 +504,14 @@ async fn handle_app_event(
             if matches!(receipt_type, "read-self" | "played-self") {
                 let jid =
                     canonical_contact_jid(&shared, transport.as_ref(), &receipt.source.chat).await;
+                let message_ids = receipt
+                    .message_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
                 match shared.database.apply_self_read_receipt(
                     &jid,
-                    &receipt.message_ids,
+                    &message_ids,
                     receipt.timestamp.timestamp(),
                 ) {
                     Ok(changed) => {
@@ -549,9 +553,14 @@ async fn handle_app_event(
                 } else {
                     None
                 };
+                let message_ids = receipt
+                    .message_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
                 match shared.database.update_receipts(
                     &chat_jid,
-                    &receipt.message_ids,
+                    &message_ids,
                     state,
                     recipient_jid.as_deref(),
                     receipt.timestamp.timestamp(),
@@ -672,16 +681,6 @@ async fn handle_app_event(
         }
         Event::CallEndedElsewhere(call) => {
             info!(from = %call.from, outcome = ?call.outcome, "WhatsApp call ended on another device");
-        }
-        Event::PushNameUpdate(update) => {
-            let jid = canonical_contact_jid(&shared, transport.as_ref(), &update.jid).await;
-            if let Err(error) = shared
-                .database
-                .update_contact_name(&jid, &update.new_push_name)
-            {
-                warn!(%error, "could not update WhatsApp push name");
-            }
-            broadcast_chats(&shared);
         }
         Event::SelfPushNameUpdated(update) => {
             info!(old = %update.old_name, new = %update.new_name, "own WhatsApp profile name changed");
@@ -1055,7 +1054,11 @@ mod tests {
                     is_group: chat.ends_with("@g.us"),
                     ..Default::default()
                 })
-                .message_ids(ids.iter().map(|id| (*id).to_owned()).collect())
+                .message_ids(
+                    ids.iter()
+                        .map(|id| whatsapp_rust::CompactString::from(*id))
+                        .collect(),
+                )
                 .timestamp(stamp(NOW + 10))
                 .r#type(kind)
                 .offline(false)
@@ -1601,29 +1604,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn push_and_business_names_are_stored_or_reported() {
+    async fn business_names_are_stored_or_reported() {
         let directory = tempfile::tempdir().unwrap();
         let (shared, generation, fake) = linked(&directory);
         let jobs = Arc::new(GenerationJobs::default());
-        let push_name = |name: &str| {
-            Event::PushNameUpdate(
-                sdk::PushNameUpdate::builder()
-                    .jid(jid(CHAT))
-                    .message(Box::new(MessageInfo {
-                        source: MessageSource {
-                            chat: jid(CHAT),
-                            sender: jid(CHAT),
-                            ..Default::default()
-                        },
-                        id: "M-1".into(),
-                        timestamp: stamp(NOW),
-                        ..Default::default()
-                    }))
-                    .old_push_name(String::new())
-                    .new_push_name(name.to_owned())
-                    .build(),
-            )
-        };
         let business = |name: Option<&str>| {
             Event::BusinessStatusUpdate(
                 sdk::BusinessStatusUpdate::builder()
@@ -1638,11 +1622,6 @@ mod tests {
             )
         };
 
-        apply(&shared, generation, push_name("Ada"), &fake, &jobs).await;
-        assert_eq!(
-            shared.database.contact_name(CHAT).unwrap().as_deref(),
-            Some("Ada")
-        );
         apply(
             &shared,
             generation,
@@ -1661,7 +1640,6 @@ mod tests {
             .database
             .execute_test_sql("DROP TABLE contacts")
             .unwrap();
-        apply(&shared, generation, push_name("Grace"), &fake, &jobs).await;
         apply(
             &shared,
             generation,

@@ -208,7 +208,7 @@
     {
       "kind": "rust",
       "name": "chacha20",
-      "version": "0.10.1",
+      "version": "0.10.2",
       "license": "MIT OR Apache-2.0",
       "homepage": "https://github.com/RustCrypto/stream-ciphers"
     },
@@ -635,13 +635,6 @@
     {
       "kind": "rust",
       "name": "hashbrown",
-      "version": "0.16.1",
-      "license": "MIT OR Apache-2.0",
-      "homepage": "https://github.com/rust-lang/hashbrown"
-    },
-    {
-      "kind": "rust",
-      "name": "hashbrown",
       "version": "0.17.1",
       "license": "MIT OR Apache-2.0",
       "homepage": "https://github.com/rust-lang/hashbrown"
@@ -649,7 +642,7 @@
     {
       "kind": "rust",
       "name": "hashlink",
-      "version": "0.11.1",
+      "version": "0.12.1",
       "license": "MIT OR Apache-2.0",
       "homepage": "https://github.com/djc/hashlink"
     },
@@ -754,7 +747,7 @@
     {
       "kind": "rust",
       "name": "libsqlite3-sys",
-      "version": "0.37.0",
+      "version": "0.38.2",
       "license": "MIT",
       "homepage": "https://github.com/rusqlite/rusqlite"
     },
@@ -992,7 +985,7 @@
     {
       "kind": "rust",
       "name": "rusqlite",
-      "version": "0.39.0",
+      "version": "0.40.2",
       "license": "MIT",
       "homepage": "https://github.com/rusqlite/rusqlite"
     },
