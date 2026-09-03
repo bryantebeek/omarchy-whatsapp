@@ -28,6 +28,35 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ureq = "3.4"
+# whatsapp-rust is pinned to a fork commit on purpose. Upstream is
+# https://github.com/oxidezap/whatsapp-rust; the pinned revision is the tip of
+# the fork's fix/v0.7-manual-presence-policy branch, which carries two patches
+# that upstream does not have and that the daemon cannot run without:
+#   - 33d810c "feat: add manual global presence policy": the PresencePolicy
+#     builder option run_daemon relies on so reconnects never advertise the
+#     linked device as available (see "Event and asset policy" in
+#     ARCHITECTURE.md).
+#   - ababb2f "fix(message): dispatch fast-ratchet key distributions": required
+#     for incoming live-location updates to decrypt.
+# Changing this line (any rev, branch, or repository) requires checking, in
+# this order, before the change can be merged:
+#   1. Both patches above are present in the new revision, or upstream has
+#      merged equivalents and run_daemon/ARCHITECTURE.md are updated to them.
+#   2. crates/daemon/src/transport.rs (ClientTransport) still compiles: it is
+#      the single adapter for every SDK call, so upstream API changes surface
+#      there rather than throughout the daemon.
+#   3. The daemon reads and writes the library's PRIVATE session.db schema to
+#      force app-state resyncs: tables app_state_versions and
+#      app_state_mutation_macs (column name), the device.push_name column, and
+#      the collection names critical_block, critical_unblock_low, regular,
+#      regular_low, regular_high, used by crates/daemon/src/sync.rs
+#      (prepare_contact_name_resync, prepare_event_state_resync) and
+#      crates/daemon/src/database.rs (regular_app_state_is_complete). A rename
+#      upstream only degrades to a warning at runtime, so verify those tables
+#      and names against the new revision's sqlite storage backend.
+#   4. deny.toml allow-git must name the same repository, and
+#      ./scripts/generate-license-report.sh --check must still pass (the
+#      report is generated from the crate metadata of the pinned revision).
 whatsapp-rust = { version = "0.7", git = "https://github.com/bryantebeek/whatsapp-rust", rev = "33d810cbe265164648f1842417c547909060015d", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal"] }
 buffa = "0.9.1"
 
