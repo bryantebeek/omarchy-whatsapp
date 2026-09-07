@@ -69,7 +69,7 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install nightly-2026-06-16 --profile minimal --component llvm-tools-preview
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
         with:
           tool: cargo-llvm-cov@0.9.0
       - name: Enforce coverage policy
