@@ -177,6 +177,15 @@ TestCase {
     compare(control("composer").enabled, true)
   }
 
+  function test_destroy_during_conversation_position_restore_is_safe() {
+    panel.restoreConversationAfterMessages = true
+    panel.scheduleConversationPositionRestore()
+    panel.destroy()
+    panel = null
+
+    wait(10)
+  }
+
   function test_daemon_setup_recovery() {
     service.connectionState = "starting"
     service.daemonSetupRequired = true

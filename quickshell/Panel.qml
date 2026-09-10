@@ -866,8 +866,11 @@ Item {
     else
       messageList.contentY = preservedConversationContentY
     if (remainingPasses > 0) {
+      var nextPass = remainingPasses - 1
+      var target = root
       Qt.callLater(function() {
-        root.restoreConversationPosition(serial, remainingPasses - 1)
+        if (target && typeof target.restoreConversationPosition === "function")
+          target.restoreConversationPosition(serial, nextPass)
       })
     } else {
       restoreConversationAfterMessages = false
@@ -877,8 +880,10 @@ Item {
 
   function scheduleConversationPositionRestore() {
     var serial = ++conversationScrollSerial
+    var target = root
     Qt.callLater(function() {
-      root.restoreConversationPosition(serial, 2)
+      if (target && typeof target.restoreConversationPosition === "function")
+        target.restoreConversationPosition(serial, 2)
     })
   }
 
