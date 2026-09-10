@@ -66,11 +66,6 @@ Item {
   property var groupParticipantRequestJids: ({})
   property var messages: []
   property string messagesChatJid: ""
-  property int messagesLimit: 300
-  readonly property int messagesLimitStep: 300
-  readonly property int messagesLimitMax: 1000
-  readonly property bool canLoadOlderMessages: messagesChatJid === selectedChatJid
-    && messages.length >= messagesLimit && messagesLimit < messagesLimitMax
   property string messagesFirstUnreadId: ""
   property bool messagesResponseHasFollowup: false
   property int messagesResponseSerial: 0
@@ -935,7 +930,7 @@ Item {
     }
     var requestId = send("get_messages", {
       chat_jid: value,
-      limit: messagesLimit
+      limit: 300
     })
     if (!requestId) return 0
     var requestIds = Object.assign({}, messagesRequestIds)
@@ -963,17 +958,6 @@ Item {
     messagesRequestJids = requestJids
     messagesQueuedRequests = queuedRequests
     return shouldRefresh ? jid : ""
-  }
-
-  function loadOlderMessages() {
-    if (!canLoadOlderMessages) return false
-    var previousLimit = messagesLimit
-    messagesLimit = Math.min(messagesLimitMax, messagesLimit + messagesLimitStep)
-    if (!requestMessages(selectedChatJid, true)) {
-      messagesLimit = previousLimit
-      return false
-    }
-    return true
   }
 
   function mediaDownloadKey(message) {
@@ -1102,7 +1086,6 @@ Item {
       groupParticipantsChatJid = ""
       groupParticipantsError = ""
       messagesChatJid = ""
-      messagesLimit = messagesLimitStep
       messagesFirstUnreadId = ""
       messagesNavigationSerial++
       replaceMessages([], false)

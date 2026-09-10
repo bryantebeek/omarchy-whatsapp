@@ -84,24 +84,6 @@ TestCase {
     return messages
   }
 
-  function olderMessages(count) {
-    var messages = []
-    for (var i = 0; i < count; i++) {
-      messages.push({
-        id: "older-" + i,
-        chat_jid: "alice@s.whatsapp.net",
-        sender_jid: "alice@s.whatsapp.net",
-        sender_name: "Alice",
-        from_me: false,
-        text: "Older message " + i + " from before the loaded window",
-        timestamp: 100 + i * 61,
-        receipt: 1,
-        read_by: []
-      })
-    }
-    return messages
-  }
-
   function test_open_search_select_and_close() {
     panel.open('{"chatJid":"team@g.us"}')
     compare(panel.opened, true)
@@ -679,94 +661,16 @@ TestCase {
       "Appending at the bottom must retain the previous latest bubble")
   }
 
-  function test_load_older_messages_keeps_the_viewport_anchor() {
+  function test_conversation_has_no_load_earlier_messages_control() {
     panel.open('{"chatJid":"alice@s.whatsapp.net"}')
-    var list = control("messageList")
-    var button = control("loadOlderMessagesButton")
-    compare(button.text, "Load earlier messages")
-
-    service.messagesLimit = 40
-    service.loadMessages(syntheticMessages(30), "")
-    tryCompare(list, "count", 30)
-    compare(service.canLoadOlderMessages, false)
-    compare(panel.canLoadOlderMessages, false)
-    compare(button.relevant, false)
-    compare(button.opacity, 0)
-    compare(button.enabled, false)
-    compare(panel.loadOlderMessages(), false)
-
-    service.loadMessages(syntheticMessages(40), "")
-    tryCompare(list, "count", 40)
-    compare(service.canLoadOlderMessages, true)
-    compare(panel.canLoadOlderMessages, true)
-    compare(button.relevant, true)
-    tryCompare(button, "opacity", 1)
-    compare(button.enabled, true)
-    tryCompare(panel, "conversationReady", true)
-
-    list.positionViewAtIndex(20, ListView.Beginning)
-    list.forceLayout()
-    wait(20)
-    var anchor = control("messageDelegate-scroll-20")
-    var anchorOffset = anchor.y - list.contentY
-    verify(list.contentY > 0)
-
-    button.click()
-    compare(callCount("loadOlderMessages"), 1)
-    compare(service.messagesLimit, 340)
-    compare(panel.olderMessagesRequestPending, true)
-    compare(button.text, "Loading earlier messages…")
-    compare(button.enabled, false)
-    compare(panel.loadOlderMessages(), false)
-    compare(callCount("loadOlderMessages"), 1)
-
-    service.loadMessages(olderMessages(8).concat(service.messages), "")
-    tryCompare(list, "count", 48)
-    compare(panel.olderMessagesRequestPending, false)
-    compare(list.model.get(0).messageKey, "id:older-0")
-    tryVerify(function() {
-      var restored = findChild(panel, "messageDelegate-scroll-20")
-      return restored !== null
-        && Math.abs((restored.y - list.contentY) - anchorOffset) < 1
-    })
-    compare(control("messageDelegate-scroll-20"), anchor,
-      "Loading older history must not recreate the anchored bubble")
-
-    // The snapshot is no longer full, so the control retires again.
-    compare(service.canLoadOlderMessages, false)
-    compare(button.relevant, false)
-    tryCompare(button, "opacity", 0)
-    service.messagesLimit = service.messagesLimitMax
-    service.loadMessages(syntheticMessages(40), "")
-    tryCompare(list, "count", 40)
-    compare(service.canLoadOlderMessages, false)
-  }
-
-  function test_scrolling_to_the_conversation_top_loads_older_messages() {
-    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
-    service.messagesLimit = 40
     service.loadMessages(syntheticMessages(40), "")
     var list = control("messageList")
     tryCompare(list, "count", 40)
-    tryCompare(panel, "conversationReady", true)
-    compare(service.canLoadOlderMessages, true)
 
-    list.positionViewAtIndex(20, ListView.Beginning)
-    list.forceLayout()
-    wait(20)
-    verify(list.contentY > 0)
+    compare(findChild(panel, "loadOlderMessagesButton"), null)
+    list.positionViewAtBeginning()
     list.movementEnded()
     compare(callCount("loadOlderMessages"), 0)
-
-    list.contentY = list.originY - list.topMargin
-    list.forceLayout()
-    wait(20)
-    verify(list.atYBeginning)
-    list.movementEnded()
-    compare(callCount("loadOlderMessages"), 1)
-    list.movementEnded()
-    compare(callCount("loadOlderMessages"), 1,
-      "A pending request must not be repeated by another movement to the top")
   }
 
   function test_create_render_and_vote_in_poll() {

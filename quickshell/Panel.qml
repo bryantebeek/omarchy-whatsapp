@@ -25,7 +25,6 @@ Item {
   property int conversationScrollSerial: 0
   property bool scrollToBottomAfterMessages: false
   property bool restoreConversationAfterMessages: false
-  property bool olderMessagesRequestPending: false
   property real preservedConversationContentY: 0
   property string preservedConversationMessageId: ""
   property real preservedConversationMessageOffset: 0
@@ -49,8 +48,6 @@ Item {
   property alias chatStateResyncAction: headerResyncAction
   property alias chatStateResyncConfirmation: resyncConfirmation
   readonly property bool unreadOnly: service && service.unreadOnly === true
-  readonly property bool canLoadOlderMessages: service
-    && service.canLoadOlderMessages === true
   readonly property bool voiceRecordingTestMode: service
     && service.voiceRecordingTestMode === true
   readonly property int voiceRecordingDurationMs: voiceRecordingTestMode
@@ -897,19 +894,6 @@ Item {
       firstUnreadId)
   }
 
-  // The conversation snapshot is capped. Raising the cap re-requests the
-  // conversation, and the larger snapshot arrives through the normal messages
-  // path with position preservation, so the anchor message stays put. Only one
-  // request is in flight at a time; scrolling back to the top while the answer
-  // is pending must not queue another.
-  function loadOlderMessages() {
-    if (!service || olderMessagesRequestPending || !canLoadOlderMessages
-        || typeof service.loadOlderMessages !== "function") return false
-    if (!service.loadOlderMessages()) return false
-    olderMessagesRequestPending = true
-    return true
-  }
-
   function remainingTimeLabel(untilTimestamp) {
     var minutes = Math.max(0, Math.ceil(
       (Number(untilTimestamp || 0) - currentTimestamp) / 60))
@@ -1136,7 +1120,6 @@ Item {
       scrollToBottomAnimation.stop()
       root.conversationScrollSerial++
       root.conversationReady = false
-      root.olderMessagesRequestPending = false
       root.scrollToBottomAfterMessages = false
       root.restoreConversationAfterMessages = false
       root.preservedConversationMessageId = ""
@@ -1168,7 +1151,6 @@ Item {
         root.scrollToBottomAfterMessages = true
     }
     function onMessagesResponseSerialChanged() {
-      root.olderMessagesRequestPending = false
       if (!root.service
           || root.service.messagesChatJid !== root.service.selectedChatJid) return
       if (root.service.messagesResponseHasFollowup === true) return
@@ -2245,12 +2227,6 @@ Item {
                     reuseItems: true
                     QQC.ScrollBar.vertical: QQC.ScrollBar {}
 
-                    // Reaching the very top of the loaded history is the
-                    // natural request for more of it. Only user-driven
-                    // movement counts, so programmatic positioning during a
-                    // conversation switch cannot trigger a request.
-                    onMovementEnded: if (atYBeginning) root.loadOlderMessages()
-
                     delegate: Item {
                       id: messageDelegate
                       objectName: "messageDelegate-" + String(modelData.id || "")
@@ -3186,38 +3162,6 @@ Item {
                         tooltipText: "Send voice message"
                         onClicked: root.stopVoiceRecording(true)
                       }
-                    }
-                  }
-                }
-
-                CrispButton {
-                  id: loadOlderMessagesButton
-
-                  objectName: "loadOlderMessagesButton"
-                  readonly property bool relevant: root.canLoadOlderMessages
-
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  anchors.top: parent.top
-                  anchors.topMargin: conversationHeader.height + Style.space(14)
-                  z: 1
-                  visible: relevant || opacity > 0
-                  enabled: relevant && !root.olderMessagesRequestPending
-                  opacity: relevant ? 1 : 0
-                  text: root.olderMessagesRequestPending
-                    ? "Loading earlier messages…" : "Load earlier messages"
-                  iconText: root.olderMessagesRequestPending ? "󰔟" : "󰁝"
-                  tooltipText: "Load more of this conversation's history"
-                  foreground: root.foreground
-                  background: root.background
-                  accent: root.accent
-                  bordered: true
-                  focusable: true
-                  onClicked: root.loadOlderMessages()
-
-                  Behavior on opacity {
-                    NumberAnimation {
-                      duration: 140
-                      easing.type: Easing.OutCubic
                     }
                   }
                 }

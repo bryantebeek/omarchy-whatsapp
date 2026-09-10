@@ -1036,87 +1036,14 @@ TestCase {
     compare(service.handleInvalidation({ resource: "unknown" }), false)
   }
 
-  function messagePage(prefix, count) {
-    var page = []
-    for (var i = 0; i < count; i++)
-      page.push({ id: prefix + i, sender_jid: "me" })
-    return page
-  }
-
-  function test_message_pagination_loads_older_history_on_demand() {
-    compare(service.messagesLimit, 300)
-    compare(service.messagesLimitStep, 300)
-    compare(service.messagesLimitMax, 1000)
-    compare(service.canLoadOlderMessages, false)
-    compare(service.loadOlderMessages(), false)
-
+  function test_message_requests_use_a_fixed_snapshot_limit() {
     service.chats = [{ jid: "chat", is_group: false }]
     TestIo.socketWrites = []
+
     service.selectChat("chat")
+
     compare(lastFrameFor("get_messages").limit, 300)
-    compare(service.canLoadOlderMessages, false)
-
-    var requestId = Number(service.messagesRequestIds.chat)
-    service.handleLine(JSON.stringify({
-      id: requestId, event: "messages", chat_jid: "chat",
-      messages: messagePage("m", 300)
-    }))
-    compare(service.messages.length, 300)
-    compare(service.canLoadOlderMessages, true)
-
-    var navigationSerial = service.messagesNavigationSerial
-    messagesWillChangeCount = 0
-    TestIo.socketWrites = []
-    compare(service.loadOlderMessages(), true)
-    compare(service.messagesLimit, 600)
-    compare(lastFrameFor("get_messages").limit, 600)
-    // A second page is already in flight, so the view cannot ask again.
-    compare(service.canLoadOlderMessages, false)
-
-    requestId = Number(service.messagesRequestIds.chat)
-    service.handleLine(JSON.stringify({
-      id: requestId, event: "messages", chat_jid: "chat",
-      messages: messagePage("m", 420)
-    }))
-    compare(service.messages.length, 420)
-    compare(messagesWillChangeCount, 1)
-    // Loading older history is not navigation: the panel keeps its anchor.
-    compare(lastPreservePosition, true)
-    compare(service.messagesNavigationSerial, navigationSerial)
-    compare(service.canLoadOlderMessages, false)
-
-    // The last page stops at the retention the daemon actually keeps.
-    service.messages = messagePage("f", 900)
-    service.messagesLimit = 900
-    compare(service.canLoadOlderMessages, true)
-    TestIo.socketWrites = []
-    compare(service.loadOlderMessages(), true)
-    compare(service.messagesLimit, 1000)
-    compare(lastFrameFor("get_messages").limit, 1000)
-    service.messages = messagePage("f", 1000)
-    compare(service.canLoadOlderMessages, false)
-    compare(service.loadOlderMessages(), false)
-
-    // Selecting another conversation starts again at the first page.
-    service.messagesLimit = 600
-    TestIo.socketWrites = []
-    service.selectChat("other")
-    compare(service.messagesLimit, 300)
-    compare(lastFrameFor("get_messages").limit, 300)
-    service.messagesLimit = 600
-    service.selectChat("other")
-    compare(service.messagesLimit, 600)
-
-    // Without a usable socket the page request cannot be sent, so the limit
-    // stays where the last successful snapshot left it.
-    service.selectedChatJid = "chat"
-    service.messagesChatJid = "chat"
-    service.messages = messagePage("f", 600)
-    compare(service.canLoadOlderMessages, true)
-    var socket = TestIo.sockets[TestIo.sockets.length - 1]
-    socket.connected = false
-    compare(service.loadOlderMessages(), false)
-    compare(service.messagesLimit, 600)
+    compare(typeof service.loadOlderMessages, "undefined")
   }
 
   function test_read_intent_requires_visible_focus() {
