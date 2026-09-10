@@ -112,6 +112,28 @@ TestCase {
     compare(panel.opened, false)
   }
 
+  function test_second_open_renders_messages_retained_by_the_service() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    service.loadMessages(syntheticMessages(3), "")
+    tryCompare(control("messageList"), "count", 3)
+    panel.close()
+    panel.destroy()
+    panel = null
+    wait(10)
+
+    // The shell's asynchronous Loader completes the panel before injecting
+    // its long-lived service, which already owns the selected conversation.
+    panel = createTemporaryObject(panelComponent, testCase)
+    verify(panel !== null)
+    compare(findChild(panel, "conversationMessageModel").count, 0)
+    panel.service = service
+    panel.open("{}")
+
+    compare(service.messages.length, 3)
+    tryCompare(control("messageList"), "count", 3)
+    verify(control("messageDelegate-scroll-0") !== null)
+  }
+
   function test_mention_contact_name_and_open_dm() {
     panel.open('{"chatJid":"team@g.us"}')
     service.groupParticipants = [{

@@ -1552,9 +1552,13 @@ Item {
       connected: true
       parser: SplitParser {
         splitMarker: "\n"
-        onRead: function(line) { root.handleLine(line) }
+        onRead: function(line) {
+          if (root && typeof root.handleLine === "function")
+            root.handleLine(line)
+        }
       }
       onConnectionStateChanged: {
+        if (!root) return
         root.connected = connected
         if (connected) {
           root.protocolCompatible = false
@@ -1573,6 +1577,7 @@ Item {
         }
       }
       onError: function(_error) {
+        if (!root) return
         root.connected = false
         root.protocolCompatible = false
         root.connectionState = "starting"
@@ -1685,31 +1690,47 @@ Item {
   Process {
     id: daemonStarter
     command: ["systemctl", "--user", "start", "omarchy-whatsapp.service"]
-    onExited: function(exitCode) { root.finishDaemonStart(exitCode) }
+    onExited: function(exitCode) {
+      if (root && typeof root.finishDaemonStart === "function")
+        root.finishDaemonStart(exitCode)
+    }
   }
 
   Process {
     id: runtimeCheck
-    onExited: function(exitCode) { root.finishDaemonRuntimeCheck(exitCode) }
+    onExited: function(exitCode) {
+      if (root && typeof root.finishDaemonRuntimeCheck === "function")
+        root.finishDaemonRuntimeCheck(exitCode)
+    }
   }
 
   Process {
     id: runtimeSetup
     stdout: SplitParser {
       splitMarker: "\n"
-      onRead: function(line) { root.updateDaemonSetupDetail(line) }
+      onRead: function(line) {
+        if (root && typeof root.updateDaemonSetupDetail === "function")
+          root.updateDaemonSetupDetail(line)
+      }
     }
     stderr: SplitParser {
       splitMarker: "\n"
-      onRead: function(line) { root.updateDaemonSetupDetail(line) }
+      onRead: function(line) {
+        if (root && typeof root.updateDaemonSetupDetail === "function")
+          root.updateDaemonSetupDetail(line)
+      }
     }
-    onExited: function(exitCode) { root.finishDaemonRuntimeSetup(exitCode) }
+    onExited: function(exitCode) {
+      if (root && typeof root.finishDaemonRuntimeSetup === "function")
+        root.finishDaemonRuntimeSetup(exitCode)
+    }
   }
 
   Process {
     id: ensureUiPreferencesDir
     command: ["/usr/bin/mkdir", "-p", root.statePath]
     onExited: {
+      if (!root) return
       if (!root.uiPreferencesReady) uiPreferencesFile.reload()
       else if (root.uiPreferencesDirty) root.flushUiPreferences()
     }
@@ -1719,6 +1740,7 @@ Item {
     id: launcherSync
     command: ["omarchy-whatsappctl", "launcher-sync"]
     onExited: {
+      if (!root) return
       if (!root.launcherSyncPending)
         return
       root.launcherSyncPending = false

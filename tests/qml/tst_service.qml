@@ -35,6 +35,7 @@ TestCase {
   }
 
   function init() {
+    failOnWarning(/.*(Cannot read property|Cannot call method).*of null.*/)
     TestIo.reset()
     Quickshell.reset()
     service = createTemporaryObject(serviceComponent, testCase, {
@@ -58,6 +59,7 @@ TestCase {
   function cleanup() {
     if (service) service.destroy()
     service = null
+    wait(10)
   }
 
   function sentFrames() {

@@ -297,6 +297,12 @@ Item {
   function open(payloadJson) {
     var payload = {}
     try { payload = JSON.parse(payloadJson || "{}") || {} } catch (error) {}
+    // Omarchy creates panels on demand and assigns the long-lived service only
+    // after Component.onCompleted. Rebuild the panel-owned render models here
+    // so reopening an already-selected conversation uses the retained service
+    // snapshot even though no service property changed.
+    syncConversationMessageModel()
+    syncChatRenderModel()
     opened = true
     if (service) {
       service.refreshMetadata()

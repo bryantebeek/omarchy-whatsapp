@@ -117,10 +117,14 @@ QtObject {
   }
 
   function selectChat(jid) {
-    selectedChatJid = String(jid || "")
-    messagesChatJid = ""
-    messages = []
-    messagesNavigationSerial++
+    var value = String(jid || "")
+    var changed = value !== selectedChatJid
+    selectedChatJid = value
+    if (changed) {
+      messagesChatJid = ""
+      messages = []
+      messagesNavigationSerial++
+    }
     record("selectChat", selectedChatJid)
   }
 
