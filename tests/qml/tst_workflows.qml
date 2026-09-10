@@ -134,6 +134,60 @@ TestCase {
     verify(control("messageDelegate-scroll-0") !== null)
   }
 
+  function test_wrapped_message_text_starts_at_left_edge_data() {
+    return [
+      { tag: "incoming", outgoing: false, caption: false },
+      { tag: "outgoing", outgoing: true, caption: false },
+      { tag: "incoming-caption", outgoing: false, caption: true },
+      { tag: "outgoing-caption", outgoing: true, caption: true }
+    ]
+  }
+
+  function test_wrapped_message_text_starts_at_left_edge(data) {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var messages = syntheticMessages(1)
+    messages[0].from_me = data.outgoing
+    messages[0].text = "Take a look https://example.com/models/"
+      + Array(30).join("sample-model-") + "?from=search"
+    if (data.caption)
+      messages[0].media = { kind: "image", caption: messages[0].text }
+    service.loadMessages(messages, "")
+    tryCompare(control("messageList"), "count", 1)
+    var text = control((data.caption ? "mediaCaptionText-" : "messageText-") + "scroll-0")
+    verify(text.lineCount > 1)
+    compare(text.horizontalAlignment, Text.AlignLeft)
+    compare(text.effectiveHorizontalAlignment, Text.AlignLeft)
+  }
+
+  function test_message_bubble_fits_rendered_lines_data() {
+    return [
+      { tag: "short", text: "A short message" },
+      { tag: "explicit-lines", text: "A longer first line\nShort" },
+      { tag: "wrapped-link", text: "Look https://example.com/"
+        + Array(14).join("sample-model-") + "?from=search" }
+    ]
+  }
+
+  function test_message_bubble_fits_rendered_lines(data) {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var messages = syntheticMessages(1)
+    messages[0].from_me = true
+    messages[0].text = data.text
+    service.loadMessages(messages, "")
+    tryCompare(control("messageList"), "count", 1)
+    var text = control("messageText-scroll-0")
+    var bubble = control("messageBubble-scroll-0")
+    tryVerify(function () {
+      return Math.abs(bubble.width - text.paintedWidth
+        - bubble.horizontalPadding) <= 1
+    })
+    verify(bubble.width <= bubble.maximumWidth)
+    if (data.tag !== "short")
+      verify(text.lineCount > 1)
+    var delegate = control("messageDelegate-scroll-0")
+    compare(bubble.x + bubble.width, delegate.width - Style.space(18))
+  }
+
   function test_mention_contact_name_and_open_dm() {
     panel.open('{"chatJid":"team@g.us"}')
     service.groupParticipants = [{

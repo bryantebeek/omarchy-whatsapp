@@ -2432,11 +2432,12 @@ Item {
 
                       Text {
                         id: messageWidthProbe
+                        width: bubble.maximumWidth - bubble.horizontalPadding
                         visible: false
                         text: messageDelegate.renderedMessageText
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
-                        wrapMode: Text.NoWrap
+                        wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                         textFormat: Text.StyledText
                       }
 
@@ -2506,7 +2507,7 @@ Item {
                           ? Math.min(maximumWidth, Style.space(340))
                           : Math.min(maximumWidth,
                             Math.max(Style.space(36),
-                              messageWidthProbe.implicitWidth + horizontalPadding,
+                              Math.ceil(messageWidthProbe.paintedWidth) + horizontalPadding,
                               messageDelegate.showSenderLabel
                                 ? senderWidthProbe.implicitWidth
                                   + horizontalPadding : 0))
@@ -2567,8 +2568,7 @@ Item {
                             font.pixelSize: Style.font.body
                             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                             textFormat: Text.StyledText
-                            horizontalAlignment: modelData.from_me
-                              ? Text.AlignRight : Text.AlignLeft
+                            horizontalAlignment: Text.AlignLeft
 
                             onLinkActivated: function (link) {
                               root.openMessageLink(link)
@@ -2591,8 +2591,7 @@ Item {
                             font.pixelSize: Style.font.body
                             wrapMode: Text.WrapAtWordBoundaryOrAnywhere
                             textFormat: Text.StyledText
-                            horizontalAlignment: modelData.from_me
-                              ? Text.AlignRight : Text.AlignLeft
+                            horizontalAlignment: Text.AlignLeft
 
                             onLinkActivated: function (link) {
                               root.openMessageLink(link)
