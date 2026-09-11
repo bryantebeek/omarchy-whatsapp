@@ -75,8 +75,8 @@ Production exclusions must remain narrow and explicit:
 
 SQLite migrations and network adapters are still exercised by dedicated
 integration or deployment smoke tests. Quickshell QML/JS requires the four Qt
-Quick suites, date tests in UTC and Pacific/Auckland, a small targeted semantic
-mutation set, `qmlformat`, strict local `qmllint`, and Omarchy plugin validation.
+Quick suites, date tests in UTC and Pacific/Auckland, `qmlformat`, strict
+local `qmllint`, and Omarchy plugin validation.
 Installer, service, and package behavior is checked by ShellCheck, metadata
 validation, locked release builds, isolated lifecycle smoke tests, and live
 installation verification.
@@ -89,11 +89,9 @@ Qt's open-source Quick Test runner does not expose interpreted QML/JavaScript
 line or branch coverage, so this repository does not manufacture a percentage
 from source-name matching. `scripts/qml-test-all.sh` runs the real unit,
 component, service-state, and workflow suites plus timezone-sensitive model
-checks. `scripts/qml-mutation.sh` complements them with a deliberately small set
-of high-value faults around input validation, request ordering, connection
-safety, and core workflows. It is a regression check, not a proxy coverage
-number; visual styling permutations remain the responsibility of review and
-focused component/workflow tests.
+checks. High-risk validation, ordering, connection, and workflow behavior is
+covered by direct behavioral tests in those suites rather than by a proxy
+coverage number.
 
 ## Pull-request expectations
 

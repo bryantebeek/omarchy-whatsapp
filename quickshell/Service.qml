@@ -33,7 +33,7 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
-  readonly property int protocolVersion: 29
+  readonly property int protocolVersion: 30
   readonly property int requestTimeoutMs: 135000
   readonly property int avatarRequestIntervalMs: 60000
 
@@ -86,6 +86,12 @@ Item {
   property string voiceMessageRequestChatJid: ""
   property int voiceMessageRequestDurationMs: 0
   property var voiceOutboxEntries: []
+  property var stagedImage: null
+  property int imagePasteRequestId: 0
+  property int imageSendRequestId: 0
+  property string imageSendChatJid: ""
+  property string imageSendCaption: ""
+  property string imageSendDeliveryId: ""
   property int sentPresenceState: -1
   property var pollVoteRequests: ({})
   property int pollCreateRequestId: 0
@@ -117,6 +123,7 @@ Item {
 
   signal messagesWillChange(bool preservePosition)
   signal textMessageAccepted(string deliveryId, string chatJid, string text)
+  signal clipboardTextPasteRequested()
 
   readonly property string qrImageUrl: pairingExpiresAt > 0
     ? "file://" + qrPath + "?v=" + pairingExpiresAt : ""
@@ -508,6 +515,75 @@ Item {
     return true
   }
 
+  function pasteImage() {
+    if (!selectedChatJid || imagePasteRequestId > 0) return false
+    imagePasteRequestId = send("paste_image", {})
+    if (!imagePasteRequestId) {
+      lastError = "Daemon is unavailable; retry is safe"
+      lastErrorRequestId = ""
+      return false
+    }
+    return true
+  }
+
+  function finishImagePasteRequest(frame) {
+    if (!frame || Number(frame.id || 0) !== imagePasteRequestId) return false
+    if (frame.event === "image_pasted" && frame.path) {
+      stagedImage = {
+        path: String(frame.path || ""),
+        width: Number(frame.width || 0),
+        height: Number(frame.height || 0),
+        mime_type: String(frame.mime_type || "")
+      }
+    } else if (frame.event === "image_paste_empty") {
+      clipboardTextPasteRequested()
+    }
+    imagePasteRequestId = 0
+    return true
+  }
+
+  function clearStagedImage() {
+    stagedImage = null
+  }
+
+  function sendImageMessage(caption) {
+    var body = String(caption || "")
+    if (!selectedChatJid || !stagedImage || !stagedImage.path
+        || imageSendRequestId > 0) return false
+    nextDeliverySerial++
+    var deliveryId = "img-" + String(Date.now()) + "-"
+      + String(nextDeliverySerial)
+    imageSendRequestId = send("send_image", {
+      chat_jid: selectedChatJid,
+      path: String(stagedImage.path),
+      caption: body,
+      delivery_id: deliveryId
+    })
+    if (!imageSendRequestId) {
+      lastError = "Daemon is unavailable; retry is safe"
+      lastErrorRequestId = ""
+      return false
+    }
+    imageSendChatJid = selectedChatJid
+    imageSendCaption = body
+    imageSendDeliveryId = deliveryId
+    return true
+  }
+
+  function finishImageSendRequest(frame) {
+    if (!frame || Number(frame.id || 0) !== imageSendRequestId) return false
+    if (frame.event === "sent") {
+      stagedImage = null
+      textMessageAccepted(imageSendDeliveryId, imageSendChatJid,
+        imageSendCaption)
+    }
+    imageSendRequestId = 0
+    imageSendChatJid = ""
+    imageSendCaption = ""
+    imageSendDeliveryId = ""
+    return true
+  }
+
   function updateDaemonSetupDetail(line) {
     var detail = String(line || "").trim()
     if (!detail) return
@@ -839,6 +915,11 @@ Item {
     pollVoteRequests = ({})
     pollCreateRequestId = 0
     chatStateResyncRequestId = 0
+    imagePasteRequestId = 0
+    imageSendRequestId = 0
+    imageSendChatJid = ""
+    imageSendCaption = ""
+    imageSendDeliveryId = ""
   }
 
   function expireRequests(nowMs) {
@@ -853,6 +934,12 @@ Item {
       finishPollRequest({ id: Number(id), event: "error" })
       finishMediaDownloadRequest({ id: Number(id), event: "error" })
       finishVoiceMessageRequest({
+        id: Number(id), event: "error", message: "WhatsApp request timed out"
+      })
+      finishImagePasteRequest({
+        id: Number(id), event: "error", message: "WhatsApp request timed out"
+      })
+      finishImageSendRequest({
         id: Number(id), event: "error", message: "WhatsApp request timed out"
       })
       finishChatStateResyncRequest({
@@ -1373,6 +1460,8 @@ Item {
     finishPollRequest(frame)
     finishMediaDownloadRequest(frame)
     finishVoiceMessageRequest(frame)
+    finishImagePasteRequest(frame)
+    finishImageSendRequest(frame)
     finishChatStateResyncRequest(frame)
     finishMessagesRequest(frame)
     finishTextMessageRequest(frame)
@@ -1407,6 +1496,8 @@ Item {
     finishPollRequest(frame)
     finishMediaDownloadRequest(frame)
     finishVoiceMessageRequest(frame)
+    finishImagePasteRequest(frame)
+    finishImageSendRequest(frame)
     finishChatStateResyncRequest(frame)
     var queuedMessagesJid = finishMessagesRequest(frame)
     finishTextMessageRequest(frame)

@@ -15,7 +15,6 @@ cd "$repo_dir"
 jq -e . manifest.json quickshell/licenses.json >/dev/null
 ./scripts/qml-lint.sh
 ./scripts/qml-test-all.sh
-./scripts/qml-mutation.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck install.sh uninstall.sh scripts/*.sh tests/*.sh

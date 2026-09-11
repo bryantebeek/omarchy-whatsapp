@@ -33,8 +33,10 @@ Item {
   property real mediaDownloadAnchorOffset: 0
   property int mediaDownloadAnchorSerial: 0
   property string imagePreviewUrl: ""
-  property var activeInlineVideoCard: null
-  property bool activeInlineVideoGif: false
+  property real imagePreviewWidth: 0
+  property real imagePreviewHeight: 0
+  property string videoPreviewUrl: ""
+  property bool videoPreviewIsGif: false
   property var activeVoiceMessageCard: null
   property bool voiceRecordingActive: false
   property string voiceRecordingId: ""
@@ -325,8 +327,8 @@ Item {
 
   function close() {
     createPollPopup.close()
-    imagePreviewPopup.close()
-    stopInlineVideo()
+    closeImagePreview()
+    videoPreviewPopup.close()
     stopVoiceMessage()
     stopVoiceRecording(false)
     scrollToBottomAnimation.stop()
@@ -336,10 +338,69 @@ Item {
     if (service) service.setPanelState(false, false)
   }
 
-  function openImagePreview(path, revision) {
+  function openImagePreview(path, revision, width, height) {
     if (!service || !path) return
+    imagePreviewWidth = Math.max(0, Number(width || 0))
+    imagePreviewHeight = Math.max(0, Number(height || 0))
     imagePreviewUrl = service.fileUrl(path, revision)
-    imagePreviewPopup.open()
+  }
+
+  function closeImagePreview() {
+    imagePreviewUrl = ""
+    imagePreviewWidth = 0
+    imagePreviewHeight = 0
+  }
+
+  function imageViewerScreenSize() {
+    var screens = Quickshell.screens || []
+    var current = window && window.screen ? window.screen : null
+    var match = null
+    for (var i = 0; i < screens.length; i++) {
+      if (!match) match = screens[i]
+      if (current && screens[i] && screens[i].name === current.name) {
+        match = screens[i]
+        break
+      }
+    }
+    var width = match ? Number(match.width || 0) : 0
+    var height = match ? Number(match.height || 0) : 0
+    if (!(width > 0 && height > 0)) return { width: 1600, height: 900 }
+    return { width: width, height: height }
+  }
+
+  function imageViewerSize(sourceWidth, sourceHeight) {
+    var screen = imageViewerScreenSize()
+    var maxWidth = Math.max(320, screen.width - Style.space(128))
+    var maxHeight = Math.max(240, screen.height - Style.space(128))
+    var width = Number(sourceWidth || 0)
+    var height = Number(sourceHeight || 0)
+    if (!(width > 0 && height > 0)) return { width: 480, height: 360 }
+    var scale = Math.min(1, maxWidth / width, maxHeight / height)
+    width = Math.max(1, Math.floor(width * scale))
+    height = Math.max(1, Math.floor(height * scale))
+    if (width < 320 || height < 240) {
+      var boost = Math.max(320 / width, 240 / height)
+      width = Math.ceil(width * boost)
+      height = Math.ceil(height * boost)
+    }
+    return { width: width, height: height }
+  }
+
+  function openVideoPreview(path, isGif) {
+    if (!service || !path) return
+    stopVoiceMessage()
+    videoPreviewIsGif = isGif === true
+    // The player source must stay a bare file URL: ffmpeg rejects the ?v=
+    // cache-busting query that QML Image items tolerate.
+    videoPreviewUrl = "file://" + path
+    videoPreviewPopup.open()
+    videoPlayer.play()
+  }
+
+  function toggleVideoPreviewPlayback() {
+    if (videoPlayer.playbackState === MediaPlayer.PlayingState)
+      videoPlayer.pause()
+    else videoPlayer.play()
   }
 
   function requestClose() {
@@ -484,7 +545,17 @@ Item {
   }
 
   function submitMessage() {
-    if (!service || !service.sendMessage(composer.text)) return
+    if (!service) return
+    if (service.stagedImage) service.sendImageMessage(composer.text)
+    else service.sendMessage(composer.text)
+  }
+
+  function pasteImageFromClipboard() {
+    if (!service || typeof service.pasteImage !== "function") {
+      composer.paste()
+      return
+    }
+    service.pasteImage()
   }
 
   function startVoiceRecording() {
@@ -563,31 +634,6 @@ Item {
     scheduleConversationScroll("bottom", "")
   }
 
-  function stopInlineVideo(card) {
-    if (card && activeInlineVideoCard !== card) return
-    inlineVideoPlayer.stop()
-    inlineVideoPlayer.source = ""
-    activeInlineVideoCard = null
-    activeInlineVideoGif = false
-  }
-
-  function toggleInlineVideo(card) {
-    if (!card || !card.downloaded || !card.mediaPath) return
-    if (activeInlineVideoCard === card) {
-      if (inlineVideoPlayer.playbackState === MediaPlayer.PlayingState)
-        inlineVideoPlayer.pause()
-      else
-        inlineVideoPlayer.play()
-      return
-    }
-    stopInlineVideo()
-    stopVoiceMessage()
-    activeInlineVideoCard = card
-    activeInlineVideoGif = card.isGif
-    inlineVideoPlayer.source = "file://" + card.mediaPath
-    inlineVideoPlayer.play()
-  }
-
   function stopVoiceMessage(card) {
     if (card && activeVoiceMessageCard !== card) return
     voiceMessagePlayer.stop()
@@ -605,7 +651,7 @@ Item {
       return
     }
     stopVoiceMessage()
-    stopInlineVideo()
+    videoPreviewPopup.close()
     activeVoiceMessageCard = card
     voiceMessagePlayer.source = "file://" + card.mediaPath
     voiceMessagePlayer.play()
@@ -1037,20 +1083,20 @@ Item {
   }
 
   AudioOutput {
-    id: inlineVideoAudio
-    muted: root.activeInlineVideoGif
+    id: videoAudio
+    muted: root.videoPreviewIsGif
   }
 
   MediaPlayer {
-    id: inlineVideoPlayer
-    audioOutput: inlineVideoAudio
-    videoOutput: root.activeInlineVideoCard
-      ? root.activeInlineVideoCard.videoSurface : null
-    loops: root.activeInlineVideoGif ? MediaPlayer.Infinite : MediaPlayer.Once
+    id: videoPlayer
+    audioOutput: videoAudio
+    videoOutput: fullVideoPreview
+    source: root.videoPreviewUrl
+    loops: root.videoPreviewIsGif ? MediaPlayer.Infinite : MediaPlayer.Once
 
     onMediaStatusChanged: {
       if (mediaStatus === MediaPlayer.EndOfMedia
-          && !root.activeInlineVideoGif) root.stopInlineVideo()
+          && !root.videoPreviewIsGif) videoPlayer.stop()
     }
   }
 
@@ -1117,11 +1163,14 @@ Item {
           && composer.text === String(text || "")) composer.text = ""
       root.scheduleConversationScroll("bottom", "")
     }
+    function onClipboardTextPasteRequested() {
+      composer.paste()
+    }
     function onSelectedChatJidChanged() {
       root.stopVoiceRecording(false)
-      imagePreviewPopup.close()
+      root.closeImagePreview()
+      videoPreviewPopup.close()
       root.clearMediaDownloadAnchor()
-      root.stopInlineVideo()
       root.stopVoiceMessage()
       scrollToBottomAnimation.stop()
       root.conversationScrollSerial++
@@ -1136,7 +1185,6 @@ Item {
         root.stopVoiceRecording(false)
     }
     function onMessagesWillChange(preservePosition) {
-      root.stopInlineVideo()
       root.stopVoiceMessage()
       if (root.mediaDownloadAnchorMessageId) return
       if (!preservePosition || !messageList || !root.conversationReady
@@ -1293,8 +1341,85 @@ Item {
         }
       }
 
+      FloatingWindow {
+        id: imageViewerWindow
+        objectName: "imageViewerWindow"
+
+        readonly property real viewerSourceWidth:
+          fullImagePreview.status === Image.Ready
+            && fullImagePreview.sourceSize.width > 0
+            && fullImagePreview.sourceSize.height > 0
+          ? fullImagePreview.sourceSize.width : root.imagePreviewWidth
+        readonly property real viewerSourceHeight:
+          fullImagePreview.status === Image.Ready
+            && fullImagePreview.sourceSize.width > 0
+            && fullImagePreview.sourceSize.height > 0
+          ? fullImagePreview.sourceSize.height : root.imagePreviewHeight
+        readonly property var viewerSize: root.imageViewerSize(
+          viewerSourceWidth, viewerSourceHeight)
+
+        visible: root.imagePreviewUrl !== ""
+        title: "WhatsApp image"
+        color: root.background
+        width: viewerSize.width
+        height: viewerSize.height
+        minimumSize: Qt.size(320, 240)
+
+        onVisibleChanged: {
+          if (visible) imageViewerKeys.forceActiveFocus()
+        }
+
+        Item {
+          id: imageViewerKeys
+          anchors.fill: parent
+          focus: true
+          Keys.onEscapePressed: root.closeImagePreview()
+        }
+
+        Image {
+          id: fullImagePreview
+
+          anchors.fill: parent
+          source: root.imagePreviewUrl
+          asynchronous: true
+          cache: false
+          fillMode: Image.PreserveAspectFit
+          smooth: true
+          mipmap: true
+        }
+
+        Text {
+          objectName: "imageViewerStatus"
+          anchors.centerIn: parent
+          visible: fullImagePreview.status === Image.Loading
+            || fullImagePreview.status === Image.Error
+          text: fullImagePreview.status === Image.Error
+            ? "Image unavailable" : "Loading image…"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        CrispButton {
+          objectName: "imageViewerCloseButton"
+          anchors.top: parent.top
+          anchors.right: parent.right
+          anchors.margins: Style.space(16)
+          width: Style.space(40)
+          height: Style.space(40)
+          iconSize: Style.font.icon * 1.5
+          iconText: "󰅖"
+          foreground: root.foreground
+          accent: root.accent
+          tooltipText: "Close image preview"
+          focusable: true
+          onClicked: root.closeImagePreview()
+        }
+      }
+
       QQC.Popup {
-        id: imagePreviewPopup
+        id: videoPreviewPopup
+        objectName: "videoPreviewPopup"
 
         parent: focusScope
         x: 0
@@ -1306,7 +1431,11 @@ Item {
         focus: true
         closePolicy: QQC.Popup.CloseOnEscape
 
-        onClosed: root.imagePreviewUrl = ""
+        onClosed: {
+          videoPlayer.stop()
+          root.videoPreviewUrl = ""
+          root.videoPreviewIsGif = false
+        }
 
         background: Rectangle {
           color: Qt.rgba(root.background.r, root.background.g,
@@ -1316,45 +1445,114 @@ Item {
         contentItem: Item {
           MouseArea {
             anchors.fill: parent
-            onClicked: imagePreviewPopup.close()
+            onClicked: videoPreviewPopup.close()
           }
 
-          Image {
-            id: fullImagePreview
+          VideoOutput {
+            id: fullVideoPreview
+            objectName: "fullVideoPreview"
 
             anchors.fill: parent
             anchors.margins: Style.space(28)
-            source: root.imagePreviewUrl
-            asynchronous: true
-            cache: false
-            fillMode: Image.PreserveAspectFit
-            smooth: true
-            mipmap: true
+            fillMode: VideoOutput.PreserveAspectFit
+            endOfStreamPolicy: VideoOutput.KeepLastFrame
           }
 
           MouseArea {
-            x: fullImagePreview.x
-              + (fullImagePreview.width - fullImagePreview.paintedWidth) / 2
-            y: fullImagePreview.y
-              + (fullImagePreview.height - fullImagePreview.paintedHeight) / 2
-            width: fullImagePreview.paintedWidth
-            height: fullImagePreview.paintedHeight
-            enabled: fullImagePreview.status === Image.Ready
-            onClicked: function(mouse) { mouse.accepted = true }
+            x: fullVideoPreview.x + fullVideoPreview.contentRect.x
+            y: fullVideoPreview.y + fullVideoPreview.contentRect.y
+            width: fullVideoPreview.contentRect.width
+            height: fullVideoPreview.contentRect.height
+            onClicked: root.toggleVideoPreviewPlayback()
           }
 
           Text {
+            objectName: "videoPreviewStatus"
             anchors.centerIn: parent
-            visible: fullImagePreview.status === Image.Loading
-              || fullImagePreview.status === Image.Error
-            text: fullImagePreview.status === Image.Error
-              ? "Image unavailable" : "Loading image…"
+            visible: videoPlayer.mediaStatus === MediaPlayer.LoadingMedia
+              || videoPlayer.mediaStatus === MediaPlayer.InvalidMedia
+              || videoPlayer.error !== MediaPlayer.NoError
+            text: videoPlayer.mediaStatus === MediaPlayer.InvalidMedia
+              || videoPlayer.error !== MediaPlayer.NoError
+              ? "Video unavailable" : "Loading video…"
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
           }
 
           CrispButton {
+            id: videoPlayButton
+            objectName: "videoPreviewPlayButton"
+            anchors.left: parent.left
+            anchors.bottom: parent.bottom
+            anchors.margins: Style.space(16)
+            width: Style.space(40)
+            height: Style.space(40)
+            iconSize: Style.font.icon * 1.5
+            iconText: videoPlayer.playbackState === MediaPlayer.PlayingState
+              ? "󰏤" : "󰐊"
+            foreground: root.foreground
+            accent: root.accent
+            tooltipText: videoPlayer.playbackState === MediaPlayer.PlayingState
+              ? (root.videoPreviewIsGif ? "Pause GIF" : "Pause video")
+              : (root.videoPreviewIsGif ? "Play GIF" : "Play video")
+            focusable: true
+            onClicked: root.toggleVideoPreviewPlayback()
+          }
+
+          Text {
+            id: videoTimeLabel
+            objectName: "videoPreviewTimeLabel"
+            anchors.right: parent.right
+            anchors.verticalCenter: videoPlayButton.verticalCenter
+            anchors.rightMargin: Style.space(16)
+            text: Model.mediaDuration(videoPlayer.position / 1000) + " / "
+              + Model.mediaDuration(videoPlayer.duration / 1000)
+            color: root.timestamp
+            font.family: root.fontFamily
+            font.pixelSize: root.messageMetaFontSize
+          }
+
+          Item {
+            anchors.left: videoPlayButton.right
+            anchors.right: videoTimeLabel.left
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            anchors.verticalCenter: videoPlayButton.verticalCenter
+            height: videoPlayButton.height
+
+            Rectangle {
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              height: Math.max(2, Style.normalBorderWidth)
+              radius: height / 2
+              color: Style.normalBorderFor(root.foreground, root.accent)
+
+              Rectangle {
+                objectName: "videoPreviewSeekFill"
+                height: parent.height
+                radius: parent.radius
+                color: root.accent
+                width: parent.width * (videoPlayer.duration > 0
+                  ? Math.min(1,
+                    videoPlayer.position / videoPlayer.duration) : 0)
+              }
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+              enabled: videoPlayer.duration > 0
+              onClicked: function (mouse) {
+                videoPlayer.position = Math.round(
+                  mouse.x / width * videoPlayer.duration)
+              }
+            }
+          }
+
+          CrispButton {
+            objectName: "videoPreviewCloseButton"
             anchors.top: parent.top
             anchors.right: parent.right
             anchors.margins: Style.space(16)
@@ -1364,9 +1562,9 @@ Item {
             iconText: "󰅖"
             foreground: root.foreground
             accent: root.accent
-            tooltipText: "Close image preview"
+            tooltipText: "Close video preview"
             focusable: true
-            onClicked: imagePreviewPopup.close()
+            onClicked: videoPreviewPopup.close()
           }
         }
       }
@@ -2253,6 +2451,15 @@ Item {
                         && mediaData.kind === "poll"
                       readonly property bool isSticker: mediaData
                         && mediaData.kind === "sticker"
+                      readonly property bool isImageMedia: mediaData
+                        && mediaData.kind === "image"
+                      readonly property bool isVideoMedia: mediaData
+                        && mediaData.kind === "video"
+                      readonly property bool hasMediaPreview: isImageMedia
+                        || isVideoMedia
+                      readonly property bool hasStandalonePreview: hasMediaPreview
+                        && !isAlbumLeader && !isAlbumFollower
+                      readonly property bool hasAlbumMosaic: isAlbumLeader
                       readonly property bool hasStructuredMedia: mediaData
                         && (mediaData.kind === "image"
                           || mediaData.kind === "sticker"
@@ -2266,6 +2473,14 @@ Item {
                       readonly property bool showSenderLabel: root.service
                         && root.service.selectedChat
                         && root.service.selectedChat.is_group === true
+                      readonly property bool showSenderHeader: showSenderLabel
+                        && (hasStandalonePreview || hasAlbumMosaic)
+                        && !isAlbumFollower
+                      readonly property real senderHeaderHeight: showSenderHeader
+                        ? senderHeader.height + Style.space(4) : 0
+                      readonly property bool showMessageBubble: !isAlbumFollower
+                        && (!hasStandalonePreview && !hasAlbumMosaic
+                          || hasMediaCaption)
                       readonly property string senderLabelText: modelData.from_me
                         ? "Me" : Model.friendlyName(modelData.sender_name,
                           modelData.sender_jid)
@@ -2273,37 +2488,106 @@ Item {
                         Model.linkifiedMessage(modelData.text, root.accent,
                           root.messageMentionContacts)
                       readonly property bool showSenderAvatar: !modelData.from_me
-                        && showSenderLabel
+                        && showSenderLabel && !isAlbumFollower
                       readonly property var previousMessage: root.service
                         && index > 0 && index <= root.service.messages.length
                         ? root.service.messages[index - 1] : null
                       readonly property var nextMessage: root.service
                         && index + 1 < root.service.messages.length
                         ? root.service.messages[index + 1] : null
+                      function albumMediaKind(message) {
+                        var media = root.service
+                          && typeof root.service.messageMedia === "function"
+                          ? root.service.messageMedia(message)
+                          : (message ? message.media || null : null)
+                        return media ? String(media.kind || "") : ""
+                      }
+                      function albumGroupable(message) {
+                        if (!message) return false
+                        var kind = albumMediaKind(message)
+                        if (kind !== "image" && kind !== "video") return false
+                        if (String(message.text || "").charAt(0) !== "[")
+                          return false
+                        var reactions = message.reactions || []
+                        if (Array.isArray(reactions) && reactions.length > 0)
+                          return false
+                        return sameSender(modelData, message)
+                          && sameMinute(modelData, message)
+                      }
+                      readonly property int albumNaturalStart: {
+                        if (!root.service || !albumGroupable(modelData))
+                          return index
+                        var start = index
+                        while (start - 1 >= 0
+                          && albumGroupable(root.service.messages[start - 1]))
+                          start--
+                        return start
+                      }
+                      readonly property int albumNaturalEnd: {
+                        if (!root.service || !albumGroupable(modelData))
+                          return index
+                        var end = index
+                        var messages = root.service.messages
+                        while (end + 1 < messages.length
+                          && albumGroupable(messages[end + 1])) end++
+                        return end
+                      }
+                      // Albums chunk at four so every member stays reachable:
+                      // a longer run continues as further mosaics and trailing
+                      // singles instead of hiding overflow behind a tile the
+                      // viewer cannot swipe to.
+                      readonly property int albumRunStart: albumNaturalStart
+                        + Math.floor((index - albumNaturalStart) / 4) * 4
+                      readonly property int albumRunEnd: Math.min(
+                        albumRunStart + 3, albumNaturalEnd)
+                      readonly property bool isAlbumLeader:
+                        albumRunStart === index && albumRunEnd > index
+                      readonly property bool isAlbumFollower:
+                        albumRunStart < index
+                      readonly property int albumCount:
+                        albumRunEnd - albumRunStart + 1
+                      readonly property var albumMembers: {
+                        if (!isAlbumLeader || !root.service) return []
+                        return root.service.messages.slice(albumRunStart,
+                          albumRunEnd + 1)
+                      }
+                      readonly property var albumLastMessage:
+                        albumMembers.length > 0
+                          ? albumMembers[albumMembers.length - 1] : null
+                      readonly property var albumAfterMessage: root.service
+                        && albumRunEnd + 1 < root.service.messages.length
+                        ? root.service.messages[albumRunEnd + 1] : null
                       readonly property string messageDateKey:
                         Model.messageDateKey(modelData.timestamp)
                       readonly property bool showDateDivider: messageDateKey !== ""
                         && (!previousMessage || messageDateKey
                           !== Model.messageDateKey(previousMessage.timestamp))
-                      readonly property bool showMessageTime: !nextMessage
-                        || !sameSender(nextMessage)
-                        || !sameMinute(nextMessage)
+                      readonly property var footerModelData: isAlbumLeader
+                        && albumLastMessage ? albumLastMessage : modelData
+                      readonly property var footerNextMessage: isAlbumLeader
+                        ? albumAfterMessage : nextMessage
+                      readonly property bool showMessageTime: isAlbumFollower
+                        ? false
+                        : (!footerNextMessage
+                          || !sameSender(footerModelData, footerNextMessage)
+                          || !sameMinute(footerModelData, footerNextMessage))
                       property real reactionPickerX: 0
                       property real reactionPickerY: 0
 
-                      function sameSender(otherMessage) {
-                        if (!otherMessage) return false
-                        if (modelData.from_me || otherMessage.from_me)
-                          return modelData.from_me === true
+                      function sameSender(firstMessage, otherMessage) {
+                        if (!firstMessage || !otherMessage) return false
+                        if (firstMessage.from_me || otherMessage.from_me)
+                          return firstMessage.from_me === true
                             && otherMessage.from_me === true
-                        return String(modelData.sender_jid
-                          || modelData.sender_name || "")
+                        return String(firstMessage.sender_jid
+                          || firstMessage.sender_name || "")
                           === String(otherMessage.sender_jid
                             || otherMessage.sender_name || "")
                       }
 
-                      function sameMinute(otherMessage) {
-                        return Math.floor(Number(modelData.timestamp || 0) / 60)
+                      function sameMinute(firstMessage, otherMessage) {
+                        if (!firstMessage || !otherMessage) return false
+                        return Math.floor(Number(firstMessage.timestamp || 0) / 60)
                           === Math.floor(Number(otherMessage.timestamp || 0) / 60)
                       }
 
@@ -2327,17 +2611,33 @@ Item {
                         reactionPicker.open()
                       }
 
+                      readonly property real mediaPreviewHeight: hasStandalonePreview
+                        ? mediaPreviewCard.height : 0
+                      readonly property real albumMosaicHeight: hasAlbumMosaic
+                        ? albumMosaic.height : 0
+                      readonly property real bubbleTopGap:
+                        hasStandalonePreview || hasAlbumMosaic
+                        ? Style.space(8) : 0
+                      readonly property real bubbleBlockHeight: showMessageBubble
+                        ? bubbleTopGap + bubble.height : 0
+                      readonly property real messageStackHeight:
+                        senderHeaderHeight + mediaPreviewHeight
+                          + albumMosaicHeight + bubbleBlockHeight
+
                       width: messageList.width
+                      // The leader absorbs its followers' list spacing so an
+                      // album keeps exactly one normal gap below it.
                       height: dateDivider.height
-                        + Math.max(bubble.height, senderAvatar.height)
+                        + Math.max(messageStackHeight, senderAvatar.height)
                         + (reactionsBar.visible
                           ? reactionsBar.height - Style.space(6) : 0)
                         + (messageFooter.visible
                           ? messageFooter.implicitHeight + Style.space(3) : 0)
-                        + Style.space(4)
+                        + (isAlbumFollower ? 0 : (isAlbumLeader
+                          ? Style.space(8) - Style.space(4) * albumCount
+                          : Style.space(4)))
 
                       ListView.onPooled: {
-                        root.stopInlineVideo(mediaPreviewCard)
                         root.stopVoiceMessage(voiceMessageCard)
                         reactionPicker.close()
                       }
@@ -2418,7 +2718,9 @@ Item {
                         objectName: "senderAvatar-" + String(modelData.id || "")
                         visible: messageDelegate.showSenderAvatar
                         x: Style.space(16)
-                        anchors.verticalCenter: bubble.verticalCenter
+                        y: dateDivider.height
+                          + Math.max(0, (messageDelegate.messageStackHeight
+                            - height) / 2)
                         service: root.service
                         jid: String(modelData.sender_jid || "")
                         name: String(modelData.sender_name || "")
@@ -2450,15 +2752,37 @@ Item {
                         font.bold: true
                       }
 
+                      Text {
+                        id: senderHeader
+                        objectName: "senderHeader-" + String(modelData.id || "")
+                        visible: messageDelegate.showSenderHeader
+                        y: dateDivider.height
+                        x: modelData.from_me
+                          ? messageDelegate.width - width - Style.space(18)
+                          : (messageDelegate.showSenderAvatar
+                            ? Style.space(56) : Style.space(18))
+                        width: Math.min(implicitWidth,
+                          bubble.mediaPreviewWidth)
+                        text: messageDelegate.senderLabelText
+                        color: root.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: root.messageMetaFontSize
+                        font.bold: true
+                        elide: Text.ElideRight
+                        horizontalAlignment: modelData.from_me
+                          ? Text.AlignRight : Text.AlignLeft
+                      }
+
                       CrispBorderSurface {
                         id: bubble
                         objectName: "messageBubble-" + String(modelData.id || "")
+                        readonly property bool showMessageBubble:
+                          messageDelegate.showMessageBubble
                         readonly property bool stickerOnlyMedia:
                           messageDelegate.isSticker
                         readonly property bool borderOnlyMedia:
                           messageDelegate.mediaData
-                          && (messageDelegate.mediaData.kind === "video"
-                            || messageDelegate.mediaData.kind === "location")
+                          && messageDelegate.mediaData.kind === "location"
                         readonly property color mediaBorderColor: {
                           var base = Style.normalBorderFor(
                             root.foreground, root.accent)
@@ -2478,44 +2802,54 @@ Item {
                             ? messageDelegate.mediaData.width || 1 : 1)
                             / Math.max(1, Number(messageDelegate.mediaData
                               ? messageDelegate.mediaData.height || 1 : 1))
-                        readonly property real imageAspectRatio:
+                        readonly property real previewAspectRatio:
                           mediaPreviewCard.imageAspectRatio
-                        readonly property real imagePreviewWidth: Math.max(
+                        readonly property real mediaPreviewWidth: Math.max(
                           Style.space(40), Math.min(maximumMediaWidth,
-                            Style.space(280) * imageAspectRatio))
-                        readonly property real videoPreviewWidth: Math.max(
-                          Style.space(40), Math.min(maximumMediaWidth,
-                            Style.space(280) * mediaAspectRatio))
+                            Style.space(280) * previewAspectRatio))
+                        readonly property real textLikeWidth: Math.min(
+                          maximumWidth,
+                          Math.max(Style.space(36),
+                            messageDelegate.hasMediaCaption
+                              || !(messageDelegate.hasStandalonePreview
+                                || messageDelegate.hasAlbumMosaic)
+                              ? Math.ceil(messageWidthProbe.paintedWidth)
+                                + horizontalPadding : 0,
+                            messageDelegate.showSenderLabel
+                              && !(messageDelegate.hasStandalonePreview
+                                || messageDelegate.hasAlbumMosaic)
+                              ? senderWidthProbe.implicitWidth
+                                + horizontalPadding : 0))
                         readonly property real stickerAspectRatio: Math.max(
                           0.5, Math.min(2, mediaAspectRatio))
                         readonly property real stickerPreviewWidth: Math.max(
                           Style.space(72), Math.min(maximumMediaWidth,
                             Style.space(180) * stickerAspectRatio))
 
-                        width: messageDelegate.mediaData
-                          && messageDelegate.mediaData.kind === "video"
-                          ? videoPreviewWidth + horizontalPadding
-                          : messageDelegate.mediaData
-                            && messageDelegate.mediaData.kind === "image"
-                          ? imagePreviewWidth + horizontalPadding
+                        visible: showMessageBubble
+                        width: !showMessageBubble
+                          ? 0
                           : messageDelegate.isSticker
                           ? stickerPreviewWidth
                           : messageDelegate.mediaData
                             && messageDelegate.mediaData.kind === "location"
                           ? locationPreviewWidth + horizontalPadding
                           : messageDelegate.hasStructuredMedia
+                            && !(messageDelegate.hasStandalonePreview
+                              || messageDelegate.hasAlbumMosaic)
                           ? Math.min(maximumWidth, Style.space(340))
-                          : Math.min(maximumWidth,
-                            Math.max(Style.space(36),
-                              Math.ceil(messageWidthProbe.paintedWidth) + horizontalPadding,
-                              messageDelegate.showSenderLabel
-                                ? senderWidthProbe.implicitWidth
-                                  + horizontalPadding : 0))
-                        height: messageColumn.implicitHeight
-                          + (borderOnlyMedia
-                            ? borderTop + borderBottom
-                            : (stickerOnlyMedia ? 0 : Style.space(16)))
+                          : textLikeWidth
+                        height: !showMessageBubble
+                          ? 0
+                          : messageColumn.implicitHeight
+                            + (borderOnlyMedia
+                              ? borderTop + borderBottom
+                              : (stickerOnlyMedia ? 0 : Style.space(16)))
                         y: dateDivider.height
+                          + messageDelegate.senderHeaderHeight
+                          + messageDelegate.mediaPreviewHeight
+                          + messageDelegate.albumMosaicHeight
+                          + messageDelegate.bubbleTopGap
                         x: modelData.from_me
                           ? messageDelegate.width - width - Style.space(18)
                           : (messageDelegate.showSenderAvatar
@@ -2547,6 +2881,8 @@ Item {
                           Text {
                             id: senderLabel
                             visible: messageDelegate.showSenderLabel
+                              && !(messageDelegate.hasStandalonePreview
+                                || messageDelegate.hasAlbumMosaic)
                             width: parent.width
                             text: messageDelegate.senderLabelText
                             color: root.accent
@@ -2639,31 +2975,6 @@ Item {
                             foreground: root.foreground
                             muted: root.muted
                           }
-                          MediaPreviewCard {
-                            id: mediaPreviewCard
-                            objectName: "mediaPreviewCard-"
-                              + String(modelData.id || "")
-                            maskObjectName: "mediaPreviewMask-"
-                              + String(modelData.id || "")
-                            imageObjectName: "mediaPreviewImage-"
-                              + String(modelData.id || "")
-                            downloadButtonObjectName: "mediaDownloadButton-"
-                              + String(modelData.id || "")
-                            width: parent.width
-                            panel: root
-                            service: root.service
-                            player: inlineVideoPlayer
-                            message: modelData
-                            media: messageDelegate.mediaData
-                            delegateItem: messageDelegate
-                            maskRadius: bubble.radius
-                            mediaAspectRatio: bubble.mediaAspectRatio
-                            fontFamily: root.fontFamily
-                            foreground: root.foreground
-                            muted: root.muted
-                            accent: root.accent
-                            devicePixelRatio: root.devicePixelRatio
-                          }
                           VoiceMessageCard {
                             id: voiceMessageCard
                             objectName: "voiceMessageCard-"
@@ -2718,9 +3029,97 @@ Item {
                           anchors.fill: parent
                           acceptedButtons: Qt.RightButton
                           onPressed: function(mouse) {
-                            messageDelegate.openReactionPicker(mouse.x, mouse.y)
+                            var point = mapToItem(messageDelegate,
+                              mouse.x, mouse.y)
+                            messageDelegate.openReactionPicker(point.x, point.y)
                             mouse.accepted = true
                           }
+                        }
+                      }
+
+                      MediaPreviewCard {
+                        id: mediaPreviewCard
+                        objectName: messageDelegate.hasStandalonePreview
+                          ? "mediaPreviewCard-"
+                            + String(modelData.id || "") : ""
+                        maskObjectName: messageDelegate.hasStandalonePreview
+                          ? "mediaPreviewMask-"
+                            + String(modelData.id || "") : ""
+                        imageObjectName: messageDelegate.hasStandalonePreview
+                          ? "mediaPreviewImage-"
+                            + String(modelData.id || "") : ""
+                        downloadButtonObjectName: messageDelegate.hasStandalonePreview
+                          ? "mediaDownloadButton-"
+                            + String(modelData.id || "") : ""
+                        hdBadgeObjectName: messageDelegate.hasStandalonePreview
+                          ? "hdBadge-" + String(modelData.id || "") : ""
+                        y: dateDivider.height
+                          + messageDelegate.senderHeaderHeight
+                        x: modelData.from_me
+                          ? messageDelegate.width - width - Style.space(18)
+                          : (messageDelegate.showSenderAvatar
+                            ? Style.space(56) : Style.space(18))
+                        width: bubble.mediaPreviewWidth
+                        panel: root
+                        service: root.service
+                        message: modelData
+                        media: messageDelegate.hasStandalonePreview
+                          ? messageDelegate.mediaData : null
+                        delegateItem: messageDelegate
+                        maskRadius: Style.cornerRadius + Style.space(6)
+                        mediaAspectRatio: bubble.mediaAspectRatio
+                        topMargin: 0
+                        fontFamily: root.fontFamily
+                        foreground: root.foreground
+                        muted: root.muted
+                        accent: root.accent
+                        devicePixelRatio: root.devicePixelRatio
+                      }
+
+                      MouseArea {
+                        anchors.fill: mediaPreviewCard
+                        acceptedButtons: Qt.RightButton
+                        enabled: messageDelegate.hasStandalonePreview
+                        onPressed: function(mouse) {
+                          var point = mapToItem(messageDelegate,
+                            mouse.x, mouse.y)
+                          messageDelegate.openReactionPicker(point.x, point.y)
+                          mouse.accepted = true
+                        }
+                      }
+
+                      AlbumMosaic {
+                        id: albumMosaic
+                        objectName: messageDelegate.hasAlbumMosaic
+                          ? "albumMosaic-" + String(modelData.id || "") : ""
+                        y: dateDivider.height
+                          + messageDelegate.senderHeaderHeight
+                        x: modelData.from_me
+                          ? messageDelegate.width - width - Style.space(18)
+                          : (messageDelegate.showSenderAvatar
+                            ? Style.space(56) : Style.space(18))
+                        width: bubble.mediaPreviewWidth
+                        panel: root
+                        service: root.service
+                        messages: messageDelegate.hasAlbumMosaic
+                          ? messageDelegate.albumMembers : []
+                        delegateItem: messageDelegate
+                        maskRadius: Style.cornerRadius + Style.space(6)
+                        fontFamily: root.fontFamily
+                        foreground: root.foreground
+                        accent: root.accent
+                        devicePixelRatio: root.devicePixelRatio
+                      }
+
+                      MouseArea {
+                        anchors.fill: albumMosaic
+                        acceptedButtons: Qt.RightButton
+                        enabled: messageDelegate.hasAlbumMosaic
+                        onPressed: function(mouse) {
+                          var point = mapToItem(messageDelegate,
+                            mouse.x, mouse.y)
+                          messageDelegate.openReactionPicker(point.x, point.y)
+                          mouse.accepted = true
                         }
                       }
 
@@ -2730,10 +3129,23 @@ Item {
                         height: Style.space(28)
                         width: implicitWidth
                         spacing: Style.space(4)
-                        anchors.top: bubble.bottom
+                        anchors.top: messageDelegate.showMessageBubble
+                          ? bubble.bottom
+                          : (messageDelegate.hasAlbumMosaic
+                            ? albumMosaic.bottom
+                            : (messageDelegate.hasStandalonePreview
+                              ? mediaPreviewCard.bottom : bubble.bottom))
                         anchors.topMargin: -Style.space(6)
                         x: modelData.from_me
-                          ? bubble.x + bubble.width - width : bubble.x
+                          ? (messageDelegate.hasAlbumMosaic
+                            ? albumMosaic.x + albumMosaic.width
+                            : (messageDelegate.hasStandalonePreview
+                              ? mediaPreviewCard.x + mediaPreviewCard.width
+                              : bubble.x + bubble.width)) - width
+                          : (messageDelegate.hasAlbumMosaic
+                            ? albumMosaic.x
+                            : (messageDelegate.hasStandalonePreview
+                              ? mediaPreviewCard.x : bubble.x))
                         z: 2
 
                         Repeater {
@@ -2774,7 +3186,7 @@ Item {
 
                           objectName: "reactionPicker-"
                             + String(modelData.id || "")
-                          parent: bubble
+                          parent: messageDelegate
                           x: modelData.from_me
                             ? messageDelegate.reactionPickerX - width
                             : messageDelegate.reactionPickerX
@@ -2797,18 +3209,31 @@ Item {
                         id: messageFooter
                         visible: messageDelegate.showMessageTime
                         anchors.top: reactionsBar.visible
-                          ? reactionsBar.bottom : bubble.bottom
+                          ? reactionsBar.bottom
+                          : (messageDelegate.showMessageBubble
+                            ? bubble.bottom
+                            : (messageDelegate.hasAlbumMosaic
+                              ? albumMosaic.bottom
+                              : (messageDelegate.hasStandalonePreview
+                                ? mediaPreviewCard.bottom : bubble.bottom)))
                         anchors.topMargin: Style.space(3)
                         x: modelData.from_me
-                          ? bubble.x + bubble.width - width - Style.space(4)
-                          : bubble.x + Style.space(4)
+                          ? (messageDelegate.hasAlbumMosaic
+                            ? albumMosaic.x + albumMosaic.width
+                            : (messageDelegate.hasStandalonePreview
+                              ? mediaPreviewCard.x + mediaPreviewCard.width
+                              : bubble.x + bubble.width)) - width - Style.space(4)
+                          : (messageDelegate.hasAlbumMosaic
+                            ? albumMosaic.x
+                            : (messageDelegate.hasStandalonePreview
+                              ? mediaPreviewCard.x : bubble.x)) + Style.space(4)
                         spacing: 8
 
                         Item {
                           id: messageReceiptHoverTarget
                           objectName: "messageReceiptHoverTarget-"
                             + String(modelData.id || "")
-                          visible: modelData.from_me === true
+                          visible: messageDelegate.footerModelData.from_me === true
                           anchors.verticalCenter: parent.verticalCenter
                           width: messageReceiptStatus.implicitWidth
                           height: messageReceiptStatus.implicitHeight
@@ -2818,9 +3243,11 @@ Item {
                             objectName: "messageReceiptStatus-"
                               + String(modelData.id || "")
                             readonly property string receiptTooltipText:
-                              root.messageReceiptTooltip(modelData)
+                              root.messageReceiptTooltip(
+                                messageDelegate.footerModelData)
                             readonly property var receiptTooltipGroups:
-                              root.messageReceiptGroups(modelData)
+                              root.messageReceiptGroups(
+                                messageDelegate.footerModelData)
                             readonly property bool receiptTooltipVisible:
                               messageReceiptTooltipPopup.visible
                             readonly property var receiptTooltipControl:
@@ -2828,18 +3255,20 @@ Item {
                             readonly property bool receiptHovered:
                               messageReceiptHoverArea.containsMouse
                             anchors.centerIn: parent
-                            text: root.messageReceiptIcon(modelData.receipt)
-                            color: Number(modelData.receipt || 0) >= 3
+                            text: root.messageReceiptIcon(
+                              messageDelegate.footerModelData.receipt)
+                            color: Number(messageDelegate.footerModelData.receipt || 0) >= 3
                               ? root.accent : root.timestamp
                             font.family: root.fontFamily
                             font.pixelSize: 14
                             font.letterSpacing:
-                              Number(modelData.receipt || 0) >= 2
-                                && Number(modelData.receipt || 0) < 4
+                              Number(messageDelegate.footerModelData.receipt || 0) >= 2
+                                && Number(messageDelegate.footerModelData.receipt || 0) < 4
                               ? -3 : 0
-                            font.bold: Number(modelData.receipt || 0) > 0
+                            font.bold: Number(messageDelegate.footerModelData.receipt || 0) > 0
                             Accessible.name:
-                              root.messageReceiptLabel(modelData.receipt)
+                              root.messageReceiptLabel(
+                                messageDelegate.footerModelData.receipt)
                           }
 
                           MouseArea {
@@ -2868,7 +3297,8 @@ Item {
                           objectName: "messageTimestamp-"
                             + String(modelData.id || "")
                           anchors.verticalCenter: parent.verticalCenter
-                          text: Model.messageTime(modelData.timestamp,
+                          text: Model.messageTime(
+                            messageDelegate.footerModelData.timestamp,
                             root.messageTimeFormat)
                           color: root.timestamp
                           font.family: root.fontFamily
@@ -2941,19 +3371,58 @@ Item {
                       spacing: Style.space(8)
                       visible: !root.voiceRecordingActive && !root.voiceOutboxEntry
                         && !root.textOutboxEntry
+                      Image {
+                        id: pastedThumbnail
+                        objectName: "pastedThumbnail"
+                        visible: root.service && root.service.stagedImage !== null
+                        width: messageComposerControls.controlHeight
+                        height: messageComposerControls.controlHeight
+                        source: root.service && root.service.stagedImage
+                          ? root.service.fileUrl(
+                            root.service.stagedImage.path, 0) : ""
+                        asynchronous: true
+                        cache: false
+                        fillMode: Image.PreserveAspectCrop
+                      }
+                      SquareControlButton {
+                        id: discardStagedButton
+                        objectName: "discardStagedButton"
+                        controlHeight: messageComposerControls.controlHeight
+                        centeredIconText: "󰅖"
+                        bordered: true
+                        visible: root.service && root.service.stagedImage !== null
+                        enabled: visible
+                        foreground: root.foreground
+                        tooltipText: "Discard pasted image"
+                        onClicked: root.service.clearStagedImage()
+                      }
                       CrispTextField {
                         id: composer
                         objectName: "composer"
                         height: messageComposerControls.controlHeight
                         width: parent.width - pollButton.width
                           - voiceRecordButton.width - sendButton.width
-                          - parent.spacing * 3
+                          - parent.spacing * 3 - (root.service
+                            && root.service.stagedImage
+                            ? pastedThumbnail.width + discardStagedButton.width
+                              + parent.spacing * 2 : 0)
                         enabled: root.service && root.service.selectedChatJid !== ""
-                        placeholderText: enabled ? "Message" : "Select a conversation"
+                        placeholderText: root.service && root.service.stagedImage
+                          ? "Add a caption"
+                          : (enabled ? "Message" : "Select a conversation")
                         onTextChanged: if (root.service
                             && typeof root.service.noteComposerActivity === "function")
                           root.service.noteComposerActivity(text)
                         onAccepted: root.submitMessage()
+                        Keys.onPressed: function(event) {
+                          var pasteKey = (event.modifiers & Qt.ControlModifier
+                              && event.key === Qt.Key_V)
+                            || (event.modifiers & Qt.ShiftModifier
+                              && event.key === Qt.Key_Insert)
+                          if (!pasteKey) return
+                          root.pasteImageFromClipboard()
+                          event.accepted = true
+                        }
                       }
                       SquareControlButton {
                         id: pollButton
@@ -2987,7 +3456,8 @@ Item {
                         bordered: true
                         enabled: composer.enabled
                         foreground: root.foreground
-                        tooltipText: "Send message"
+                        tooltipText: root.service && root.service.stagedImage
+                          ? "Send image" : "Send message"
                         onClicked: root.submitMessage()
                       }
                     }

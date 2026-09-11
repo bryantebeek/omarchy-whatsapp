@@ -33,6 +33,9 @@ QtObject {
   property int voiceRecordingSerial: 0
   property var voiceOutboxEntries: []
   property var textOutboxEntries: []
+  property var stagedImage: null
+  property bool pasteImageEmpty: false
+  property var sentImages: []
   property var pollVotes: []
   property var createdPolls: []
   property bool pollVotePendingValue: false
@@ -60,6 +63,7 @@ QtObject {
 
   signal messagesWillChange(bool preservePosition)
   signal textMessageAccepted(string deliveryId, string chatJid, string text)
+  signal clipboardTextPasteRequested()
 
   function record(name, value) {
     calls = calls.concat([{ name: name, value: value }])
@@ -226,6 +230,47 @@ QtObject {
     messageSentSerial++
     textMessageAccepted(
       "fixture-" + String(messageSentSerial), selectedChatJid, body)
+    return true
+  }
+
+  function stagedFixturePath() {
+    return decodeURIComponent(
+      String(Qt.resolvedUrl("pixel.svg")).substring("file://".length))
+  }
+
+  function pasteImage() {
+    if (!selectedChatJid) return false
+    record("pasteImage", null)
+    if (pasteImageEmpty) {
+      clipboardTextPasteRequested()
+      return true
+    }
+    stagedImage = {
+      path: stagedFixturePath(),
+      width: 800,
+      height: 600,
+      mime_type: "image/png"
+    }
+    return true
+  }
+
+  function clearStagedImage() {
+    stagedImage = null
+  }
+
+  function sendImageMessage(text) {
+    var body = String(text || "")
+    if (!selectedChatJid || !stagedImage || !stagedImage.path) return false
+    messageSentSerial++
+    var deliveryId = "fixture-image-" + String(messageSentSerial)
+    sentImages = sentImages.concat([{
+      chat_jid: selectedChatJid,
+      path: String(stagedImage.path),
+      text: body,
+      delivery_id: deliveryId
+    }])
+    stagedImage = null
+    textMessageAccepted(deliveryId, selectedChatJid, body)
     return true
   }
 

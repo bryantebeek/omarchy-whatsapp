@@ -22,6 +22,7 @@ TestCase {
 
   Component { id: serviceComponent; WorkflowService {} }
   Component { id: avatarComponent; Whatsapp.Avatar {} }
+  Component { id: albumMosaicComponent; Whatsapp.AlbumMosaic {} }
   Component { id: crispSurfaceComponent; Whatsapp.DevicePixelBorderSurface {} }
   Component { id: crispTextFieldComponent; Whatsapp.DevicePixelTextField {} }
   Component { id: documentCardComponent; Whatsapp.DocumentCard {} }
@@ -379,8 +380,6 @@ TestCase {
     compare(card.isVideo, true)
     compare(card.isGif, true)
     compare(card.isImage, false)
-    compare(card.inlineActive, false)
-    compare(card.inlinePlaying, false)
     compare(card.topMargin, Style.space(8))
     // A video always shows its cached thumbnail, downloaded or not.
     compare(card.displayPath, "/synthetic/media/clip.png")
@@ -396,6 +395,249 @@ TestCase {
     compare(card.displayPath, "/synthetic/media/clip.mp4")
     card.media = Object.assign({}, card.media, { downloaded: false })
     compare(card.displayPath, "/synthetic/media/clip.png")
+  }
+
+  function test_media_preview_card_sizes_from_announced_dimensions() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var card = createTemporaryObject(mediaPreviewCardComponent, testCase, {
+      service: service,
+      message: { id: "size-component" },
+      mediaAspectRatio: 2,
+      media: {
+        kind: "video",
+        path: "/synthetic/media/clip.mp4",
+        thumbnail_path: "/synthetic/media/clip.png",
+        downloaded: false,
+        width: 16,
+        height: 8
+      }
+    })
+    verify(card !== null)
+    card.width = 160
+    // Test doubles are never shown, so ancestors stay invisible: the height
+    // must still follow the announced dimensions rather than the effective
+    // visibility.
+    compare(card.height, Style.space(8) + 160 / 2)
+    card.topMargin = 0
+    compare(card.height, 160 / 2)
+    card.media = Object.assign({}, card.media, {
+      kind: "image",
+      downloaded: true
+    })
+    compare(card.height, 160 / 2)
+    card.media = null
+    compare(card.height, 0)
+  }
+
+  function test_media_preview_card_marks_high_definition_images() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var card = createTemporaryObject(mediaPreviewCardComponent, testCase, {
+      service: service,
+      message: { id: "hd-component" },
+      hdBadgeObjectName: "hdBadge-hd-component",
+      media: {
+        kind: "image",
+        path: "/synthetic/media/photo.jpg",
+        thumbnail_path: "/synthetic/media/thumb.jpg",
+        downloaded: true,
+        width: 4000,
+        height: 3000
+      }
+    })
+    verify(card !== null)
+    compare(card.showHdBadge, true)
+    verify(findChild(card, "hdBadge-hd-component") !== null)
+    card.media = Object.assign({}, card.media, { width: 800, height: 600 })
+    compare(card.showHdBadge, false)
+  }
+
+  function test_media_preview_card_opens_full_size_viewer() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var opened = []
+    var panelDouble = {
+      openVideoPreview: function (path, isGif) {
+        opened.push({ kind: "video", path: path, isGif: isGif })
+      },
+      openImagePreview: function (path, revision, width, height) {
+        opened.push({ kind: "image", path: path, revision: revision, width: width, height: height })
+      }
+    }
+    var card = createTemporaryObject(mediaPreviewCardComponent, testCase, {
+      service: service,
+      panel: panelDouble,
+      message: { id: "open-component" },
+      media: {
+        kind: "video",
+        gif_playback: true,
+        path: "/synthetic/media/clip.mp4",
+        thumbnail_path: "/synthetic/media/clip.png",
+        downloaded: true,
+        width: 16,
+        height: 9
+      }
+    })
+    verify(card !== null)
+    card.openPreview()
+    compare(opened.length, 1)
+    compare(opened[0].kind, "video")
+    compare(opened[0].path, "/synthetic/media/clip.mp4")
+    compare(opened[0].isGif, true)
+
+    card.media = Object.assign({}, card.media, {
+      kind: "image",
+      gif_playback: false
+    })
+    card.openPreview()
+    compare(opened.length, 2)
+    compare(opened[1].kind, "image")
+    compare(opened[1].path, "/synthetic/media/clip.mp4")
+    compare(opened[1].revision, "0-0")
+    compare(opened[1].width, 16)
+    compare(opened[1].height, 9)
+  }
+
+  function test_album_mosaic_layouts_two_three_and_four_tiles() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    function syntheticTile(index) {
+      return {
+        id: "album-layout-" + index,
+        media: {
+          kind: "image",
+          path: "/synthetic/media/photo-" + index + ".jpg",
+          thumbnail_path: "/synthetic/media/thumb-" + index + ".jpg",
+          downloaded: true,
+          width: 4000,
+          height: 3000
+        }
+      }
+    }
+
+    var two = createTemporaryObject(albumMosaicComponent, testCase, {
+      service: service,
+      width: 318
+    })
+    two.messages = [syntheticTile(0), syntheticTile(1)]
+    verify(two !== null)
+    compare(two.cellSize, 158)
+    compare(two.height, 158)
+    compare(findChild(two, "albumTile-album-layout-0").showHdBadge, true)
+    compare(findChild(two, "albumTile-album-layout-0").x, 0)
+    compare(findChild(two, "albumTile-album-layout-0").width, 158)
+    compare(findChild(two, "albumTile-album-layout-1").x, 160)
+    compare(findChild(two, "albumTile-album-layout-1").y, 0)
+
+    var three = createTemporaryObject(albumMosaicComponent, testCase, {
+      service: service,
+      width: 318
+    })
+    three.messages = [syntheticTile(0), syntheticTile(1), syntheticTile(2)]
+    compare(three.height, 318)
+    compare(findChild(three, "albumTile-album-layout-0").height, 318)
+    compare(findChild(three, "albumTile-album-layout-1").x, 160)
+    compare(findChild(three, "albumTile-album-layout-1").y, 0)
+    compare(findChild(three, "albumTile-album-layout-2").x, 160)
+    compare(findChild(three, "albumTile-album-layout-2").y, 160)
+
+    var four = createTemporaryObject(albumMosaicComponent, testCase, {
+      service: service,
+      width: 318
+    })
+    four.messages = [syntheticTile(0), syntheticTile(1), syntheticTile(2), syntheticTile(3)]
+    compare(four.height, 318)
+    compare(findChild(four, "albumTile-album-layout-3").x, 160)
+    compare(findChild(four, "albumTile-album-layout-3").y, 160)
+
+    var single = createTemporaryObject(albumMosaicComponent, testCase, {
+      service: service,
+      width: 318
+    })
+    single.messages = [syntheticTile(0)]
+    compare(single.visible, false)
+    compare(single.height, 0)
+  }
+
+  function test_album_mosaic_opens_and_downloads_per_tile() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    var opened = []
+    var downloads = []
+    var panelDouble = {
+      openVideoPreview: function (path, isGif) {
+        opened.push({ kind: "video", path: path, isGif: isGif })
+      },
+      openImagePreview: function (path, revision, width, height) {
+        opened.push({ kind: "image", path: path, width: width, height: height })
+      },
+      downloadMedia: function (message) {
+        downloads.push(message)
+      }
+    }
+    var members = [
+      {
+        id: "album-tile-image",
+        media: {
+          kind: "image",
+          path: "/synthetic/media/photo.jpg",
+          thumbnail_path: "/synthetic/media/thumb.jpg",
+          downloaded: true,
+          width: 800,
+          height: 600
+        }
+      },
+      {
+        id: "album-tile-video",
+        media: {
+          kind: "video",
+          gif_playback: true,
+          path: "/synthetic/media/clip.mp4",
+          thumbnail_path: "/synthetic/media/thumb.jpg",
+          downloaded: true
+        }
+      },
+      {
+        id: "album-tile-pending",
+        media: {
+          kind: "image",
+          path: "",
+          thumbnail_path: "/synthetic/media/thumb.jpg",
+          downloaded: false
+        }
+      }
+    ]
+    var mosaic = createTemporaryObject(albumMosaicComponent, testCase, {
+      service: service,
+      panel: panelDouble,
+      width: 318
+    })
+    mosaic.messages = members
+    verify(mosaic !== null)
+    compare(findChild(mosaic, "albumTile-album-tile-image").showHdBadge,
+      false)
+    compare(findChild(mosaic, "albumTile-album-tile-image").showDownloadButton,
+      false)
+    compare(findChild(mosaic, "albumTile-album-tile-video").showDownloadButton,
+      false)
+    var pendingButton = findChild(mosaic, "albumDownloadButton-album-tile-pending")
+    compare(findChild(mosaic, "albumTile-album-tile-pending").showDownloadButton,
+      true)
+    compare(pendingButton.tooltipText, "Download media")
+    pendingButton.click()
+    compare(downloads.length, 1)
+    compare(downloads[0].id, "album-tile-pending")
+
+    mosaic.openTile(members[1])
+    compare(opened.length, 1)
+    compare(opened[0].kind, "video")
+    compare(opened[0].path, "/synthetic/media/clip.mp4")
+    compare(opened[0].isGif, true)
+    mosaic.openTile(members[0])
+    compare(opened.length, 2)
+    compare(opened[1].kind, "image")
+    compare(opened[1].path, "/synthetic/media/photo.jpg")
+    compare(opened[1].width, 800)
+    compare(opened[1].height, 600)
+    mosaic.openTile(members[2])
+    compare(downloads.length, 2)
+    compare(downloads[1].id, "album-tile-pending")
   }
 
   function test_poll_card_replaces_or_extends_the_selection() {

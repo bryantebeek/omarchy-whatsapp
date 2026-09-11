@@ -300,6 +300,13 @@ mod tests {
         ) -> Result<wa::Message> {
             unimplemented!("voice notes have their own outbox")
         }
+        async fn upload_image_message(
+            &self,
+            _data: Vec<u8>,
+            _options: media::ImageOptions,
+        ) -> Result<wa::Message> {
+            unimplemented!("pasted images send without an outbox")
+        }
         async fn send_reaction(
             &self,
             _chat: &Jid,

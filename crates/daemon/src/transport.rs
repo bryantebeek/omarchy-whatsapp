@@ -81,6 +81,13 @@ pub(crate) trait Transport: Send + Sync {
         data: Vec<u8>,
         options: media::AudioOptions,
     ) -> Result<wa::Message>;
+    /// Uploads pasted image bytes and composes the outbound image message.
+    /// Same scripting constraint as [`Transport::upload_audio_message`].
+    async fn upload_image_message(
+        &self,
+        data: Vec<u8>,
+        options: media::ImageOptions,
+    ) -> Result<wa::Message>;
     /// Sends a reaction to an existing message.
     async fn send_reaction(
         &self,
@@ -265,6 +272,19 @@ impl Transport for ClientTransport {
             .upload(data, MediaType::Audio, UploadOptions::new())
             .await?;
         Ok(media::audio_message(upload, options))
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    async fn upload_image_message(
+        &self,
+        data: Vec<u8>,
+        options: media::ImageOptions,
+    ) -> Result<wa::Message> {
+        let upload = self
+            .0
+            .upload(data, MediaType::Image, UploadOptions::new())
+            .await?;
+        Ok(media::image_message(upload, options))
     }
 
     #[cfg_attr(coverage_nightly, coverage(off))]
@@ -510,6 +530,7 @@ pub(crate) mod fake {
         ProfilePicture,
         SendMessage,
         UploadAudioMessage,
+        UploadImageMessage,
         SendReaction,
         MarkAsRead,
         MarkChatAsRead,
@@ -563,6 +584,11 @@ pub(crate) mod fake {
             byte_count: usize,
             duration_seconds: Option<u32>,
             ptt: Option<bool>,
+        },
+        UploadImageMessage {
+            byte_count: usize,
+            mimetype: Option<String>,
+            caption: Option<String>,
         },
         SendReaction {
             chat: String,
@@ -640,6 +666,7 @@ pub(crate) mod fake {
                 Self::ProfilePicture(_) => CallKind::ProfilePicture,
                 Self::SendMessage { .. } => CallKind::SendMessage,
                 Self::UploadAudioMessage { .. } => CallKind::UploadAudioMessage,
+                Self::UploadImageMessage { .. } => CallKind::UploadImageMessage,
                 Self::SendReaction { .. } => CallKind::SendReaction,
                 Self::MarkAsRead { .. } => CallKind::MarkAsRead,
                 Self::MarkChatAsRead(_) => CallKind::MarkChatAsRead,
@@ -1016,6 +1043,27 @@ pub(crate) mod fake {
                     ptt: options.ptt,
                     file_length: Some(u64::try_from(data.len()).unwrap_or(u64::MAX)),
                     ..wa::message::AudioMessage::default()
+                }),
+                ..wa::Message::default()
+            })
+        }
+
+        async fn upload_image_message(
+            &self,
+            data: Vec<u8>,
+            options: media::ImageOptions,
+        ) -> Result<wa::Message> {
+            self.record(Call::UploadImageMessage {
+                byte_count: data.len(),
+                mimetype: options.mimetype.clone(),
+                caption: options.caption.clone(),
+            })?;
+            Ok(wa::Message {
+                image_message: MessageField::some(wa::message::ImageMessage {
+                    mimetype: options.mimetype,
+                    caption: options.caption,
+                    file_length: Some(u64::try_from(data.len()).unwrap_or(u64::MAX)),
+                    ..wa::message::ImageMessage::default()
                 }),
                 ..wa::Message::default()
             })

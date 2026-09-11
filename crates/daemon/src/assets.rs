@@ -313,13 +313,25 @@ fn jpeg_file_is_valid(path: &Path) -> bool {
     file.read_exact(&mut header).is_ok() && header == [0xff, 0xd8, 0xff]
 }
 
+// Embedded WhatsApp thumbnails are tiny by design. Once the full download
+// lands, the cached poster is stale whenever the download is newer than it,
+// so the next ffmpeg pass replaces it with a full-resolution frame.
+fn video_thumbnail_is_stale(path: &Path, thumbnail_path: &Path) -> bool {
+    let modified = |candidate: &Path| {
+        std::fs::metadata(candidate)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    };
+    match (modified(path), modified(thumbnail_path)) {
+        (Some(video), Some(thumbnail)) => video > thumbnail,
+        _ => false,
+    }
+}
+
 // The ffmpeg process boundary is verified by release smoke tests. Cache naming,
 // validation, migration, and pruning around it remain coverage-instrumented.
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub fn ensure_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Result<bool> {
-    if jpeg_file_is_valid(thumbnail_path) {
-        return Ok(false);
-    }
+fn generate_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Result<bool> {
     if !path.is_file() {
         return Ok(false);
     }
@@ -378,6 +390,21 @@ pub fn ensure_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Res
         prune_media_cache(directory, thumbnail_path);
     }
     Ok(true)
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn ensure_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Result<bool> {
+    if jpeg_file_is_valid(thumbnail_path) && !video_thumbnail_is_stale(path, thumbnail_path) {
+        return Ok(false);
+    }
+    generate_message_video_thumbnail(path, thumbnail_path)
+}
+
+// A fresh download always supersedes the embedded thumbnail, even when both
+// land within the same filesystem timestamp tick.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub fn refresh_message_video_thumbnail(path: &Path, thumbnail_path: &Path) -> Result<bool> {
+    generate_message_video_thumbnail(path, thumbnail_path)
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -1530,6 +1557,87 @@ mod tests {
         let file = File::create(&oversized).unwrap();
         file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
         assert!(!jpeg_file_is_valid(&oversized));
+    }
+
+    fn stamp_modified(path: &Path, modified: std::time::SystemTime) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    #[test]
+    fn downloaded_video_marks_embedded_thumbnail_stale() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("clip.video.mp4");
+        let thumbnail = directory.path().join("clip.video-thumbnail.jpg");
+        std::fs::write(&video, b"download").unwrap();
+        std::fs::write(&thumbnail, b"\xff\xd8\xffembedded").unwrap();
+        let older = std::time::SystemTime::now() - Duration::from_secs(60);
+        stamp_modified(&thumbnail, older);
+        assert!(video_thumbnail_is_stale(&video, &thumbnail));
+        stamp_modified(&video, older);
+        assert!(!video_thumbnail_is_stale(&video, &thumbnail));
+    }
+
+    #[test]
+    fn missing_video_posters_are_never_stale() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("clip.video.mp4");
+        let thumbnail = directory.path().join("clip.video-thumbnail.jpg");
+        assert!(!video_thumbnail_is_stale(&video, &thumbnail));
+        std::fs::write(&video, b"download").unwrap();
+        assert!(!video_thumbnail_is_stale(&video, &thumbnail));
+        std::fs::write(&thumbnail, b"\xff\xd8\xffembedded").unwrap();
+        std::fs::remove_file(&video).unwrap();
+        assert!(!video_thumbnail_is_stale(&video, &thumbnail));
+    }
+
+    #[test]
+    fn ensure_regenerates_a_stale_video_thumbnail() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("clip.video.mp4");
+        let thumbnail = directory.path().join("clip.video-thumbnail.jpg");
+        std::fs::write(&video, b"\0\0\0\x18ftypisomsynthetic").unwrap();
+        std::fs::write(&thumbnail, b"\xff\xd8\xffembedded").unwrap();
+        stamp_modified(
+            &thumbnail,
+            std::time::SystemTime::now() - Duration::from_secs(60),
+        );
+        // The synthetic bytes cannot decode with or without ffmpeg installed,
+        // so the attempt must fail while leaving the embedded fallback alone.
+        assert!(ensure_message_video_thumbnail(&video, &thumbnail).is_err());
+        assert_eq!(std::fs::read(&thumbnail).unwrap(), b"\xff\xd8\xffembedded");
+    }
+
+    #[test]
+    fn ensure_keeps_a_fresh_video_thumbnail() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("clip.video.mp4");
+        let thumbnail = directory.path().join("clip.video-thumbnail.jpg");
+        std::fs::write(&video, b"\0\0\0\x18ftypisomsynthetic").unwrap();
+        std::fs::write(&thumbnail, b"\xff\xd8\xffposter").unwrap();
+        stamp_modified(
+            &video,
+            std::time::SystemTime::now() - Duration::from_secs(60),
+        );
+        // Undecodable bytes would fail a regeneration, so Ok(false) proves the
+        // fresh poster was kept without spawning ffmpeg.
+        assert!(!ensure_message_video_thumbnail(&video, &thumbnail).unwrap());
+        assert_eq!(std::fs::read(&thumbnail).unwrap(), b"\xff\xd8\xffposter");
+    }
+
+    #[test]
+    fn refresh_attempts_regeneration_despite_a_valid_embedded_thumbnail() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("clip.video.mp4");
+        let thumbnail = directory.path().join("clip.video-thumbnail.jpg");
+        std::fs::write(&video, b"\0\0\0\x18ftypisomsynthetic").unwrap();
+        std::fs::write(&thumbnail, b"\xff\xd8\xffembedded").unwrap();
+        assert!(refresh_message_video_thumbnail(&video, &thumbnail).is_err());
+        assert_eq!(std::fs::read(&thumbnail).unwrap(), b"\xff\xd8\xffembedded");
     }
 
     #[tokio::test]

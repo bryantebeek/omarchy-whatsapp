@@ -14,6 +14,7 @@ mod jobs;
 mod messages;
 mod notification;
 mod outbox;
+mod paste;
 mod presence;
 mod revisions;
 mod state;
@@ -212,6 +213,7 @@ async fn run_daemon() -> Result<()> {
         event_sync_marker: paths.state_dir.join("event-state-v6"),
         avatar_dir,
         media_dir,
+        clipboard: Arc::new(crate::paste::SystemClipboard),
         voice_outbox_dir,
         presence_sync_generation: AtomicU64::new(0),
         app_state_failed: AtomicBool::new(false),
@@ -638,6 +640,7 @@ pub(crate) mod test_support {
             event_sync_marker: directory.path().join("event-state-v6"),
             avatar_dir: directory.path().join("avatars"),
             media_dir: directory.path().join("media"),
+            clipboard: Arc::new(crate::paste::fake::FakeClipboard::new()),
             voice_outbox_dir: directory.path().join("outbox"),
             presence_sync_generation: AtomicU64::new(0),
             app_state_failed: AtomicBool::new(false),

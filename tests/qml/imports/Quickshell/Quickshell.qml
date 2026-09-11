@@ -4,6 +4,7 @@ import QtQuick
 
 QtObject {
   property var detachedCommands: []
+  property var screens: [{ width: 1920, height: 1080, name: "mock" }]
 
   function env(name) {
     if (name === "XDG_RUNTIME_DIR") return "/tmp/omarchy-whatsapp-qml-tests/runtime"

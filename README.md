@@ -73,7 +73,7 @@ text placeholder does not count as complete until the user can inspect and
 operate it in this app.
 
 The order is directional rather than a release promise. Each item also needs
-the corresponding Rust, IPC, QML, workflow, coverage, mutation, packaging, and
+the corresponding Rust, IPC, QML, workflow, coverage, packaging, and
 live-deployment work required by this repository's quality gates.
 
 ### Rich messaging
@@ -377,15 +377,14 @@ not touch the installed service or paired account.
 
 The local checks are mirrored by required GitHub Actions jobs for formatting,
 strict Clippy linting, Rust unit tests and coverage, the four QML test suites,
-targeted QML mutation testing, release smoke testing, dependency policy,
+release smoke testing, dependency policy,
 dependency review, and CodeQL. See
 [QUALITY.md](QUALITY.md) for the exact coverage contract and merge-policy setup.
 
 `scripts/check.sh` validates the root marketplace manifest and entry points. It
 also runs portable Qt Quick unit, component, service-state, and UI workflow
 tests against side-effect-free Quickshell and Omarchy test doubles, including
-date behavior in two time zones. A small semantic mutation set guards high-risk
-validation, request-ordering, connection, and workflow behavior. On Omarchy,
+date behavior in two time zones. On Omarchy,
 the same check additionally runs strict `qmllint` against the installed shell
 modules; hosted CI uses the portable test doubles where those modules are
 unavailable.

@@ -1,9 +1,11 @@
 import QtQuick
 import QtTest
+import QtMultimedia
 import Quickshell
 import qs.Commons
 
 import "../../quickshell" as Whatsapp
+import "../../quickshell/Model.js" as Model
 import "fixtures"
 
 TestCase {
@@ -82,6 +84,15 @@ TestCase {
       })
     }
     return messages
+  }
+
+  function fixturePath(name) {
+    var path = String(Qt.resolvedUrl("fixtures/" + name))
+    return decodeURIComponent(path.substring("file://".length))
+  }
+
+  function mappedBottom(item, target) {
+    return item.mapToItem(target, 0, item.height).y
   }
 
   function test_open_search_select_and_close() {
@@ -861,8 +872,7 @@ TestCase {
 
   function test_open_media_and_recover_connection() {
     panel.open('{"chatJid":"alice@s.whatsapp.net"}')
-    var imagePath = String(Qt.resolvedUrl("fixtures/pixel.svg"))
-    imagePath = decodeURIComponent(imagePath.substring("file://".length))
+    var imagePath = fixturePath("pixel.svg")
     service.loadMessages([{
       id: "text-style",
       chat_jid: "alice@s.whatsapp.net",
@@ -887,30 +897,36 @@ TestCase {
       }
     }], "")
     tryCompare(control("messageList"), "count", 2)
+    var delegate = control("messageDelegate-image-style")
     var textBubble = control("messageBubble-text-style")
     var imageBubble = control("messageBubble-image-style")
-    compare(imageBubble.borderOnlyMedia, false)
-    compare(imageBubble.radius, textBubble.radius)
-    compare(imageBubble.color, textBubble.color)
-    compare(imageBubble.borderLeft, textBubble.borderLeft)
-    compare(imageBubble.borderTop, textBubble.borderTop)
-    compare(imageBubble.horizontalPadding, textBubble.horizontalPadding)
     var mediaCard = control("mediaPreviewCard-image-style")
     var imageMask = control("mediaPreviewMask-image-style")
     var previewImage = control("mediaPreviewImage-image-style")
     var downloadButton = control("mediaDownloadButton-image-style")
-    compare(mediaCard.topMargin, Style.space(8))
-    compare(previewImage.y, mediaCard.topMargin)
-    compare(previewImage.height, mediaCard.height - mediaCard.topMargin)
-    compare(imageMask.radius, imageBubble.radius)
-    compare(imageMask.y, mediaCard.topMargin)
+    var timestamp = control("messageTimestamp-image-style")
+    compare(imageBubble.showMessageBubble, false)
+    compare(imageBubble.height, 0)
+    compare(findChild(imageBubble, "mediaPreviewCard-image-style"), null)
+    compare(mediaCard.topMargin, 0)
+    compare(previewImage.y, 0)
+    compare(previewImage.height, mediaCard.height)
+    compare(imageMask.radius, textBubble.radius)
+    compare(imageMask.y, 0)
     compare(previewImage.layer.enabled, true)
-    compare(downloadButton.y + downloadButton.height / 2,
-      mediaCard.topMargin
-        + (mediaCard.height - mediaCard.topMargin) / 2)
+    compare(downloadButton.y + downloadButton.height / 2, mediaCard.height / 2)
+    compare(mediaCard.x + mediaCard.width, delegate.width - Style.space(18))
+    compare(textBubble.x + textBubble.width, delegate.width - Style.space(18))
+    verify(mappedBottom(mediaCard, delegate)
+      <= timestamp.parent.mapToItem(delegate, 0, 0).y)
 
-    panel.openImagePreview(imagePath, "7")
+    panel.openImagePreview(imagePath, "7", 1600, 900)
     verify(panel.imagePreviewUrl.endsWith("/fixtures/pixel.svg?v=7"))
+    var viewer = control("imageViewerWindow")
+    compare(viewer.width, 1600)
+    compare(viewer.height, 900)
+    control("imageViewerCloseButton").click()
+    compare(panel.imagePreviewUrl, "")
 
     service.connectionState = "disconnected"
     tryCompare(panel, "paired", false)
@@ -919,6 +935,627 @@ TestCase {
     service.connectionState = "connected"
     service.lastError = ""
     tryCompare(panel, "paired", true)
+  }
+
+  function test_image_viewer_size_fits_screen() {
+    panel.open("{}")
+    var fits = panel.imageViewerSize(1600, 900)
+    compare(fits.width, 1600)
+    compare(fits.height, 900)
+    var fallback = panel.imageViewerSize(0, 0)
+    compare(fallback.width, 480)
+    compare(fallback.height, 360)
+    var tiny = panel.imageViewerSize(32, 32)
+    compare(tiny.width, 320)
+    compare(tiny.height, 320)
+    var huge = panel.imageViewerSize(5120, 3840)
+    verify(huge.width <= 1792)
+    verify(huge.height <= 952)
+    verify(Math.abs(huge.width / huge.height - 4 / 3) < 0.01)
+    verify(1792 - huge.width <= 1 || 952 - huge.height <= 1)
+  }
+
+  function test_image_caption_sits_below_preview() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var imagePath = fixturePath("pixel.svg")
+    service.loadMessages([{
+      id: "captioned-image",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "me",
+      from_me: true,
+      text: "Hi",
+      timestamp: 200,
+      media: {
+        kind: "image",
+        path: imagePath,
+        thumbnail_path: imagePath,
+        downloaded: true,
+        width: 16,
+        height: 9
+      }
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    var delegate = control("messageDelegate-captioned-image")
+    var bubble = control("messageBubble-captioned-image")
+    var caption = control("mediaCaptionText-captioned-image")
+    var mediaCard = control("mediaPreviewCard-captioned-image")
+    var imageMask = control("mediaPreviewMask-captioned-image")
+    var timestamp = control("messageTimestamp-captioned-image")
+    compare(bubble.showMessageBubble, true)
+    verify(bubble.height > 0)
+    compare(caption.text, "Hi")
+    compare(caption.parent, control("messageColumn-captioned-image"))
+    verify(caption.height > 0)
+    verify(bubble.height >= caption.height)
+    compare(findChild(bubble, "mediaPreviewCard-captioned-image"), null)
+    compare(mediaCard.topMargin, 0)
+    compare(imageMask.radius, bubble.radius)
+    compare(mediaCard.y, control("dateDivider-captioned-image").height)
+    compare(bubble.y, mediaCard.y + mediaCard.height + Style.space(8))
+    verify(bubble.width < mediaCard.width)
+    compare(bubble.x + bubble.width, delegate.width - Style.space(18))
+    compare(mediaCard.x + mediaCard.width, delegate.width - Style.space(18))
+    verify(mappedBottom(bubble, delegate)
+      <= timestamp.parent.mapToItem(delegate, 0, 0).y)
+  }
+
+  function test_group_image_keeps_sender_header_above_preview() {
+    panel.open('{"chatJid":"team@g.us"}')
+    var imagePath = fixturePath("pixel.svg")
+    service.loadMessages([{
+      id: "group-image",
+      chat_jid: "team@g.us",
+      sender_jid: "alice@s.whatsapp.net",
+      sender_name: "Alice",
+      from_me: false,
+      text: "[Image]",
+      timestamp: 200,
+      media: {
+        kind: "image",
+        path: imagePath,
+        thumbnail_path: imagePath,
+        downloaded: true,
+        width: 1,
+        height: 1
+      }
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    var bubble = control("messageBubble-group-image")
+    var header = control("senderHeader-group-image")
+    var mediaCard = control("mediaPreviewCard-group-image")
+    var imageMask = control("mediaPreviewMask-group-image")
+    compare(header.text, "Alice")
+    verify(header.height > 0)
+    compare(header.y, control("dateDivider-group-image").height)
+    compare(header.x, Style.space(56))
+    compare(bubble.showMessageBubble, false)
+    compare(bubble.height, 0)
+    compare(findChild(bubble, "mediaPreviewCard-group-image"), null)
+    compare(imageMask.radius, Style.cornerRadius + Style.space(6))
+    compare(mediaCard.y, header.y + header.height + Style.space(4))
+    compare(mediaCard.x, Style.space(56))
+    verify(mediaCard.width > header.width)
+  }
+
+  function test_video_preview_without_caption_has_no_bubble_data() {
+    return [
+      { tag: "video", gif: false, downloaded: true, tooltip: "Play video" },
+      { tag: "gif", gif: true, downloaded: true, tooltip: "Play GIF" },
+      { tag: "pending-download", gif: false, downloaded: false, tooltip: "Download video" }
+    ]
+  }
+
+  function test_video_preview_without_caption_has_no_bubble(data) {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var previewPath = fixturePath("pixel.svg")
+    var media = {
+      kind: "video",
+      path: "/synthetic/media/clip.mp4",
+      thumbnail_path: previewPath,
+      downloaded: data.downloaded,
+      width: 16,
+      height: 9
+    }
+    if (data.gif) media.gif_playback = true
+    service.loadMessages([{
+      id: "video-style",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "me",
+      from_me: true,
+      text: "[Video]",
+      timestamp: 200,
+      media: media
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    var delegate = control("messageDelegate-video-style")
+    var bubble = control("messageBubble-video-style")
+    var mediaCard = control("mediaPreviewCard-video-style")
+    var previewImage = control("mediaPreviewImage-video-style")
+    var downloadButton = control("mediaDownloadButton-video-style")
+    var timestamp = control("messageTimestamp-video-style")
+    compare(delegate.hasMediaPreview, true)
+    compare(bubble.showMessageBubble, false)
+    compare(bubble.height, 0)
+    compare(findChild(bubble, "mediaPreviewCard-video-style"), null)
+    compare(mediaCard.topMargin, 0)
+    compare(mediaCard.isVideo, true)
+    compare(mediaCard.isGif, data.gif)
+    verify(mediaCard.height > 0)
+    compare(previewImage.y, 0)
+    compare(previewImage.height, mediaCard.height)
+    compare(previewImage.layer.enabled, true)
+    compare(control("mediaPreviewMask-video-style").radius,
+      Style.cornerRadius + Style.space(6))
+    compare(downloadButton.tooltipText, data.tooltip)
+    // Centered anchors snap to whole pixels, so fractional card heights
+    // leave the button up to half a pixel off the exact center.
+    verify(Math.abs(downloadButton.y + downloadButton.height / 2
+      - mediaCard.height / 2) <= 0.5)
+    compare(mediaCard.x + mediaCard.width, delegate.width - Style.space(18))
+    verify(mappedBottom(mediaCard, delegate)
+      <= timestamp.parent.mapToItem(delegate, 0, 0).y)
+  }
+
+  function test_video_caption_sits_below_preview() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var previewPath = fixturePath("pixel.svg")
+    service.loadMessages([{
+      id: "captioned-video",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "me",
+      from_me: true,
+      text: "Watch this",
+      timestamp: 200,
+      media: {
+        kind: "video",
+        path: "/synthetic/media/clip.mp4",
+        thumbnail_path: previewPath,
+        downloaded: true,
+        width: 16,
+        height: 9
+      }
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    var delegate = control("messageDelegate-captioned-video")
+    var bubble = control("messageBubble-captioned-video")
+    var caption = control("mediaCaptionText-captioned-video")
+    var mediaCard = control("mediaPreviewCard-captioned-video")
+    var imageMask = control("mediaPreviewMask-captioned-video")
+    var timestamp = control("messageTimestamp-captioned-video")
+    compare(bubble.showMessageBubble, true)
+    verify(bubble.height > 0)
+    compare(caption.text, "Watch this")
+    compare(caption.parent, control("messageColumn-captioned-video"))
+    verify(caption.height > 0)
+    verify(bubble.height >= caption.height)
+    compare(findChild(bubble, "mediaPreviewCard-captioned-video"), null)
+    compare(mediaCard.topMargin, 0)
+    compare(imageMask.radius, bubble.radius)
+    compare(mediaCard.y, control("dateDivider-captioned-video").height)
+    compare(bubble.y, mediaCard.y + mediaCard.height + Style.space(8))
+    verify(bubble.width < mediaCard.width)
+    compare(bubble.x + bubble.width, delegate.width - Style.space(18))
+    compare(mediaCard.x + mediaCard.width, delegate.width - Style.space(18))
+    verify(mappedBottom(bubble, delegate)
+      <= timestamp.parent.mapToItem(delegate, 0, 0).y)
+  }
+
+  function test_group_video_keeps_sender_header_above_preview() {
+    panel.open('{"chatJid":"team@g.us"}')
+    var previewPath = fixturePath("pixel.svg")
+    service.loadMessages([{
+      id: "group-video",
+      chat_jid: "team@g.us",
+      sender_jid: "alice@s.whatsapp.net",
+      sender_name: "Alice",
+      from_me: false,
+      text: "[Video]",
+      timestamp: 200,
+      media: {
+        kind: "video",
+        path: "/synthetic/media/clip.mp4",
+        thumbnail_path: previewPath,
+        downloaded: true,
+        width: 1,
+        height: 1
+      }
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    var bubble = control("messageBubble-group-video")
+    var header = control("senderHeader-group-video")
+    var mediaCard = control("mediaPreviewCard-group-video")
+    var imageMask = control("mediaPreviewMask-group-video")
+    compare(header.text, "Alice")
+    verify(header.height > 0)
+    compare(header.y, control("dateDivider-group-video").height)
+    compare(header.x, Style.space(56))
+    compare(bubble.showMessageBubble, false)
+    compare(bubble.height, 0)
+    compare(findChild(bubble, "mediaPreviewCard-group-video"), null)
+    compare(imageMask.radius, Style.cornerRadius + Style.space(6))
+    compare(mediaCard.y, header.y + header.height + Style.space(4))
+    compare(mediaCard.x, Style.space(56))
+    verify(mediaCard.width > header.width)
+  }
+
+  function test_video_click_opens_original_size_viewer_data() {
+    return [
+      { tag: "video", gif: false, playTooltip: "Play video", pauseTooltip: "Pause video" },
+      { tag: "gif", gif: true, playTooltip: "Play GIF", pauseTooltip: "Pause GIF" }
+    ]
+  }
+
+  function test_video_click_opens_original_size_viewer(data) {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var previewPath = fixturePath("pixel.svg")
+    var media = {
+      kind: "video",
+      path: "/synthetic/media/clip.mp4",
+      thumbnail_path: previewPath,
+      downloaded: true,
+      width: 16,
+      height: 9
+    }
+    if (data.gif) media.gif_playback = true
+    service.loadMessages([{
+      id: "video-viewer",
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: "me",
+      from_me: true,
+      text: "[Video]",
+      timestamp: 200,
+      media: media
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    control("mediaPreviewCard-video-viewer").openPreview()
+    var popup = control("videoPreviewPopup")
+    tryCompare(popup, "opened", true)
+    compare(panel.videoPreviewIsGif, data.gif)
+    verify(panel.videoPreviewUrl.endsWith("/synthetic/media/clip.mp4"))
+    compare(panel.videoPreviewUrl.indexOf("?"), -1)
+    compare(control("fullVideoPreview").fillMode, VideoOutput.PreserveAspectFit)
+    compare(control("videoPreviewStatus").visible, false)
+    compare(control("videoPreviewTimeLabel").text, "0:00 / 0:00")
+    compare(control("videoPreviewSeekFill").width, 0)
+    var playButton = control("videoPreviewPlayButton")
+    compare(playButton.tooltipText, data.pauseTooltip)
+    playButton.click()
+    compare(playButton.tooltipText, data.playTooltip)
+    playButton.click()
+    compare(playButton.tooltipText, data.pauseTooltip)
+    tryCompare(popup, "opened", true)
+    verify(panel.videoPreviewUrl.endsWith("/synthetic/media/clip.mp4"))
+
+    control("videoPreviewCloseButton").click()
+    tryCompare(popup, "opened", false)
+    tryCompare(panel, "videoPreviewUrl", "")
+    tryCompare(panel, "videoPreviewIsGif", false)
+
+    control("mediaPreviewCard-video-viewer").openPreview()
+    tryCompare(popup, "opened", true)
+    panel.chooseChat("team@g.us")
+    tryCompare(popup, "opened", false)
+    tryCompare(panel, "videoPreviewUrl", "")
+  }
+
+  function albumMessage(id, options) {
+    options = options || {}
+    var kind = options.kind || "image"
+    var message = {
+      id: id,
+      chat_jid: "alice@s.whatsapp.net",
+      sender_jid: options.sender || "alice@s.whatsapp.net",
+      sender_name: options.senderName || "Alice",
+      from_me: false,
+      text: options.text !== undefined ? options.text
+        : (kind === "video" ? "[Video]" : "[Image]"),
+      timestamp: options.timestamp !== undefined ? options.timestamp : 200,
+      media: {
+        kind: kind,
+        path: kind === "video" ? "/synthetic/media/clip.mp4"
+          : fixturePath("pixel.svg"),
+        thumbnail_path: fixturePath("pixel.svg"),
+        downloaded: true,
+        width: 16,
+        height: 9
+      }
+    }
+    if (options.reactions) message.reactions = options.reactions
+    return message
+  }
+
+  function test_album_groups_consecutive_uncaptioned_media_data() {
+    return [
+      {
+        tag: "two-images",
+        messages: [albumMessage("m0"), albumMessage("m1")],
+        mosaicLeader: "m0",
+        followers: ["m1"],
+        standalone: []
+      },
+      {
+        tag: "image-video-mix",
+        messages: [albumMessage("m0"), albumMessage("m1", { kind: "video" })],
+        mosaicLeader: "m0",
+        followers: ["m1"],
+        standalone: []
+      },
+      {
+        tag: "caption-breaks-run",
+        messages: [albumMessage("m0"), albumMessage("m1", { text: "Nice!" })],
+        mosaicLeader: null,
+        followers: [],
+        standalone: ["m0", "m1"]
+      },
+      {
+        tag: "reaction-breaks-run",
+        messages: [albumMessage("m0"),
+          albumMessage("m1", { reactions: [{ emoji: "👍", from_me: false, count: 1 }] })],
+        mosaicLeader: null,
+        followers: [],
+        standalone: ["m0", "m1"]
+      },
+      {
+        tag: "different-minute-breaks-run",
+        messages: [albumMessage("m0", { timestamp: 200 }),
+          albumMessage("m1", { timestamp: 320 })],
+        mosaicLeader: null,
+        followers: [],
+        standalone: ["m0", "m1"]
+      },
+      {
+        tag: "text-between-breaks-run",
+        messages: [albumMessage("m0"),
+          { id: "m1", chat_jid: "alice@s.whatsapp.net", sender_jid: "alice@s.whatsapp.net", sender_name: "Alice", from_me: false, text: "hello", timestamp: 201 },
+          albumMessage("m2")],
+        mosaicLeader: null,
+        followers: [],
+        standalone: ["m0", "m2"]
+      },
+      {
+        tag: "different-sender-breaks-run",
+        messages: [albumMessage("m0"),
+          albumMessage("m1", { sender: "bob@s.whatsapp.net", senderName: "Bob" })],
+        mosaicLeader: null,
+        followers: [],
+        standalone: ["m0", "m1"]
+      },
+      {
+        tag: "single-never-groups",
+        messages: [albumMessage("m0")],
+        mosaicLeader: null,
+        followers: [],
+        standalone: ["m0"]
+      },
+      {
+        tag: "five-chunks-four-plus-single",
+        messages: [albumMessage("m0"), albumMessage("m1"),
+          albumMessage("m2"), albumMessage("m3"), albumMessage("m4")],
+        mosaicLeader: "m0",
+        followers: ["m1", "m2", "m3"],
+        standalone: ["m4"]
+      }
+    ]
+  }
+
+  function test_album_groups_consecutive_uncaptioned_media(data) {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    service.loadMessages(data.messages, "")
+    tryCompare(control("messageList"), "count", data.messages.length)
+    var mosaic = findChild(panel, "albumMosaic-" + data.messages[0].id)
+    if (data.mosaicLeader) {
+      compare(data.messages[0].id, data.mosaicLeader)
+      verify(mosaic !== null)
+      verify(mosaic.height > 0)
+      for (var f = 0; f < data.followers.length; f++) {
+        var followerId = data.followers[f]
+        compare(findChild(panel, "messageBubble-" + followerId).height, 0)
+        compare(findChild(panel, "mediaPreviewCard-" + followerId), null)
+        compare(findChild(panel, "messageDelegate-" + followerId).height, 0)
+      }
+    } else {
+      compare(mosaic, null)
+      for (var m = 0; m < data.messages.length; m++)
+        compare(findChild(panel, "albumMosaic-" + data.messages[m].id), null)
+    }
+    for (var s = 0; s < data.standalone.length; s++) {
+      var standaloneId = data.standalone[s]
+      verify(findChild(panel, "mediaPreviewCard-" + standaloneId) !== null)
+      verify(findChild(panel, "albumTile-" + standaloneId) === null)
+    }
+  }
+
+  function test_album_footer_shows_last_message_time() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    function outgoingImage(id, timestamp, receipt, readBy) {
+      return {
+        id: id,
+        chat_jid: "alice@s.whatsapp.net",
+        sender_jid: "me",
+        from_me: true,
+        text: "[Image]",
+        timestamp: timestamp,
+        receipt: receipt,
+        read_by: readBy || [],
+        media: {
+          kind: "image",
+          path: fixturePath("pixel.svg"),
+          thumbnail_path: fixturePath("pixel.svg"),
+          downloaded: true,
+          width: 16,
+          height: 9
+        }
+      }
+    }
+    service.loadMessages([
+      outgoingImage("a0", 200, 1),
+      outgoingImage("a1", 201, 1),
+      outgoingImage("a2", 202, 3, [
+        { jid: "alice@s.whatsapp.net", name: "Alice", read_at: 203 }
+      ])
+    ], "")
+    tryCompare(control("messageList"), "count", 3)
+    verify(findChild(panel, "albumMosaic-a0") !== null)
+    compare(control("messageTimestamp-a0").text,
+      Model.messageTime(202, panel.messageTimeFormat))
+    compare(control("messageReceiptStatus-a0").text, "✓✓")
+    verify(control("messageReceiptStatus-a0").receiptTooltipText
+      .indexOf("Alice") >= 0)
+  }
+
+  function test_group_album_shows_single_sender_header_and_avatar() {
+    panel.open('{"chatJid":"team@g.us"}')
+    function groupImage(id, timestamp) {
+      return {
+        id: id,
+        chat_jid: "team@g.us",
+        sender_jid: "alice@s.whatsapp.net",
+        sender_name: "Alice",
+        from_me: false,
+        text: "[Image]",
+        timestamp: timestamp,
+        media: {
+          kind: "image",
+          path: fixturePath("pixel.svg"),
+          thumbnail_path: fixturePath("pixel.svg"),
+          downloaded: true,
+          width: 1,
+          height: 1
+        }
+      }
+    }
+    service.loadMessages([groupImage("g0", 200), groupImage("g1", 201)], "")
+    tryCompare(control("messageList"), "count", 2)
+    var mosaic = control("albumMosaic-g0")
+    var header = control("senderHeader-g0")
+    compare(header.text, "Alice")
+    verify(header.height > 0)
+    compare(header.x, Style.space(56))
+    compare(control("messageBubble-g0").showMessageBubble, false)
+    compare(control("messageBubble-g0").height, 0)
+    compare(control("messageBubble-g1").height, 0)
+    compare(control("senderAvatar-g0").width, Style.space(30))
+    compare(control("senderAvatar-g1").width, 0)
+    compare(mosaic.y, header.y + header.height + Style.space(4))
+    compare(mosaic.x, Style.space(56))
+    compare(control("messageTimestamp-g0").text,
+      Model.messageTime(201, panel.messageTimeFormat))
+    verify(mappedBottom(mosaic, control("messageDelegate-g0"))
+      <= control("messageTimestamp-g0").parent
+        .mapToItem(control("messageDelegate-g0"), 0, 0).y)
+  }
+
+  function test_album_tile_download_and_open() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    service.loadMessages([
+      {
+        id: "am0",
+        chat_jid: "alice@s.whatsapp.net",
+        sender_jid: "alice@s.whatsapp.net",
+        sender_name: "Alice",
+        from_me: false,
+        text: "[Image]",
+        timestamp: 200,
+        media: {
+          kind: "image",
+          path: "",
+          thumbnail_path: fixturePath("pixel.svg"),
+          downloaded: false,
+          width: 16,
+          height: 9
+        }
+      },
+      albumMessage("am1", { kind: "video" }),
+      albumMessage("am2")
+    ], "")
+    tryCompare(control("messageList"), "count", 3)
+    var mosaic = control("albumMosaic-am0")
+    control("albumDownloadButton-am0").click()
+    compare(service.downloadedMessages.length, 1)
+    compare(service.downloadedMessages[0].id, "am0")
+
+    mosaic.openTile(service.messages[1])
+    tryCompare(control("videoPreviewPopup"), "opened", true)
+    verify(panel.videoPreviewUrl.endsWith("/synthetic/media/clip.mp4"))
+    control("videoPreviewCloseButton").click()
+    tryCompare(control("videoPreviewPopup"), "opened", false)
+
+    mosaic.openTile(service.messages[2])
+    verify(panel.imagePreviewUrl.endsWith("/fixtures/pixel.svg?v=0-0"))
+  }
+
+  function test_hd_badge_marks_high_definition_images() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    function definitionImage(id, timestamp, width, height) {
+      return {
+        id: id,
+        chat_jid: "alice@s.whatsapp.net",
+        sender_jid: "alice@s.whatsapp.net",
+        sender_name: "Alice",
+        from_me: false,
+        text: "[Image]",
+        timestamp: timestamp,
+        media: {
+          kind: "image",
+          path: fixturePath("pixel.svg"),
+          thumbnail_path: fixturePath("pixel.svg"),
+          downloaded: true,
+          width: width,
+          height: height
+        }
+      }
+    }
+    service.loadMessages([
+      definitionImage("hd-photo", 200, 4000, 3000),
+      definitionImage("sd-photo", 320, 800, 600)
+    ], "")
+    tryCompare(control("messageList"), "count", 2)
+    var hdCard = control("mediaPreviewCard-hd-photo")
+    compare(hdCard.showHdBadge, true)
+    verify(findChild(hdCard, "hdBadge-hd-photo") !== null)
+    compare(control("mediaPreviewCard-sd-photo").showHdBadge, false)
+  }
+
+  function test_paste_image_stage_send_and_discard() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var composer = control("composer")
+    compare(composer.placeholderText, "Message")
+    compare(control("sendButton").tooltipText, "Send message")
+    var plainWidth = composer.width
+
+    panel.pasteImageFromClipboard()
+    compare(service.stagedImage !== null, true)
+    compare(composer.placeholderText, "Add a caption")
+    compare(control("sendButton").tooltipText, "Send image")
+    verify(composer.width < plainWidth)
+    verify(control("pastedThumbnail").source.toString()
+      .endsWith("/fixtures/pixel.svg?v=0"))
+
+    composer.text = "look at this"
+    control("sendButton").click()
+    compare(service.sentImages.length, 1)
+    compare(service.sentImages[0].text, "look at this")
+    compare(service.sentImages[0].chat_jid, "alice@s.whatsapp.net")
+    compare(service.stagedImage, null)
+    compare(composer.text, "")
+    compare(composer.placeholderText, "Message")
+    compare(control("sendButton").tooltipText, "Send message")
+
+    panel.pasteImageFromClipboard()
+    compare(service.stagedImage !== null, true)
+    composer.text = "keep me"
+    control("discardStagedButton").click()
+    compare(service.stagedImage, null)
+    compare(composer.text, "keep me")
+
+    service.pasteImageEmpty = true
+    var pasted = []
+    service.clipboardTextPasteRequested.connect(function () {
+      pasted.push(true)
+    })
+    panel.pasteImageFromClipboard()
+    compare(pasted.length, 1)
+    compare(service.stagedImage, null)
   }
 
   function test_render_and_download_stickers() {

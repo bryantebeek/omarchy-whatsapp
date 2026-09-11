@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 const MAX_DELIVERY_ID_BYTES: usize = 128;
 const MAX_TEXT_BYTES: usize = 65_536;
 
-pub fn validate(delivery_id: &str, text: &str) -> Result<String> {
+pub fn validate_delivery_id(delivery_id: &str) -> Result<()> {
     ensure!(!delivery_id.is_empty(), "delivery ID cannot be empty");
     ensure!(
         delivery_id.len() <= MAX_DELIVERY_ID_BYTES,
@@ -17,6 +17,11 @@ pub fn validate(delivery_id: &str, text: &str) -> Result<String> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
         "delivery ID contains unsupported characters"
     );
+    Ok(())
+}
+
+pub fn validate(delivery_id: &str, text: &str) -> Result<String> {
+    validate_delivery_id(delivery_id)?;
     let text = text.trim().to_owned();
     ensure!(!text.is_empty(), "message cannot be empty");
     ensure!(text.len() <= MAX_TEXT_BYTES, "message is too large");

@@ -34,7 +34,9 @@ pub const AVATAR_FLUSH_WINDOW: Duration = Duration::from_millis(100);
 #[must_use]
 pub fn timeout(command: &Command) -> Duration {
     match command {
-        Command::SendVoiceMessage { .. } | Command::CreatePoll { .. } => Duration::from_secs(120),
+        Command::SendVoiceMessage { .. }
+        | Command::SendImage { .. }
+        | Command::CreatePoll { .. } => Duration::from_secs(120),
         Command::GetGroupParticipants { .. } => Duration::from_secs(60),
         _ => Duration::from_secs(30),
     }
@@ -44,6 +46,7 @@ pub fn timeout(command: &Command) -> Duration {
 pub fn conflict_key(command: &Command) -> Option<String> {
     let key = match command {
         Command::SendMessage { chat_jid, .. }
+        | Command::SendImage { chat_jid, .. }
         | Command::CreatePoll { chat_jid, .. }
         | Command::VotePoll { chat_jid, .. }
         | Command::React { chat_jid, .. }
@@ -58,8 +61,10 @@ pub fn conflict_key(command: &Command) -> Option<String> {
         Command::SetActiveChat { .. } | Command::SetPresence { .. } => "connection-intent".into(),
         Command::ResyncChatState | Command::Logout => "global-session".into(),
         // Downloads and avatar fetches only enqueue background work; their own
-        // in-flight sets already deduplicate per resource.
+        // in-flight sets already deduplicate per resource. Clipboard reads are
+        // local and idempotent.
         Command::DownloadMedia { .. }
+        | Command::PasteImage
         | Command::RequestAvatar { .. }
         | Command::GetState
         | Command::ListChats { .. }
@@ -111,6 +116,16 @@ mod tests {
             }),
             Duration::from_secs(120)
         );
+        assert_eq!(
+            timeout(&Command::SendImage {
+                chat_jid: "chat".into(),
+                path: "/cache/paste-1.png".into(),
+                caption: String::new(),
+                delivery_id: "img-1".into(),
+            }),
+            Duration::from_secs(120)
+        );
+        assert_eq!(timeout(&Command::PasteImage), Duration::from_secs(30));
     }
 
     #[test]
@@ -141,6 +156,15 @@ mod tests {
                     chat_jid: "chat".into(),
                     text: "x".into(),
                     delivery_id: "d".into(),
+                },
+                "chat:chat",
+            ),
+            (
+                Command::SendImage {
+                    chat_jid: "chat".into(),
+                    path: "/cache/paste-1.png".into(),
+                    caption: String::new(),
+                    delivery_id: "img-1".into(),
                 },
                 "chat:chat",
             ),
@@ -231,6 +255,7 @@ mod tests {
             Command::ListVoiceOutbox,
             Command::ListTextOutbox,
             Command::ListAvatars,
+            Command::PasteImage,
             Command::Ping,
         ] {
             assert_eq!(conflict_key(&command), None);

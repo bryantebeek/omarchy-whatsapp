@@ -15,6 +15,7 @@ TestCase {
   property int textAcceptedCount: 0
   property string acceptedDeliveryId: ""
   property string acceptedText: ""
+  property int clipboardPasteCount: 0
 
   Connections {
     target: testCase.service
@@ -26,6 +27,9 @@ TestCase {
       testCase.textAcceptedCount++
       testCase.acceptedDeliveryId = deliveryId
       testCase.acceptedText = text
+    }
+    function onClipboardTextPasteRequested() {
+      testCase.clipboardPasteCount++
     }
   }
 
@@ -54,6 +58,7 @@ TestCase {
     textAcceptedCount = 0
     acceptedDeliveryId = ""
     acceptedText = ""
+    clipboardPasteCount = 0
   }
 
   function cleanup() {
@@ -1206,5 +1211,125 @@ TestCase {
       event: "hello", protocol_version: service.protocolVersion
     }))
     compare(service.protocolCompatible, true)
+  }
+
+  function test_image_paste_and_send_lifecycle() {
+    service.selectedChatJid = ""
+    compare(service.pasteImage(), false)
+    service.selectedChatJid = "chat"
+    compare(service.pasteImage(), true)
+    var request = lastFrame()
+    compare(request.command, "paste_image")
+    compare(service.pasteImage(), false)
+
+    service.handleLine(JSON.stringify({
+      id: request.id + 1,
+      event: "image_pasted",
+      path: "/elsewhere/clip.png",
+      width: 1,
+      height: 1,
+      mime_type: "image/png"
+    }))
+    compare(service.stagedImage, null)
+    compare(service.imagePasteRequestId, request.id)
+
+    service.handleLine(JSON.stringify({
+      id: request.id, event: "image_paste_empty"
+    }))
+    compare(clipboardPasteCount, 1)
+    compare(service.stagedImage, null)
+    compare(service.imagePasteRequestId, 0)
+
+    compare(service.pasteImage(), true)
+    request = lastFrame()
+    service.handleLine(JSON.stringify({
+      id: request.id,
+      event: "image_pasted",
+      path: "/cache/paste-1.png",
+      width: 800,
+      height: 600,
+      mime_type: "image/png"
+    }))
+    compare(service.stagedImage.path, "/cache/paste-1.png")
+    compare(service.stagedImage.width, 800)
+    compare(service.imagePasteRequestId, 0)
+    service.clearStagedImage()
+    compare(service.stagedImage, null)
+
+    compare(service.pasteImage(), true)
+    request = lastFrame()
+    service.handleLine(JSON.stringify({
+      id: request.id, event: "error", message: "clipboard broken"
+    }))
+    compare(service.stagedImage, null)
+    compare(service.imagePasteRequestId, 0)
+    compare(service.lastError, "clipboard broken")
+
+    service.selectedChatJid = ""
+    compare(service.sendImageMessage("hi"), false)
+    service.selectedChatJid = "chat"
+    compare(service.sendImageMessage("hi"), false)
+    service.stagedImage = {
+      path: "/cache/paste-1.png", width: 800, height: 600,
+      mime_type: "image/png"
+    }
+    compare(service.sendImageMessage("hello"), true)
+    var send = lastFrame()
+    compare(send.command, "send_image")
+    compare(send.chat_jid, "chat")
+    compare(send.path, "/cache/paste-1.png")
+    compare(send.caption, "hello")
+    verify(/^img-[0-9]+-[0-9]+$/.test(send.delivery_id))
+    compare(service.sendImageMessage("again"), false)
+
+    service.handleLine(JSON.stringify({
+      id: send.id + 1, event: "sent", message: {}
+    }))
+    compare(service.stagedImage !== null, true)
+    compare(service.imageSendRequestId, send.id)
+
+    service.handleLine(JSON.stringify({
+      id: send.id, event: "error", message: "offline"
+    }))
+    compare(service.stagedImage.path, "/cache/paste-1.png")
+    compare(service.lastError, "offline")
+    compare(service.imageSendRequestId, 0)
+
+    compare(service.sendImageMessage("hello"), true)
+    send = lastFrame()
+    service.handleLine(JSON.stringify({
+      id: send.id,
+      event: "sent",
+      message: { id: "m1", chat_jid: "chat" }
+    }))
+    compare(service.stagedImage, null)
+    compare(textAcceptedCount, 1)
+    compare(acceptedText, "hello")
+    verify(acceptedDeliveryId.indexOf("img-") === 0)
+
+    compare(service.pasteImage(), true)
+    request = lastFrame()
+    service.requestDeadlines[String(request.id)] = 1
+    TestIo.socketWrites = []
+    compare(service.expireRequests(2), 1)
+    compare(service.imagePasteRequestId, 0)
+    verify(service.lastError.indexOf("paste image timed out") >= 0)
+
+    service.stagedImage = { path: "/cache/paste-1.png" }
+    compare(service.sendImageMessage("x"), true)
+    send = lastFrame()
+    service.requestDeadlines[String(send.id)] = 1
+    compare(service.expireRequests(2), 1)
+    compare(service.imageSendRequestId, 0)
+    compare(service.stagedImage.path, "/cache/paste-1.png")
+    verify(service.lastError.indexOf("send image timed out") >= 0)
+
+    compare(service.pasteImage(), true)
+    compare(service.sendImageMessage("y"), true)
+    var socket = TestIo.sockets[TestIo.sockets.length - 1]
+    socket.connected = false
+    compare(service.imagePasteRequestId, 0)
+    compare(service.imageSendRequestId, 0)
+    compare(service.stagedImage.path, "/cache/paste-1.png")
   }
 }

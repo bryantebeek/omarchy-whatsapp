@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 29;
+pub const PROTOCOL_VERSION: u16 = 30;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -281,6 +281,14 @@ pub enum Command {
         chat_jid: String,
         recording_id: String,
     },
+    PasteImage,
+    SendImage {
+        chat_jid: String,
+        path: String,
+        caption: String,
+        /// Stable client-generated identity used for idempotent delivery.
+        delivery_id: String,
+    },
     DiscardVoiceRecording {
         recording_id: String,
     },
@@ -393,6 +401,13 @@ pub enum ServerEvent {
         message_id: String,
         message: String,
     },
+    ImagePasted {
+        path: String,
+        width: u32,
+        height: u32,
+        mime_type: String,
+    },
+    ImagePasteEmpty,
     Sent {
         message: Message,
     },
@@ -586,6 +601,61 @@ mod tests {
         });
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), event);
+    }
+
+    #[test]
+    fn image_paste_and_send_commands_round_trip_are_stable() {
+        for command in [
+            Command::PasteImage,
+            Command::SendImage {
+                chat_jid: "1@s.whatsapp.net".into(),
+                path: "/cache/paste-1.png".into(),
+                caption: "look".into(),
+                delivery_id: "img-9".into(),
+            },
+        ] {
+            let frame = ClientFrame::new(Some(9), command);
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+        }
+        let json = serde_json::to_string(&ClientFrame::new(Some(9), Command::PasteImage)).unwrap();
+        assert!(json.contains("\"paste_image\""));
+        let json = serde_json::to_string(&ClientFrame::new(
+            Some(9),
+            Command::SendImage {
+                chat_jid: "1@s.whatsapp.net".into(),
+                path: "/cache/paste-1.png".into(),
+                caption: String::new(),
+                delivery_id: "img-9".into(),
+            },
+        ))
+        .unwrap();
+        assert!(json.contains("\"send_image\""));
+
+        for event in [
+            ServerEvent::ImagePasted {
+                path: "/cache/paste-1.png".into(),
+                width: 800,
+                height: 600,
+                mime_type: "image/png".into(),
+            },
+            ServerEvent::ImagePasteEmpty,
+        ] {
+            let frame = ServerFrame::event(event);
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+        }
+        let json = serde_json::to_string(&ServerFrame::event(ServerEvent::ImagePasted {
+            path: String::new(),
+            width: 0,
+            height: 0,
+            mime_type: String::new(),
+        }))
+        .unwrap();
+        assert!(json.contains("\"image_pasted\""));
+        let json =
+            serde_json::to_string(&ServerFrame::event(ServerEvent::ImagePasteEmpty)).unwrap();
+        assert!(json.contains("\"image_paste_empty\""));
     }
 
     #[test]

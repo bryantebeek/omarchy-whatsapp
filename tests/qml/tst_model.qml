@@ -318,4 +318,35 @@ TestCase {
   function test_connectionLabel(data) {
     compare(Model.connectionLabel(data.input), data.expected)
   }
+
+  function test_previewDisplayPath_data() {
+    return [
+      { tag: "missing", media: null, expected: "" },
+      { tag: "video uses thumbnail when downloaded", media: { kind: "video", path: "/full/clip.mp4", thumbnail_path: "/cache/thumb.jpg", downloaded: true }, expected: "/cache/thumb.jpg" },
+      { tag: "video uses thumbnail when pending", media: { kind: "video", path: "", thumbnail_path: "/cache/thumb.jpg", downloaded: false }, expected: "/cache/thumb.jpg" },
+      { tag: "downloaded image uses full file", media: { kind: "image", path: "/full/photo.jpg", thumbnail_path: "/cache/thumb.jpg", downloaded: true }, expected: "/full/photo.jpg" },
+      { tag: "pending image uses thumbnail", media: { kind: "image", path: "", thumbnail_path: "/cache/thumb.jpg", downloaded: false }, expected: "/cache/thumb.jpg" },
+      { tag: "missing paths", media: { kind: "image", downloaded: true }, expected: "" }
+    ]
+  }
+
+  function test_previewDisplayPath(data) {
+    compare(Model.previewDisplayPath(data.media), data.expected)
+  }
+
+  function test_isHighDefinitionImage_data() {
+    return [
+      { tag: "missing", media: null, expected: false },
+      { tag: "video ignored", media: { kind: "video", width: 3840, height: 2160 }, expected: false },
+      { tag: "standard boundary", media: { kind: "image", width: 1600, height: 900 }, expected: false },
+      { tag: "just above", media: { kind: "image", width: 1601, height: 900 }, expected: true },
+      { tag: "portrait", media: { kind: "image", width: 900, height: 3000 }, expected: true },
+      { tag: "full resolution", media: { kind: "image", width: 4096, height: 2692 }, expected: true },
+      { tag: "missing dimensions", media: { kind: "image" }, expected: false }
+    ]
+  }
+
+  function test_isHighDefinitionImage(data) {
+    compare(Model.isHighDefinitionImage(data.media), data.expected)
+  }
 }

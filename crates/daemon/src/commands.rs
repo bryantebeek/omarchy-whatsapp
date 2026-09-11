@@ -12,8 +12,8 @@ use crate::state::{
 };
 use crate::sync::refresh_avatar;
 use crate::transport::Transport;
-use crate::{assets, database, jobs, text_outbox, voice_outbox};
-use anyhow::{Context, Result, anyhow, bail};
+use crate::{assets, database, jobs, paste, text_outbox, voice_outbox};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use buffa::Message as _;
 use chrono::Utc;
 use omarchy_whatsapp_protocol::{
@@ -309,7 +309,7 @@ async fn perform_media_download(
                 .update_message_media(chat_jid, message_id, &media)?;
             assets::download_message_video(transport, video, path.clone()).await?;
             let preview_result = tokio::task::spawn_blocking(move || {
-                assets::ensure_message_video_thumbnail(&path, &thumbnail_path)
+                assets::refresh_message_video_thumbnail(&path, &thumbnail_path)
             })
             .await;
             log_video_preview_result(preview_result);
@@ -744,6 +744,167 @@ where
         .context("voice outbox write task failed")?
 }
 
+const MAX_IMAGE_CAPTION_CHARS: usize = 1024;
+
+fn validate_image_caption(caption: &str) -> Result<String> {
+    let caption = caption.trim().to_owned();
+    ensure!(
+        caption.chars().count() <= MAX_IMAGE_CAPTION_CHARS,
+        "caption is too large"
+    );
+    Ok(caption)
+}
+
+async fn paste_image(shared: &Arc<Shared>) -> Result<ServerEvent> {
+    let clipboard = shared.clipboard.clone();
+    let media_dir = shared.media_dir.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        paste::paste_image_from_clipboard(&*clipboard, &media_dir)
+    })
+    .await
+    .context("clipboard paste task failed")??;
+    match outcome {
+        paste::PasteOutcome::Empty => Ok(ServerEvent::ImagePasteEmpty),
+        paste::PasteOutcome::Pasted {
+            path,
+            width,
+            height,
+            mime_type,
+        } => Ok(ServerEvent::ImagePasted {
+            path: path.to_string_lossy().into_owned(),
+            width,
+            height,
+            mime_type,
+        }),
+    }
+}
+
+async fn send_image(
+    shared: &Arc<Shared>,
+    chat_jid: String,
+    path: String,
+    caption: String,
+    delivery_id: String,
+) -> Result<ServerEvent> {
+    let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
+    text_outbox::validate_delivery_id(&delivery_id)?;
+    let caption = validate_image_caption(&caption)?;
+    let staged = paste::resolve_staged_image(&shared.media_dir, &path)?;
+    let bytes = std::fs::read(&staged).context("staged image is not available")?;
+    let mime_type = paste::sniff_image_mime(&bytes)
+        .context("staged image is not a supported image")?
+        .to_owned();
+    paste::validate_pasted_bytes(&bytes, &mime_type)?;
+    let (width, height) = paste::pasted_image_dimensions(&bytes, &mime_type)?;
+    let transport = shared
+        .client
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| anyhow!("WhatsApp is not connected"))?;
+    let canonical = canonical_contact_jid(shared, transport.as_ref(), &requested).await;
+    let jid: Jid = canonical.parse().context("invalid canonical chat JID")?;
+    let canonical_jid = jid.to_non_ad_string();
+    let message_id = text_outbox::stable_message_id(&delivery_id);
+    if let Some(message) = shared.database.message_by_id(&canonical_jid, &message_id)? {
+        return Ok(ServerEvent::Sent { message });
+    }
+    let mut outbound = transport
+        .upload_image_message(
+            bytes,
+            media::ImageOptions {
+                caption: (!caption.is_empty()).then(|| caption.clone()),
+                mimetype: Some(mime_type.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .context("uploading image")?;
+    if let Some(image) = outbound.image_message.as_option_mut() {
+        image.width = Some(width);
+        image.height = Some(height);
+    }
+    let sent = transport
+        .send_message(
+            &jid,
+            outbound,
+            SendOptions::default().with_message_id(&message_id),
+        )
+        .await?;
+    if sent.message_id != message_id {
+        bail!("WhatsApp returned a different image message ID");
+    }
+    let cached_path = assets::message_image_path(&shared.media_dir, &canonical_jid, &message_id);
+    let copy_source = staged.clone();
+    let copy_destination = cached_path.clone();
+    let downloaded = match tokio::task::spawn_blocking(move || {
+        assets::copy_private_file(&copy_source, &copy_destination)
+    })
+    .await
+    .context("image cache copy task failed")?
+    {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "could not retain sent image in the private cache");
+            false
+        }
+    };
+    assets::prune_media_cache(
+        &shared.media_dir,
+        if downloaded { &cached_path } else { &staged },
+    );
+    let cached = cached_path.to_string_lossy().into_owned();
+    let message = Message {
+        id: message_id,
+        chat_jid: canonical_jid,
+        sender_jid: "me".into(),
+        sender_name: "You".into(),
+        text: if caption.is_empty() {
+            "[Image]".into()
+        } else {
+            caption
+        },
+        timestamp: Utc::now().timestamp(),
+        from_me: true,
+        receipt: 1,
+        delivered_at: None,
+        read_at: None,
+        delivered_to: Vec::new(),
+        read_by: Vec::new(),
+        media: Some(MessageMedia::Image {
+            // Sent images have no separate thumbnail; pointing at the cached
+            // copy keeps history recovery from ever flipping them back to
+            // undownloaded.
+            path: cached.clone(),
+            thumbnail_path: cached,
+            downloaded,
+            mime_type,
+            width,
+            height,
+        }),
+        reactions: Vec::new(),
+    };
+    let chat_name = shared
+        .database
+        .chat_name(&message.chat_jid)?
+        .or_else(|| {
+            shared
+                .database
+                .contact_name(&message.chat_jid)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| message.chat_jid.clone());
+    shared
+        .database
+        .insert_message(&message, &chat_name, jid.is_group(), false)?;
+    // The requesting connection already learns about the send from this
+    // command's `sent` response, so other clients only need a refresh.
+    broadcast_messages(shared, &message.chat_jid);
+    broadcast_chats(shared);
+    Ok(ServerEvent::Sent { message })
+}
+
 // IPC command-to-`WhatsApp` dispatch. Command identity, deadlines,
 // serialization, and response convergence belong to `ipc`; every arm below owns
 // only its validation, its outbound calls, and the local state it publishes.
@@ -862,6 +1023,13 @@ pub(crate) async fn handle_command(
             broadcast_voice_outbox(shared);
             Ok(ServerEvent::Ack)
         }
+        Command::PasteImage => paste_image(shared).await,
+        Command::SendImage {
+            chat_jid,
+            path,
+            caption,
+            delivery_id,
+        } => send_image(shared, chat_jid, path, caption, delivery_id).await,
         // Listing an outbox is a snapshot of atomically written job files or a
         // single query. Taking a delivery gate here would make the panel's
         // first request wait for an in-flight upload and time out.
@@ -2894,7 +3062,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn downloading_a_video_keeps_its_embedded_preview() {
+    async fn downloading_a_video_keeps_its_embedded_preview_when_regeneration_fails() {
+        // The synthetic bytes cannot decode, so the forced post-download
+        // refresh must fall back to the embedded thumbnail it tried to beat.
         let directory = tempfile::tempdir().unwrap();
         let shared = shared_with_dirs(&directory);
         let bytes = b"\0\0\0\x18ftypisomsynthetic".to_vec();
@@ -3335,6 +3505,325 @@ mod tests {
     }
 
     // --- voice messages ---------------------------------------------------
+
+    fn pasted_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 2, 0, 0, 0]);
+        bytes
+    }
+
+    fn stage_paste(shared: &Arc<Shared>, name: &str, bytes: &[u8]) -> String {
+        let path = shared.media_dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn pasting_an_image_from_clipboard_stages_it_for_sending() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        paste::fake::test_clipboard(&shared.clipboard).script_image("image/png", pasted_png(2, 3));
+        std::fs::create_dir_all(&shared.media_dir).unwrap();
+
+        let event = run(&shared, Command::PasteImage).await.unwrap();
+        let ServerEvent::ImagePasted {
+            path,
+            width,
+            height,
+            mime_type,
+        } = event
+        else {
+            panic!("expected a staged paste, got {event:?}");
+        };
+        assert_eq!((width, height), (2, 3));
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(
+            Path::new(&path).extension().and_then(|name| name.to_str()),
+            Some("png")
+        );
+        assert_eq!(std::fs::read(path).unwrap(), pasted_png(2, 3));
+    }
+
+    #[tokio::test]
+    async fn pasting_without_an_image_reports_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        assert!(matches!(
+            run(&shared, Command::PasteImage).await.unwrap(),
+            ServerEvent::ImagePasteEmpty
+        ));
+        paste::fake::test_clipboard(&shared.clipboard).fail_list("no selection");
+        assert!(matches!(
+            run(&shared, Command::PasteImage).await.unwrap(),
+            ServerEvent::ImagePasteEmpty
+        ));
+    }
+
+    #[tokio::test]
+    async fn pasting_an_invalid_image_fails_the_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        paste::fake::test_clipboard(&shared.clipboard)
+            .script_image("image/png", b"not an image".to_vec());
+        assert!(run(&shared, Command::PasteImage).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sending_a_pasted_image_uploads_caches_and_persists_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let staged = stage_paste(&shared, "paste-1.png", &pasted_png(2, 3));
+
+        let event = run(
+            &shared,
+            Command::SendImage {
+                chat_jid: "1@s.whatsapp.net".into(),
+                path: staged,
+                caption: "hi".into(),
+                delivery_id: "img-1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ServerEvent::Sent { message } = event else {
+            panic!("expected the sent image message");
+        };
+        assert_eq!(message.id, text_outbox::stable_message_id("img-1"));
+        assert_eq!(message.chat_jid, "1@s.whatsapp.net");
+        assert_eq!(message.text, "hi");
+        let Some(MessageMedia::Image {
+            path,
+            thumbnail_path,
+            downloaded,
+            width,
+            height,
+            ..
+        }) = message.media
+        else {
+            panic!("expected image media");
+        };
+        assert!(downloaded);
+        assert_eq!((width, height), (2, 3));
+        assert_eq!(thumbnail_path, path);
+        assert_eq!(std::fs::read(&path).unwrap(), pasted_png(2, 3));
+        assert_eq!(
+            fake.calls_of(CallKind::UploadImageMessage),
+            vec![Call::UploadImageMessage {
+                byte_count: pasted_png(2, 3).len(),
+                mimetype: Some("image/png".into()),
+                caption: Some("hi".into()),
+            }]
+        );
+        assert_eq!(fake.calls_of(CallKind::SendMessage).len(), 1);
+        assert!(
+            shared
+                .database
+                .message_by_id("1@s.whatsapp.net", &message.id)
+                .unwrap()
+                .is_some()
+        );
+
+        let staged = stage_paste(&shared, "paste-2.png", &pasted_png(4, 5));
+        let event = run(
+            &shared,
+            Command::SendImage {
+                chat_jid: "1@s.whatsapp.net".into(),
+                path: staged,
+                caption: String::new(),
+                delivery_id: "img-2".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let ServerEvent::Sent { message } = event else {
+            panic!("expected the sent image message");
+        };
+        assert_eq!(message.text, "[Image]");
+    }
+
+    #[tokio::test]
+    async fn sending_a_pasted_image_twice_delivers_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let staged = stage_paste(&shared, "paste-1.png", &pasted_png(2, 3));
+        let send = || Command::SendImage {
+            chat_jid: "1@s.whatsapp.net".into(),
+            path: staged.clone(),
+            caption: String::new(),
+            delivery_id: "img-1".into(),
+        };
+        run(&shared, send()).await.unwrap();
+        run(&shared, send()).await.unwrap();
+        assert_eq!(fake.calls_of(CallKind::UploadImageMessage).len(), 1);
+        assert_eq!(fake.calls_of(CallKind::SendMessage).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn image_sends_reject_invalid_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let staged = stage_paste(&shared, "paste-1.png", &pasted_png(2, 3));
+        let send =
+            |chat_jid: &str, path: String, caption: String, delivery_id: &str| Command::SendImage {
+                chat_jid: chat_jid.into(),
+                path,
+                caption,
+                delivery_id: delivery_id.into(),
+            };
+        assert!(
+            run(
+                &shared,
+                send("not a jid", staged.clone(), String::new(), "img-1")
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            run(
+                &shared,
+                send("1@s.whatsapp.net", staged.clone(), String::new(), "!!")
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            run(
+                &shared,
+                send(
+                    "1@s.whatsapp.net",
+                    staged.clone(),
+                    "a".repeat(1025),
+                    "img-1"
+                )
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "caption is too large"
+        );
+        assert!(
+            run(
+                &shared,
+                send(
+                    "1@s.whatsapp.net",
+                    "/etc/hostname".into(),
+                    String::new(),
+                    "img-1"
+                )
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            run(
+                &shared,
+                send(
+                    "1@s.whatsapp.net",
+                    shared
+                        .media_dir
+                        .join("missing.png")
+                        .to_string_lossy()
+                        .into_owned(),
+                    String::new(),
+                    "img-1"
+                )
+            )
+            .await
+            .is_err()
+        );
+        let garbage = stage_paste(&shared, "paste-garbage.png", b"not an image");
+        assert!(
+            run(
+                &shared,
+                send("1@s.whatsapp.net", garbage, String::new(), "img-1")
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fake.calls_of(CallKind::UploadImageMessage).len(), 0);
+        assert_eq!(fake.calls_of(CallKind::SendMessage).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn image_send_failures_surface_transport_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let staged = stage_paste(&shared, "paste-1.png", &pasted_png(2, 3));
+        let send = || Command::SendImage {
+            chat_jid: "1@s.whatsapp.net".into(),
+            path: staged.clone(),
+            caption: String::new(),
+            delivery_id: "img-1".into(),
+        };
+        assert_eq!(
+            run(&shared, send()).await.unwrap_err().to_string(),
+            "WhatsApp is not connected"
+        );
+
+        let fake =
+            Arc::new(FakeTransport::new().failing(CallKind::UploadImageMessage, "cdn is down"));
+        attach(&shared, &fake).await;
+        assert!(
+            run(&shared, send())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("uploading image")
+        );
+
+        let failing_send =
+            Arc::new(FakeTransport::new().failing(CallKind::SendMessage, "send is down"));
+        attach(&shared, &failing_send).await;
+        assert!(run(&shared, send()).await.is_err());
+
+        let mismatched = Arc::new(FakeTransport::new().with_send_receipt_id("SOMETHING-ELSE"));
+        attach(&shared, &mismatched).await;
+        assert_eq!(
+            run(&shared, send()).await.unwrap_err().to_string(),
+            "WhatsApp returned a different image message ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sent_image_survives_cache_copy_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let staged = stage_paste(&shared, "paste-1.png", &pasted_png(2, 3));
+        let mut permissions = std::fs::metadata(&shared.media_dir).unwrap().permissions();
+        permissions.set_mode(0o555);
+        std::fs::set_permissions(&shared.media_dir, permissions).unwrap();
+
+        let ServerEvent::Sent { message } = run(
+            &shared,
+            Command::SendImage {
+                chat_jid: "1@s.whatsapp.net".into(),
+                path: staged,
+                caption: String::new(),
+                delivery_id: "img-1".into(),
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("expected the sent image message");
+        };
+
+        let Some(MessageMedia::Image { downloaded, .. }) = message.media else {
+            panic!("expected image media");
+        };
+        assert!(!downloaded);
+        assert_eq!(fake.calls_of(CallKind::SendMessage).len(), 1);
+    }
 
     #[tokio::test]
     async fn sending_a_recording_uploads_caches_and_completes_the_outbox_job() {

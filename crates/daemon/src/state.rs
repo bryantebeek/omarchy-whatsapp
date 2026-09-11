@@ -389,6 +389,7 @@ pub(crate) struct Shared {
     pub(crate) event_sync_marker: PathBuf,
     pub(crate) avatar_dir: PathBuf,
     pub(crate) media_dir: PathBuf,
+    pub(crate) clipboard: Arc<dyn crate::paste::ClipboardBackend>,
     pub(crate) voice_outbox_dir: PathBuf,
     pub(crate) presence_sync_generation: AtomicU64,
     pub(crate) app_state_failed: AtomicBool,

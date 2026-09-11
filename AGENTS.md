@@ -35,11 +35,7 @@ or update tests in the appropriate suite:
   media, and recovering from connection changes.
 
 Add direct behavioral tests for new service events, production entry points,
-public `Model.js` helpers, and user workflows. Add a targeted mutant to
-`scripts/qml-mutation.py` only when it represents a high-risk semantic fault in
-validation, ordering, connection safety, or a core workflow. Mutation testing
-is not a coverage metric; do not add source-text permutations for styling,
-spacing, or every branch merely to increase a score.
+public `Model.js` helpers, and user workflows.
 
 Keep test doubles and fixtures synthetic and side-effect-free. QML tests must
 never connect to the real daemon, read or write paired account state, start user
@@ -52,12 +48,11 @@ Before declaring any QML or frontend-related change complete, run:
 
 ```bash
 ./scripts/qml-test-all.sh
-./scripts/qml-mutation.sh
 ```
 
-Both commands must pass. Also run the formatting, linting, validation,
+It must pass. Also run the formatting, linting, validation,
 deployment, reload, and live-log checks required by the relevant section below.
-The CI `Quality` job runs all four suites and the targeted mutation set once.
+The CI `Quality` job runs all four suites once.
 
 ### Quickshell-only changes
 

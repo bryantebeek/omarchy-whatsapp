@@ -275,3 +275,20 @@ function connectionLabel(state) {
   if (value === "error") return "Connection error"
   return "Starting"
 }
+
+function previewDisplayPath(media) {
+  if (!media) return ""
+  if (media.kind === "video") return String(media.thumbnail_path || "")
+  if (media.downloaded === true) return String(media.path || "")
+  return String(media.thumbnail_path || "")
+}
+
+// The protocol carries no HD flag. Standard photos are capped around 1600px
+// on the long edge while HD photos keep higher resolutions, so the announced
+// dimensions reveal HD shots.
+function isHighDefinitionImage(media) {
+  if (!media || media.kind !== "image") return false
+  var width = Number(media.width || 0)
+  var height = Number(media.height || 0)
+  return Math.max(width, height) > 1600
+}
