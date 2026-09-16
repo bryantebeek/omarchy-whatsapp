@@ -785,8 +785,10 @@ async fn send_image(
     path: String,
     caption: String,
     delivery_id: String,
+    mentions: Vec<String>,
 ) -> Result<ServerEvent> {
     let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
+    let mentions = text_outbox::validate_mentions(&requested, &caption, mentions)?;
     text_outbox::validate_delivery_id(&delivery_id)?;
     let caption = validate_image_caption(&caption)?;
     let staged = paste::resolve_staged_image(&shared.media_dir, &path)?;
@@ -823,6 +825,7 @@ async fn send_image(
     if let Some(image) = outbound.image_message.as_option_mut() {
         image.width = Some(width);
         image.height = Some(height);
+        image.context_info.get_or_insert_default().mentioned_jid = mentions;
     }
     let sent = transport
         .send_message(
@@ -995,10 +998,12 @@ pub(crate) async fn handle_command(
             chat_jid,
             text,
             delivery_id,
+            mentions,
         } => {
             let _outbox_guard = shared.text_outbox_gate.lock().await;
             let text = text_outbox::validate(&delivery_id, &text)?;
             let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
+            let mentions = text_outbox::validate_mentions(&requested, &text, mentions)?;
             let message_id = text_outbox::stable_message_id(&delivery_id);
             shared.database.enqueue_text_message(
                 &delivery_id,
@@ -1006,6 +1011,7 @@ pub(crate) async fn handle_command(
                 &text,
                 &message_id,
                 Utc::now().timestamp(),
+                &mentions,
             )?;
             broadcast_text_outbox(shared);
             shared.text_outbox_notify.notify_one();
@@ -1029,7 +1035,8 @@ pub(crate) async fn handle_command(
             path,
             caption,
             delivery_id,
-        } => send_image(shared, chat_jid, path, caption, delivery_id).await,
+            mentions,
+        } => send_image(shared, chat_jid, path, caption, delivery_id, mentions).await,
         // Listing an outbox is a snapshot of atomically written job files or a
         // single query. Taking a delivery gate here would make the panel's
         // first request wait for an in-flight upload and time out.
@@ -1553,6 +1560,7 @@ mod tests {
                 chat_jid: "chat@s.whatsapp.net".into(),
                 text: "  ".into(),
                 delivery_id: "synthetic".into(),
+                mentions: Vec::new(),
             },
             &shared,
             0,
@@ -2177,6 +2185,48 @@ mod tests {
     // --- text outbox ------------------------------------------------------
 
     #[tokio::test]
+    async fn text_mentions_are_validated_before_durable_acceptance() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        for (chat, text) in [("1@s.whatsapp.net", "Hi @200"), ("123@g.us", "Hi @201")] {
+            assert!(
+                run(
+                    &shared,
+                    Command::SendMessage {
+                        chat_jid: chat.into(),
+                        text: text.into(),
+                        delivery_id: "mention".into(),
+                        mentions: vec!["200@lid".into()],
+                    }
+                )
+                .await
+                .is_err()
+            );
+            assert!(shared.database.text_outbox().unwrap().is_empty());
+        }
+        run(
+            &shared,
+            Command::SendMessage {
+                chat_jid: "123@g.us".into(),
+                text: "Hi @200".into(),
+                delivery_id: "mention".into(),
+                mentions: vec!["200@lid".into()],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            shared
+                .database
+                .claim_text_message()
+                .unwrap()
+                .unwrap()
+                .mentions,
+            ["200@lid"]
+        );
+    }
+
+    #[tokio::test]
     async fn text_messages_are_validated_queued_retried_and_discarded() {
         let directory = tempfile::tempdir().unwrap();
         let shared = shared_with_dirs(&directory);
@@ -2191,6 +2241,7 @@ mod tests {
                     chat_jid: "1@s.whatsapp.net".into(),
                     text: "hi".into(),
                     delivery_id: String::new(),
+                    mentions: Vec::new(),
                 }
             )
             .await
@@ -2205,6 +2256,7 @@ mod tests {
                     chat_jid: "not a jid".into(),
                     text: "hi".into(),
                     delivery_id: "d1".into(),
+                    mentions: Vec::new(),
                 }
             )
             .await
@@ -2215,6 +2267,7 @@ mod tests {
             chat_jid: "1:2@s.whatsapp.net".into(),
             text: "  hi  ".into(),
             delivery_id: "d1".into(),
+            mentions: Vec::new(),
         };
         assert_eq!(run(&shared, send()).await.unwrap(), accepted);
         assert_eq!(run(&shared, send()).await.unwrap(), accepted);
@@ -2225,6 +2278,7 @@ mod tests {
                     chat_jid: "1@s.whatsapp.net".into(),
                     text: "different".into(),
                     delivery_id: "d1".into(),
+                    mentions: Vec::new(),
                 }
             )
             .await
@@ -3572,6 +3626,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_caption_mentions_reach_the_wire() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let staged = stage_paste(&shared, "mention.png", &pasted_png(2, 3));
+        run(
+            &shared,
+            Command::SendImage {
+                chat_jid: "123@g.us".into(),
+                path: staged,
+                caption: "For @200".into(),
+                delivery_id: "image-mention".into(),
+                mentions: vec!["200@lid".into()],
+            },
+        )
+        .await
+        .unwrap();
+        let calls = fake.calls_of(CallKind::SendMessage);
+        let Call::SendMessage { message, .. } = &calls[0] else {
+            panic!("expected send")
+        };
+        assert_eq!(
+            message.image_message.context_info.mentioned_jid,
+            ["200@lid"]
+        );
+    }
+
+    #[tokio::test]
     async fn sending_a_pasted_image_uploads_caches_and_persists_it() {
         let directory = tempfile::tempdir().unwrap();
         let shared = shared_with_dirs(&directory);
@@ -3586,6 +3669,7 @@ mod tests {
                 path: staged,
                 caption: "hi".into(),
                 delivery_id: "img-1".into(),
+                mentions: Vec::new(),
             },
         )
         .await
@@ -3636,6 +3720,7 @@ mod tests {
                 path: staged,
                 caption: String::new(),
                 delivery_id: "img-2".into(),
+                mentions: Vec::new(),
             },
         )
         .await
@@ -3658,6 +3743,7 @@ mod tests {
             path: staged.clone(),
             caption: String::new(),
             delivery_id: "img-1".into(),
+            mentions: Vec::new(),
         };
         run(&shared, send()).await.unwrap();
         run(&shared, send()).await.unwrap();
@@ -3678,6 +3764,7 @@ mod tests {
                 path,
                 caption,
                 delivery_id: delivery_id.into(),
+                mentions: Vec::new(),
             };
         assert!(
             run(
@@ -3763,6 +3850,7 @@ mod tests {
             path: staged.clone(),
             caption: String::new(),
             delivery_id: "img-1".into(),
+            mentions: Vec::new(),
         };
         assert_eq!(
             run(&shared, send()).await.unwrap_err().to_string(),
@@ -3811,6 +3899,7 @@ mod tests {
                 path: staged,
                 caption: String::new(),
                 delivery_id: "img-1".into(),
+                mentions: Vec::new(),
             },
         )
         .await

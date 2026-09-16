@@ -33,8 +33,6 @@ Item {
   property real mediaDownloadAnchorOffset: 0
   property int mediaDownloadAnchorSerial: 0
   property string imagePreviewUrl: ""
-  property real imagePreviewWidth: 0
-  property real imagePreviewHeight: 0
   property string videoPreviewUrl: ""
   property bool videoPreviewIsGif: false
   property var activeVoiceMessageCard: null
@@ -107,6 +105,27 @@ Item {
     }
     return output
   }
+  property var composerMentions: []
+  property bool mentionPickerDismissed: false
+  readonly property var composerMentionQuery: Model.mentionQuery(composer.text, composer.cursorPosition)
+  readonly property var composerMentionChoices: service && service.selectedChat
+    && service.selectedChat.is_group === true
+    && service.groupParticipantsChatJid === service.selectedChatJid
+    && composerMentionQuery && !mentionPickerDismissed
+    ? Model.mentionChoices(service.groupParticipants, composerMentionQuery.query) : []
+
+  function insertComposerMention(choice) {
+    var query = composerMentionQuery
+    if (!query || !choice) return
+    var cursor = composer.cursorPosition
+    var selections = composerMentions.filter(function(p) { return p.label !== choice.label }).concat([choice])
+    composer.remove(query.start, cursor)
+    composer.insert(query.start, choice.label + " ")
+    composerMentions = selections
+    composer.cursorPosition = query.start + choice.label.length + 1
+    composer.forceActiveFocus()
+  }
+
   readonly property var messageMentionContacts: {
     var output = []
     var chats = service ? service.chats : []
@@ -338,52 +357,14 @@ Item {
     if (service) service.setPanelState(false, false)
   }
 
-  function openImagePreview(path, revision, width, height) {
+  function openImagePreview(path, revision) {
     if (!service || !path) return
-    imagePreviewWidth = Math.max(0, Number(width || 0))
-    imagePreviewHeight = Math.max(0, Number(height || 0))
     imagePreviewUrl = service.fileUrl(path, revision)
+    imageViewerPopup.open()
   }
 
   function closeImagePreview() {
-    imagePreviewUrl = ""
-    imagePreviewWidth = 0
-    imagePreviewHeight = 0
-  }
-
-  function imageViewerScreenSize() {
-    var screens = Quickshell.screens || []
-    var current = window && window.screen ? window.screen : null
-    var match = null
-    for (var i = 0; i < screens.length; i++) {
-      if (!match) match = screens[i]
-      if (current && screens[i] && screens[i].name === current.name) {
-        match = screens[i]
-        break
-      }
-    }
-    var width = match ? Number(match.width || 0) : 0
-    var height = match ? Number(match.height || 0) : 0
-    if (!(width > 0 && height > 0)) return { width: 1600, height: 900 }
-    return { width: width, height: height }
-  }
-
-  function imageViewerSize(sourceWidth, sourceHeight) {
-    var screen = imageViewerScreenSize()
-    var maxWidth = Math.max(320, screen.width - Style.space(128))
-    var maxHeight = Math.max(240, screen.height - Style.space(128))
-    var width = Number(sourceWidth || 0)
-    var height = Number(sourceHeight || 0)
-    if (!(width > 0 && height > 0)) return { width: 480, height: 360 }
-    var scale = Math.min(1, maxWidth / width, maxHeight / height)
-    width = Math.max(1, Math.floor(width * scale))
-    height = Math.max(1, Math.floor(height * scale))
-    if (width < 320 || height < 240) {
-      var boost = Math.max(320 / width, 240 / height)
-      width = Math.ceil(width * boost)
-      height = Math.ceil(height * boost)
-    }
-    return { width: width, height: height }
+    imageViewerPopup.close()
   }
 
   function openVideoPreview(path, isGif) {
@@ -419,7 +400,7 @@ Item {
 
   function mentionContactForJid(jid) {
     var value = String(jid || "")
-    var phone = Model.contactPhoneNumber("", value).replace(/[^0-9]/g, "")
+    var phone = value.split("@")[0].replace(/[^0-9]/g, "")
     if (!value || !phone) return null
     var contacts = messageMentionContacts
     for (var i = 0; i < contacts.length; i++) {
@@ -546,8 +527,8 @@ Item {
 
   function submitMessage() {
     if (!service) return
-    if (service.stagedImage) service.sendImageMessage(composer.text)
-    else service.sendMessage(composer.text)
+    if (service.stagedImage) service.sendImageMessage(composer.text, composerMentions)
+    else service.sendMessage(composer.text, composerMentions)
   }
 
   function pasteImageFromClipboard() {
@@ -1167,6 +1148,8 @@ Item {
       composer.paste()
     }
     function onSelectedChatJidChanged() {
+      root.composerMentions = []
+      root.mentionPickerDismissed = false
       root.stopVoiceRecording(false)
       root.closeImagePreview()
       videoPreviewPopup.close()
@@ -1341,79 +1324,84 @@ Item {
         }
       }
 
-      FloatingWindow {
-        id: imageViewerWindow
-        objectName: "imageViewerWindow"
+      QQC.Popup {
+        id: imageViewerPopup
+        objectName: "imageViewerPopup"
 
-        readonly property real viewerSourceWidth:
-          fullImagePreview.status === Image.Ready
-            && fullImagePreview.sourceSize.width > 0
-            && fullImagePreview.sourceSize.height > 0
-          ? fullImagePreview.sourceSize.width : root.imagePreviewWidth
-        readonly property real viewerSourceHeight:
-          fullImagePreview.status === Image.Ready
-            && fullImagePreview.sourceSize.width > 0
-            && fullImagePreview.sourceSize.height > 0
-          ? fullImagePreview.sourceSize.height : root.imagePreviewHeight
-        readonly property var viewerSize: root.imageViewerSize(
-          viewerSourceWidth, viewerSourceHeight)
+        parent: focusScope
+        x: 0
+        y: 0
+        width: parent.width
+        height: parent.height
+        padding: 0
+        modal: true
+        focus: true
+        closePolicy: QQC.Popup.CloseOnEscape
 
-        visible: root.imagePreviewUrl !== ""
-        title: "WhatsApp image"
-        color: root.background
-        width: viewerSize.width
-        height: viewerSize.height
-        minimumSize: Qt.size(320, 240)
+        onClosed: root.imagePreviewUrl = ""
 
-        onVisibleChanged: {
-          if (visible) imageViewerKeys.forceActiveFocus()
+        background: Rectangle {
+          color: Qt.rgba(root.background.r, root.background.g,
+            root.background.b, 0.96)
         }
 
-        Item {
-          id: imageViewerKeys
-          anchors.fill: parent
-          focus: true
-          Keys.onEscapePressed: root.closeImagePreview()
-        }
+        contentItem: Item {
+          MouseArea {
+            anchors.fill: parent
+            onClicked: imageViewerPopup.close()
+          }
 
-        Image {
-          id: fullImagePreview
+          Image {
+            id: fullImagePreview
 
-          anchors.fill: parent
-          source: root.imagePreviewUrl
-          asynchronous: true
-          cache: false
-          fillMode: Image.PreserveAspectFit
-          smooth: true
-          mipmap: true
-        }
+            anchors.fill: parent
+            anchors.margins: Style.space(28)
+            source: root.imagePreviewUrl
+            asynchronous: true
+            cache: false
+            fillMode: Image.PreserveAspectFit
+            smooth: true
+            mipmap: true
+          }
 
-        Text {
-          objectName: "imageViewerStatus"
-          anchors.centerIn: parent
-          visible: fullImagePreview.status === Image.Loading
-            || fullImagePreview.status === Image.Error
-          text: fullImagePreview.status === Image.Error
-            ? "Image unavailable" : "Loading image…"
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-        }
+          MouseArea {
+            x: fullImagePreview.x
+              + (fullImagePreview.width - fullImagePreview.paintedWidth) / 2
+            y: fullImagePreview.y
+              + (fullImagePreview.height - fullImagePreview.paintedHeight) / 2
+            width: fullImagePreview.paintedWidth
+            height: fullImagePreview.paintedHeight
+            enabled: fullImagePreview.status === Image.Ready
+            onClicked: function(mouse) { mouse.accepted = true }
+          }
 
-        CrispButton {
-          objectName: "imageViewerCloseButton"
-          anchors.top: parent.top
-          anchors.right: parent.right
-          anchors.margins: Style.space(16)
-          width: Style.space(40)
-          height: Style.space(40)
-          iconSize: Style.font.icon * 1.5
-          iconText: "󰅖"
-          foreground: root.foreground
-          accent: root.accent
-          tooltipText: "Close image preview"
-          focusable: true
-          onClicked: root.closeImagePreview()
+          Text {
+            objectName: "imageViewerStatus"
+            anchors.centerIn: parent
+            visible: fullImagePreview.status === Image.Loading
+              || fullImagePreview.status === Image.Error
+            text: fullImagePreview.status === Image.Error
+              ? "Image unavailable" : "Loading image…"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+          }
+
+          CrispButton {
+            objectName: "imageViewerCloseButton"
+            anchors.top: parent.top
+            anchors.right: parent.right
+            anchors.margins: Style.space(16)
+            width: Style.space(40)
+            height: Style.space(40)
+            iconSize: Style.font.icon * 1.5
+            iconText: "󰅖"
+            foreground: root.foreground
+            accent: root.accent
+            tooltipText: "Close image preview"
+            focusable: true
+            onClicked: imageViewerPopup.close()
+          }
         }
       }
 
@@ -3357,6 +3345,55 @@ Item {
                       height: Math.max(1, Style.normalBorderWidth)
                       color: Style.normalBorderFor(root.foreground, root.accent)
                     }
+                    Rectangle {
+                      id: mentionPopover
+                      objectName: "mentionPopover"
+                      anchors.left: parent.left
+                      anchors.right: parent.right
+                      anchors.bottom: parent.top
+                      anchors.margins: Style.space(14)
+                      height: Math.min(Style.space(200), mentionList.contentHeight) + border.width * 2
+                      visible: messageComposerControls.visible && root.composerMentionChoices.length > 0
+                      color: Qt.tint(root.background,
+                        Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14))
+                      border.color: root.accent
+                      z: 10
+                      ListView {
+                        id: mentionList
+                        objectName: "mentionList"
+                        anchors.fill: parent
+                        anchors.margins: mentionPopover.border.width
+                        clip: true
+                        model: root.composerMentionChoices
+                        currentIndex: 0
+                        onModelChanged: currentIndex = 0
+                        delegate: QQC.ItemDelegate {
+                          required property var modelData
+                          required property int index
+                          objectName: "mentionChoice-" + index
+                          width: ListView.view.width
+                          height: Style.space(40)
+                          text: modelData.label
+                          highlighted: ListView.isCurrentItem
+                          contentItem: Text {
+                            text: parent.text
+                            textFormat: Text.PlainText
+                            color: root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.body
+                            elide: Text.ElideRight
+                            verticalAlignment: Text.AlignVCenter
+                          }
+                          background: Rectangle {
+                            color: parent.highlighted || parent.hovered
+                              ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.25)
+                              : "transparent"
+                          }
+                          Accessible.name: "Mention " + modelData.label
+                          onClicked: root.insertComposerMention(modelData)
+                        }
+                      }
+                    }
                     Row {
                       id: messageComposerControls
 
@@ -3410,11 +3447,37 @@ Item {
                         placeholderText: root.service && root.service.stagedImage
                           ? "Add a caption"
                           : (enabled ? "Message" : "Select a conversation")
-                        onTextChanged: if (root.service
-                            && typeof root.service.noteComposerActivity === "function")
-                          root.service.noteComposerActivity(text)
-                        onAccepted: root.submitMessage()
+                        onTextChanged: {
+                          root.mentionPickerDismissed = false
+                          if (!text) root.composerMentions = []
+                          if (root.service && typeof root.service.noteComposerActivity === "function")
+                            root.service.noteComposerActivity(text)
+                        }
+                        onCursorPositionChanged: root.mentionPickerDismissed = false
+                        onAccepted: {
+                          if (root.composerMentionChoices.length > 0)
+                            root.insertComposerMention(root.composerMentionChoices[mentionList.currentIndex])
+                          else root.submitMessage()
+                        }
                         Keys.onPressed: function(event) {
+                          if (root.composerMentionChoices.length > 0) {
+                            if (event.key === Qt.Key_Down || event.key === Qt.Key_Up) {
+                              mentionList.currentIndex = (mentionList.currentIndex
+                                + (event.key === Qt.Key_Down ? 1 : mentionList.count - 1)) % mentionList.count
+                              event.accepted = true
+                              return
+                            }
+                            if (event.key === Qt.Key_Escape) {
+                              root.mentionPickerDismissed = true
+                              event.accepted = true
+                              return
+                            }
+                            if (event.key === Qt.Key_Tab) {
+                              root.insertComposerMention(root.composerMentionChoices[mentionList.currentIndex])
+                              event.accepted = true
+                              return
+                            }
+                          }
                           var pasteKey = (event.modifiers & Qt.ControlModifier
                               && event.key === Qt.Key_V)
                             || (event.modifiers & Qt.ShiftModifier

@@ -52,7 +52,7 @@ Item {
         media.gif_playback === true)
     else if (service)
       panel.openImagePreview(String(media.path || ""),
-        service.messageMediaRevision(message), media.width, media.height)
+        service.messageMediaRevision(message))
   }
 
   function tileX(index) {

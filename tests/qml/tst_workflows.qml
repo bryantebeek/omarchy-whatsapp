@@ -246,6 +246,82 @@ TestCase {
     compare(control("composer").enabled, true)
   }
 
+  function test_mentions_incoming_and_outgoing_data() {
+    return [
+      { tag: "others mention me", fromMe: false, token: "100444", expected: "You", self: true },
+      { tag: "I mention others", fromMe: true, token: "100222", expected: "Bob", self: false },
+      { tag: "others mention others", fromMe: false, token: "316222", expected: "Bob", self: false }
+    ]
+  }
+
+  function test_mentions_incoming_and_outgoing(data) {
+    panel.open('{"chatJid":"team@g.us"}')
+    service.groupParticipantsChatJid = "team@g.us"
+    service.loadMessages([{
+      id: "mention-direction", chat_jid: "team@g.us",
+      sender_jid: data.fromMe ? "me" : "alice@s.whatsapp.net",
+      from_me: data.fromMe, text: "Hi @" + data.token, timestamp: 100
+    }], "")
+    tryCompare(control("messageList"), "count", 1)
+    // Participant metadata can arrive after the messages.
+    service.groupParticipants = [
+      { jid: "316444@s.whatsapp.net", aliases: ["100444@lid"], name: "", is_me: true },
+      { jid: "100222@lid", aliases: ["316222@s.whatsapp.net"], name: "Bob", is_me: false }
+    ]
+    var delegate = control("messageDelegate-mention-direction")
+    tryVerify(function() {
+      return delegate.renderedMessageText.indexOf("@" + data.expected) >= 0
+    })
+    if (data.self) {
+      verify(delegate.renderedMessageText.indexOf("mention:") < 0)
+    } else {
+      control("messageText-mention-direction").linkActivated("mention:100222%40lid")
+      compare(service.selectedChatJid, "100222@lid")
+      compare(service.selectedChat.name, "Bob")
+    }
+  }
+
+  function test_compose_group_mentions() {
+    panel.open('{"chatJid":"team@g.us"}')
+    service.groupParticipantsChatJid = "team@g.us"
+    service.groupParticipants = [
+      { jid: "100@lid", name: "Alice & Sons" },
+      { jid: "200@s.whatsapp.net", name: "Bob" }
+    ]
+    var composer = control("composer")
+    composer.text = "Hi @Al"
+    composer.cursorPosition = composer.text.length
+    tryCompare(control("mentionList"), "count", 1)
+    control("mentionChoice-0").clicked()
+    compare(composer.text, "Hi @Alice & Sons ")
+    compare(panel.composerMentions.length, 1)
+    composer.insert(composer.text.length, "and @Bo")
+    composer.cursorPosition = composer.text.length
+    tryCompare(control("mentionList"), "count", 1)
+    composer.accepted()
+    compare(composer.text, "Hi @Alice & Sons and @Bob ")
+    composer.accepted()
+    compare(service.sentMentionMessages[0].text, "Hi @100 and @200 ")
+    compare(service.sentMentionMessages[0].mentions, ["100@lid", "200@s.whatsapp.net"])
+    compare(composer.text, "")
+    compare(panel.composerMentions, [])
+
+    composer.text = "@Al"
+    composer.cursorPosition = 3
+    tryCompare(control("mentionList"), "count", 1)
+    control("mentionChoice-0").clicked()
+    composer.text = "removed mention"
+    control("sendButton").clicked()
+    compare(service.sentMentionMessages[1].mentions, [])
+
+    composer.text = "@"
+    composer.cursorPosition = 1
+    tryCompare(control("mentionList"), "count", 2)
+    panel.chooseChat("alice@s.whatsapp.net")
+    compare(panel.composerMentionChoices, [])
+    compare(panel.composerMentions, [])
+  }
+
   function test_destroy_during_conversation_position_restore_is_safe() {
     panel.restoreConversationAfterMessages = true
     panel.scheduleConversationPositionRestore()
@@ -922,11 +998,12 @@ TestCase {
 
     panel.openImagePreview(imagePath, "7", 1600, 900)
     verify(panel.imagePreviewUrl.endsWith("/fixtures/pixel.svg?v=7"))
-    var viewer = control("imageViewerWindow")
-    compare(viewer.width, 1600)
-    compare(viewer.height, 900)
+    var viewer = control("imageViewerPopup")
+    tryCompare(viewer, "visible", true)
+    compare(viewer.width, viewer.parent.width)
+    compare(viewer.height, viewer.parent.height)
     control("imageViewerCloseButton").click()
-    compare(panel.imagePreviewUrl, "")
+    tryCompare(panel, "imagePreviewUrl", "")
 
     service.connectionState = "disconnected"
     tryCompare(panel, "paired", false)
@@ -937,22 +1014,17 @@ TestCase {
     tryCompare(panel, "paired", true)
   }
 
-  function test_image_viewer_size_fits_screen() {
+  function test_image_viewer_popup_fits_panel() {
     panel.open("{}")
-    var fits = panel.imageViewerSize(1600, 900)
-    compare(fits.width, 1600)
-    compare(fits.height, 900)
-    var fallback = panel.imageViewerSize(0, 0)
-    compare(fallback.width, 480)
-    compare(fallback.height, 360)
-    var tiny = panel.imageViewerSize(32, 32)
-    compare(tiny.width, 320)
-    compare(tiny.height, 320)
-    var huge = panel.imageViewerSize(5120, 3840)
-    verify(huge.width <= 1792)
-    verify(huge.height <= 952)
-    verify(Math.abs(huge.width / huge.height - 4 / 3) < 0.01)
-    verify(1792 - huge.width <= 1 || 952 - huge.height <= 1)
+    panel.openImagePreview(fixturePath("pixel.svg"), "1")
+    var viewer = control("imageViewerPopup")
+    tryCompare(viewer, "visible", true)
+    compare(viewer.width, viewer.parent.width)
+    compare(viewer.height, viewer.parent.height)
+    compare(viewer.modal, true)
+    panel.closeImagePreview()
+    tryCompare(viewer, "visible", false)
+    tryCompare(panel, "imagePreviewUrl", "")
   }
 
   function test_image_caption_sits_below_preview() {

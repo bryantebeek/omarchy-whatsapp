@@ -143,6 +143,7 @@ fn command_for_action(action: Action) -> Result<Command> {
             limit,
         },
         Action::Send { chat, text } => Command::SendMessage {
+            mentions: Vec::new(),
             chat_jid: chat,
             text,
             delivery_id: format!(
@@ -547,7 +548,7 @@ mod tests {
         })
         .unwrap();
         assert!(
-            matches!(send, Command::SendMessage { chat_jid, text, delivery_id }
+            matches!(send, Command::SendMessage { chat_jid, text, delivery_id, .. }
             if chat_jid == "c" && text == "hello" && delivery_id.starts_with("ctl-"))
         );
         let poll = command_for_action(Action::PollCreate {

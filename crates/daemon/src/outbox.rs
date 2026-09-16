@@ -74,7 +74,7 @@ async fn send_claimed_text(
     let result = transport
         .send_message(
             &jid,
-            wa::Message::text(pending.text.clone()),
+            crate::text_outbox::message(pending.text.clone(), pending.mentions),
             SendOptions::default().with_message_id(pending.message_id),
         )
         .await?;
@@ -439,13 +439,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mentions_survive_restart_and_retry_then_reach_the_wire() {
+        let directory = tempfile::tempdir().unwrap();
+        let mentions = vec!["100@lid".into(), "200@s.whatsapp.net".into()];
+        {
+            let shared = test_shared(&directory);
+            shared
+                .database
+                .enqueue_text_message(
+                    "mention-1",
+                    "123@g.us",
+                    "Hi @100 @200",
+                    "MENTION-1",
+                    10,
+                    &mentions,
+                )
+                .unwrap();
+            assert!(
+                shared
+                    .database
+                    .enqueue_text_message(
+                        "mention-1",
+                        "123@g.us",
+                        "Hi @100 @200",
+                        "MENTION-1",
+                        10,
+                        &[]
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                shared
+                    .database
+                    .claim_text_message()
+                    .unwrap()
+                    .unwrap()
+                    .mentions,
+                mentions
+            );
+        }
+        let shared = Arc::new(test_shared(&directory));
+        let fake = Arc::new(FakeTransport::new().failing(CallKind::SendMessage, "offline"));
+        assert!(
+            deliver_pending_text(&shared, &scripted(&fake))
+                .await
+                .unwrap()
+        );
+        shared.database.retry_text_message("mention-1").unwrap();
+        let fake = Arc::new(FakeTransport::new());
+        assert!(
+            deliver_pending_text(&shared, &scripted(&fake))
+                .await
+                .unwrap()
+        );
+        let calls = fake.calls_of(CallKind::SendMessage);
+        let Call::SendMessage {
+            message,
+            message_id,
+            ..
+        } = &calls[0]
+        else {
+            panic!("expected send")
+        };
+        assert_eq!(message_id.as_deref(), Some("MENTION-1"));
+        assert_eq!(
+            message.extended_text_message.context_info.mentioned_jid,
+            mentions
+        );
+        assert_eq!(
+            message.extended_text_message.text.as_deref(),
+            Some("Hi @100 @200")
+        );
+        assert!(shared.database.text_outbox().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_delivered_text_completes_its_row_and_publishes_the_stored_message() {
         let directory = tempfile::tempdir().unwrap();
         let shared = Arc::new(test_shared(&directory));
         let chat = "31600000000@s.whatsapp.net";
         shared
             .database
-            .enqueue_text_message("delivery-1", chat, "hello", "MSG-1", 10)
+            .enqueue_text_message("delivery-1", chat, "hello", "MSG-1", 10, &[])
             .unwrap();
         let fake = Arc::new(FakeTransport::new());
         let transport = scripted(&fake);
@@ -495,7 +570,7 @@ mod tests {
         let canonical = "31612345678@s.whatsapp.net";
         shared
             .database
-            .enqueue_text_message("delivery-1", alias, "hello", "MSG-1", 10)
+            .enqueue_text_message("delivery-1", alias, "hello", "MSG-1", 10, &[])
             .unwrap();
         let fake = Arc::new(FakeTransport::new().with_lid_pn_entry(
             alias,
@@ -531,7 +606,7 @@ mod tests {
             .unwrap();
         shared
             .database
-            .enqueue_text_message("delivery-2", "1@s.whatsapp.net", "again", "MSG-2", 11)
+            .enqueue_text_message("delivery-2", "1@s.whatsapp.net", "again", "MSG-2", 11, &[])
             .unwrap();
         assert!(deliver_pending_text(&shared, &transport).await.unwrap());
         assert_eq!(
@@ -555,7 +630,7 @@ mod tests {
             .unwrap();
         shared
             .database
-            .enqueue_text_message("delivery-1", chat, "hello", "MSG-1", 10)
+            .enqueue_text_message("delivery-1", chat, "hello", "MSG-1", 10, &[])
             .unwrap();
         let fake = Arc::new(FakeTransport::new());
         // No chat row exists yet, so only the address book can name this chat.
@@ -589,6 +664,7 @@ mod tests {
                 "hello",
                 "MSG-1",
                 10,
+                &[],
             )
             .unwrap();
         let fake =
@@ -623,7 +699,7 @@ mod tests {
         let shared = Arc::new(test_shared(&directory));
         shared
             .database
-            .enqueue_text_message("delivery-1", "not a jid", "hello", "MSG-1", 10)
+            .enqueue_text_message("delivery-1", "not a jid", "hello", "MSG-1", 10, &[])
             .unwrap();
         let fake = Arc::new(FakeTransport::new());
 
@@ -830,7 +906,7 @@ mod tests {
         let chat = "31600000000@s.whatsapp.net";
         shared
             .database
-            .enqueue_text_message("delivery-1", chat, "hello", "MSG-1", 10)
+            .enqueue_text_message("delivery-1", chat, "hello", "MSG-1", 10, &[])
             .unwrap();
         shared
             .database
@@ -891,7 +967,7 @@ mod tests {
         *shared.client.write().await = Some(scripted(&fake));
         shared
             .database
-            .enqueue_text_message("delivery-1", chat, "hello", "MSG-1", 10)
+            .enqueue_text_message("delivery-1", chat, "hello", "MSG-1", 10, &[])
             .unwrap();
         shared
             .database

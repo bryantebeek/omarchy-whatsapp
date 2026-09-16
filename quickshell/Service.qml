@@ -33,7 +33,7 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
-  readonly property int protocolVersion: 30
+  readonly property int protocolVersion: 31
   readonly property int requestTimeoutMs: 135000
   readonly property int avatarRequestIntervalMs: 60000
 
@@ -546,17 +546,19 @@ Item {
     stagedImage = null
   }
 
-  function sendImageMessage(caption) {
+  function sendImageMessage(caption, selections) {
     var body = String(caption || "")
     if (!selectedChatJid || !stagedImage || !stagedImage.path
         || imageSendRequestId > 0) return false
     nextDeliverySerial++
     var deliveryId = "img-" + String(Date.now()) + "-"
       + String(nextDeliverySerial)
+    var composed = Model.composeMentions(body, selections)
     imageSendRequestId = send("send_image", {
       chat_jid: selectedChatJid,
       path: String(stagedImage.path),
-      caption: body,
+      caption: composed.text,
+      mentions: composed.mentions,
       delivery_id: deliveryId
     })
     if (!imageSendRequestId) {
@@ -1185,14 +1187,16 @@ Item {
     updateActiveChat()
   }
 
-  function sendMessage(text) {
+  function sendMessage(text, selections) {
     var body = String(text || "")
     if (!selectedChatJid || !body.trim()) return false
     nextDeliverySerial++
     var deliveryId = "qml-" + String(Date.now()) + "-" + String(nextDeliverySerial)
+    var composed = Model.composeMentions(body, selections)
     var requestId = send("send_message", {
       chat_jid: selectedChatJid,
-      text: body,
+      text: composed.text,
+      mentions: composed.mentions,
       delivery_id: deliveryId
     })
     if (!requestId) return false

@@ -18,7 +18,7 @@ const CHAT_NAME_ADDRESS_BOOK: i64 = 40;
 const READ_BOUNDARY_IDS_CAP: usize = 256;
 // The last step of the ordered migration ladder in `Database::migrate`. Every
 // opened database ends on this `user_version`.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Clone, Copy)]
 enum ChatSetting {
@@ -620,6 +620,7 @@ pub struct StoredPoll {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingTextMessage {
+    pub mentions: Vec<String>,
     pub delivery_id: String,
     pub chat_jid: String,
     pub text: String,
@@ -839,6 +840,14 @@ impl Database {
             Self::migrate_chat_names(transaction, path)
         })?;
         run_migration(connection, &mut version, 7, migrate_control_bubbles)?;
+        run_migration(connection, &mut version, 8, |transaction| {
+            ensure_column(
+                transaction,
+                "text_outbox",
+                "mentions",
+                "mentions TEXT NOT NULL DEFAULT '[]'",
+            )
+        })?;
         Ok(())
     }
 
@@ -985,25 +994,34 @@ impl Database {
         text: &str,
         message_id: &str,
         created_at: i64,
+        mentions: &[String],
     ) -> Result<bool> {
+        let mentions = serde_json::to_string(mentions)?;
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
         let existing = transaction
             .query_row(
-                "SELECT chat_jid, text, message_id FROM text_outbox WHERE delivery_id = ?1",
+                "SELECT chat_jid, text, message_id, mentions FROM text_outbox WHERE delivery_id = ?1",
                 [delivery_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .optional()?;
         if let Some(existing) = existing {
             anyhow::ensure!(
-                existing == (chat_jid.to_owned(), text.to_owned(), message_id.to_owned()),
+                existing
+                    == (
+                        chat_jid.to_owned(),
+                        text.to_owned(),
+                        message_id.to_owned(),
+                        mentions.clone()
+                    ),
                 "delivery ID is already assigned to another message"
             );
             transaction.commit()?;
@@ -1011,9 +1029,16 @@ impl Database {
         }
         transaction.execute(
             "INSERT INTO text_outbox
-             (delivery_id, chat_jid, text, message_id, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
-            params![delivery_id, chat_jid, text, message_id, created_at],
+             (delivery_id, chat_jid, text, message_id, status, created_at, mentions)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+            params![
+                delivery_id,
+                chat_jid,
+                text,
+                message_id,
+                created_at,
+                mentions
+            ],
         )?;
         transaction.execute(
             "DELETE FROM text_outbox WHERE delivery_id IN (
@@ -1056,7 +1081,7 @@ impl Database {
         let transaction = connection.transaction()?;
         let pending = transaction
             .query_row(
-                "SELECT delivery_id, chat_jid, text, message_id
+                "SELECT delivery_id, chat_jid, text, message_id, mentions
                  FROM text_outbox WHERE status = 0
                  ORDER BY created_at, delivery_id LIMIT 1",
                 [],
@@ -1066,6 +1091,15 @@ impl Database {
                         chat_jid: row.get(1)?,
                         text: row.get(2)?,
                         message_id: row.get(3)?,
+                        mentions: serde_json::from_str(&row.get::<_, String>(4)?).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    4,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            },
+                        )?,
                     })
                 },
             )
@@ -5577,22 +5611,58 @@ mod tests {
     }
 
     #[test]
+    fn legacy_outbox_mentions_migrate_and_corrupt_metadata_is_not_sent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        {
+            let database = Database::open(&path).unwrap();
+            database
+                .enqueue_text_message("old", "123@g.us", "hello", "MSG", 1, &[])
+                .unwrap();
+            database
+                .execute_test_sql(
+                    "ALTER TABLE text_outbox DROP COLUMN mentions; PRAGMA user_version = 7;",
+                )
+                .unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        assert!(
+            database
+                .claim_text_message()
+                .unwrap()
+                .unwrap()
+                .mentions
+                .is_empty()
+        );
+        database.fail_text_message("old", "retry").unwrap();
+        database.retry_text_message("old").unwrap();
+        database
+            .execute_test_sql("UPDATE text_outbox SET mentions = 'invalid'")
+            .unwrap();
+        assert!(database.claim_text_message().is_err());
+        assert_eq!(
+            database.text_outbox().unwrap()[0].status,
+            TextOutboxStatus::Queued
+        );
+    }
+
+    #[test]
     fn text_outbox_has_stable_accept_claim_failure_retry_and_finish_transitions() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::open(&directory.path().join("history.db")).unwrap();
         assert!(
             database
-                .enqueue_text_message("delivery", "chat", "hello", "message", 10)
+                .enqueue_text_message("delivery", "chat", "hello", "message", 10, &[])
                 .unwrap()
         );
         assert!(
             !database
-                .enqueue_text_message("delivery", "chat", "hello", "message", 10)
+                .enqueue_text_message("delivery", "chat", "hello", "message", 10, &[])
                 .unwrap()
         );
         assert!(
             database
-                .enqueue_text_message("delivery", "other", "hello", "message", 10)
+                .enqueue_text_message("delivery", "other", "hello", "message", 10, &[])
                 .is_err()
         );
         assert_eq!(
@@ -5603,6 +5673,7 @@ mod tests {
         assert_eq!(
             pending,
             PendingTextMessage {
+                mentions: Vec::new(),
                 delivery_id: "delivery".into(),
                 chat_jid: "chat".into(),
                 text: "hello".into(),
@@ -5629,7 +5700,7 @@ mod tests {
         assert!(!database.complete_text_message("delivery").unwrap());
 
         database
-            .enqueue_text_message("discard", "chat", "bye", "message-2", 11)
+            .enqueue_text_message("discard", "chat", "bye", "message-2", 11, &[])
             .unwrap();
         assert!(database.discard_text_message("discard").unwrap());
         assert!(!database.discard_text_message("discard").unwrap());
@@ -6204,7 +6275,7 @@ mod tests {
         {
             let database = Database::open(&path).unwrap();
             database
-                .enqueue_text_message("delivery", "chat", "hello", "message", 10)
+                .enqueue_text_message("delivery", "chat", "hello", "message", 10, &[])
                 .unwrap();
             database.claim_text_message().unwrap().unwrap();
         }

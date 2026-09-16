@@ -1,4 +1,5 @@
 import QtQuick
+import "../../../quickshell/Model.js" as Model
 
 QtObject {
   id: root
@@ -47,6 +48,7 @@ QtObject {
   property var avatarUrls: ({})
   property var calls: []
   property var sentMessages: []
+  property var sentMentionMessages: []
   property var sentVoiceMessages: []
   property var discardedVoiceRecordings: []
   property var pinnedChats: []
@@ -223,10 +225,11 @@ QtObject {
 
   function setUnreadOnly(value) { unreadOnly = value === true }
 
-  function sendMessage(text) {
+  function sendMessage(text, selections) {
     var body = String(text || "")
     if (!selectedChatJid || !body.trim()) return false
     sentMessages = sentMessages.concat([body])
+    sentMentionMessages = sentMentionMessages.concat([Model.composeMentions(body, selections)])
     messageSentSerial++
     textMessageAccepted(
       "fixture-" + String(messageSentSerial), selectedChatJid, body)

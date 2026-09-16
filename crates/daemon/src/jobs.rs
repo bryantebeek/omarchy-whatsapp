@@ -122,6 +122,7 @@ mod tests {
                 path: "/cache/paste-1.png".into(),
                 caption: String::new(),
                 delivery_id: "img-1".into(),
+                mentions: Vec::new(),
             }),
             Duration::from_secs(120)
         );
@@ -156,6 +157,7 @@ mod tests {
                     chat_jid: "chat".into(),
                     text: "x".into(),
                     delivery_id: "d".into(),
+                    mentions: Vec::new(),
                 },
                 "chat:chat",
             ),
@@ -165,6 +167,7 @@ mod tests {
                     path: "/cache/paste-1.png".into(),
                     caption: String::new(),
                     delivery_id: "img-1".into(),
+                    mentions: Vec::new(),
                 },
                 "chat:chat",
             ),

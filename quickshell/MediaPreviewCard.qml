@@ -50,7 +50,7 @@ Item {
     if (!panel) return
     if (isVideo) panel.openVideoPreview(mediaPath, isGif)
     else if (service && media) panel.openImagePreview(mediaPath,
-      service.messageMediaRevision(message), media.width, media.height)
+      service.messageMediaRevision(message))
   }
 
   visible: media && (media.kind === "image" || media.kind === "video")

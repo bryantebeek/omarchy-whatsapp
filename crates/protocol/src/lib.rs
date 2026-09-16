@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 30;
+pub const PROTOCOL_VERSION: u16 = 31;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -276,6 +276,8 @@ pub enum Command {
         text: String,
         /// Stable client-generated identity used for durable, idempotent delivery.
         delivery_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<String>,
     },
     SendVoiceMessage {
         chat_jid: String,
@@ -288,6 +290,8 @@ pub enum Command {
         caption: String,
         /// Stable client-generated identity used for idempotent delivery.
         delivery_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<String>,
     },
     DiscardVoiceRecording {
         recording_id: String,
@@ -566,10 +570,40 @@ mod tests {
                 chat_jid: "31612345678@s.whatsapp.net".into(),
                 text: "hello".into(),
                 delivery_id: "synthetic-7".into(),
+                mentions: Vec::new(),
             },
         );
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn mention_commands_accept_legacy_text_and_round_trip_recipients() {
+        let legacy: Command = serde_json::from_str(
+            r#"{"command":"send_message","chat_jid":"123@g.us","text":"hi","delivery_id":"old"}"#,
+        )
+        .unwrap();
+        assert!(matches!(legacy, Command::SendMessage { mentions, .. } if mentions.is_empty()));
+        for command in [
+            Command::SendMessage {
+                chat_jid: "123@g.us".into(),
+                text: "Hi @200".into(),
+                delivery_id: "text".into(),
+                mentions: vec!["200@lid".into()],
+            },
+            Command::SendImage {
+                chat_jid: "123@g.us".into(),
+                path: "/synthetic/image.png".into(),
+                caption: "Hi @200".into(),
+                delivery_id: "image".into(),
+                mentions: vec!["200@lid".into()],
+            },
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Command>(&serde_json::to_string(&command).unwrap()).unwrap(),
+                command
+            );
+        }
     }
 
     #[test]
@@ -612,6 +646,7 @@ mod tests {
                 path: "/cache/paste-1.png".into(),
                 caption: "look".into(),
                 delivery_id: "img-9".into(),
+                mentions: Vec::new(),
             },
         ] {
             let frame = ClientFrame::new(Some(9), command);
@@ -627,6 +662,7 @@ mod tests {
                 path: "/cache/paste-1.png".into(),
                 caption: String::new(),
                 delivery_id: "img-9".into(),
+                mentions: Vec::new(),
             },
         ))
         .unwrap();

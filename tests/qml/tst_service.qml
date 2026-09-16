@@ -858,6 +858,27 @@ TestCase {
     verify(sentFrames().length > 0)
   }
 
+  function test_mentions_preserve_draft_until_acknowledged() {
+    service.selectedChatJid = "group@g.us"
+    var selections = [{ label: "@Bob", jid: "200@lid" }]
+    compare(service.sendMessage("Hi @Bob", selections), true)
+    var request = lastFrame()
+    compare(request.text, "Hi @200")
+    compare(request.mentions, ["200@lid"])
+    service.handleLine(JSON.stringify({ id: request.id + 1000, event: "text_accepted", delivery_id: "stale" }))
+    compare(textAcceptedCount, 0)
+    service.handleLine(JSON.stringify({ id: request.id, event: "text_accepted", delivery_id: request.delivery_id }))
+    compare(acceptedText, "Hi @Bob")
+    compare(textAcceptedCount, 1)
+
+    service.stagedImage = { path: "/synthetic/image.png" }
+    compare(service.sendImageMessage("Photo for @Bob", selections), true)
+    request = lastFrame()
+    compare(request.caption, "Photo for @200")
+    compare(request.mentions, ["200@lid"])
+    compare(service.imageSendCaption, "Photo for @Bob")
+  }
+
   function test_text_message_is_only_complete_after_durable_acceptance() {
     service.selectedChatJid = "chat"
     compare(service.sendMessage("keep this draft"), true)

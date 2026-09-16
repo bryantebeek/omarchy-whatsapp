@@ -44,6 +44,40 @@ TestCase {
     failOnWarning(/.*/)
   }
 
+  function test_mention_picker_requires_current_group_metadata() {
+    var service = createTemporaryObject(serviceComponent, testCase)
+    service.chats = [{ jid: "123@g.us", name: "Group", is_group: true }]
+    service.selectedChatJid = "123@g.us"
+    service.groupParticipants = [{ jid: "100@lid", name: "Alice" }]
+    var panel = createTemporaryObject(panelComponent, testCase, { service: service })
+    panel.open("{}")
+    var composer = findChild(panel, "composer")
+    verify(composer !== null)
+    composer.text = "@Al"
+    composer.cursorPosition = 3
+    compare(panel.composerMentionChoices, [])
+    service.groupParticipantsChatJid = "123@g.us"
+    compare(panel.composerMentionChoices.length, 1)
+    var popover = findChild(panel, "mentionPopover")
+    var list = findChild(panel, "mentionList")
+    verify(popover !== null)
+    verify(popover.color !== panel.background)
+    compare(popover.color.a, 1)
+    compare(list.anchors.margins, popover.border.width)
+    tryVerify(function() { return list.itemAtIndex(0) !== null })
+    var choice = list.itemAtIndex(0)
+    verify(choice.background.color.a > 0)
+    choice.highlighted = false
+    compare(choice.background.color.a, 0)
+    panel.mentionPickerDismissed = true
+    compare(panel.composerMentionChoices, [])
+    composer.text = "@Ali"
+    composer.cursorPosition = 4
+    compare(panel.composerMentionChoices.length, 1)
+    panel.insertComposerMention(null)
+    compare(composer.text, "@Ali")
+  }
+
   function test_panel_loads() {
     var service = createTemporaryObject(serviceComponent, testCase)
     service.chats = [{ jid: "group@g.us", name: "Test Group", is_group: true }]
@@ -458,8 +492,8 @@ TestCase {
       openVideoPreview: function (path, isGif) {
         opened.push({ kind: "video", path: path, isGif: isGif })
       },
-      openImagePreview: function (path, revision, width, height) {
-        opened.push({ kind: "image", path: path, revision: revision, width: width, height: height })
+      openImagePreview: function (path, revision) {
+        opened.push({ kind: "image", path: path, revision: revision })
       }
     }
     var card = createTemporaryObject(mediaPreviewCardComponent, testCase, {
@@ -492,8 +526,6 @@ TestCase {
     compare(opened[1].kind, "image")
     compare(opened[1].path, "/synthetic/media/clip.mp4")
     compare(opened[1].revision, "0-0")
-    compare(opened[1].width, 16)
-    compare(opened[1].height, 9)
   }
 
   function test_album_mosaic_layouts_two_three_and_four_tiles() {
@@ -564,8 +596,8 @@ TestCase {
       openVideoPreview: function (path, isGif) {
         opened.push({ kind: "video", path: path, isGif: isGif })
       },
-      openImagePreview: function (path, revision, width, height) {
-        opened.push({ kind: "image", path: path, width: width, height: height })
+      openImagePreview: function (path, revision) {
+        opened.push({ kind: "image", path: path, revision: revision })
       },
       downloadMedia: function (message) {
         downloads.push(message)
@@ -578,9 +610,7 @@ TestCase {
           kind: "image",
           path: "/synthetic/media/photo.jpg",
           thumbnail_path: "/synthetic/media/thumb.jpg",
-          downloaded: true,
-          width: 800,
-          height: 600
+          downloaded: true
         }
       },
       {
@@ -633,8 +663,6 @@ TestCase {
     compare(opened.length, 2)
     compare(opened[1].kind, "image")
     compare(opened[1].path, "/synthetic/media/photo.jpg")
-    compare(opened[1].width, 800)
-    compare(opened[1].height, 600)
     mosaic.openTile(members[2])
     compare(downloads.length, 2)
     compare(downloads[1].id, "album-tile-pending")

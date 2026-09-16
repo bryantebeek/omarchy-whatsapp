@@ -213,9 +213,9 @@ function contactMention(phoneNumber, contacts) {
   if (!digits || !Array.isArray(contacts)) return null
   for (var i = 0; i < contacts.length; i++) {
     var contact = contacts[i] || {}
-    if (contact.is_group === true || contact.is_me === true) continue
+    if (contact.is_group === true) continue
     var jid = String(contact.jid || "").trim()
-    var name = String(contact.name || "").trim()
+    var name = contact.is_me === true ? "You" : String(contact.name || "").trim()
     if (!jid || !name || name === jid || name.indexOf("@lid") >= 0) continue
     var addresses = [jid]
     if (Array.isArray(contact.aliases)) addresses = addresses.concat(contact.aliases)
@@ -226,7 +226,7 @@ function contactMention(phoneNumber, contacts) {
       matched = address.split("@")[0].replace(/[^0-9]/g, "") === digits
     }
     if (!matched) continue
-    return { jid: jid, name: friendlyName(name, jid) }
+    return { jid: jid, name: friendlyName(name, jid), is_me: contact.is_me === true }
   }
   return null
 }
@@ -245,9 +245,11 @@ function linkifiedMessage(value, linkColor, contacts) {
       var mention = contactMention(match[0].substr(1), contacts)
       if (!mention) continue
       output += escapedMessageText(input.slice(cursor, match.index))
-      output += "<a href=\"mention:" + escapeHtml(encodeURIComponent(mention.jid))
-        + "\"><font color=\"" + escapeHtml(String(linkColor || "")) + "\">@"
-        + escapedMessageText(mention.name) + "</font></a>"
+      if (!mention.is_me)
+        output += "<a href=\"mention:" + escapeHtml(encodeURIComponent(mention.jid)) + "\">"
+      output += "<font color=\"" + escapeHtml(String(linkColor || "")) + "\">@"
+        + escapedMessageText(mention.name) + "</font>"
+      if (!mention.is_me) output += "</a>"
       cursor = pattern.lastIndex
       continue
     }
@@ -264,6 +266,62 @@ function linkifiedMessage(value, linkColor, contacts) {
   }
   output += escapedMessageText(input.slice(cursor))
   return output
+}
+
+function mentionQuery(text, cursor) {
+  var prefix = String(text || "").slice(0, Math.max(0, Number(cursor) || 0))
+  var match = /(^|[\s([{])@([^\s@]*)$/.exec(prefix)
+  return match ? { start: prefix.length - match[2].length - 1, query: match[2] } : null
+}
+
+function mentionChoices(participants, query) {
+  if (!Array.isArray(participants)) return []
+  var choices = []
+  for (var i = 0; i < participants.length; i++) {
+    var p = participants[i] || {}
+    var jid = String(p.jid || "")
+    if (p.is_me === true || !/^[0-9]+@(s\.whatsapp\.net|lid)$/.test(jid)) continue
+    var name = friendlyName(p.name, jid)
+    var duplicate = participants.some(function(other) {
+      return other && other.jid !== jid && friendlyName(other.name, other.jid) === name
+    })
+    var label = "@" + name + (duplicate ? " (" + jid.split("@")[0] + ")" : "")
+    if ((name + " " + jid).toLowerCase().indexOf(String(query || "").toLowerCase()) >= 0)
+      choices.push({ jid: jid, label: label })
+  }
+  return choices
+}
+
+function composeMentions(text, selections) {
+  var input = String(text || "")
+  var choices = (Array.isArray(selections) ? selections : []).filter(function(p) {
+    return p && typeof p.label === "string" && p.label.length > 1
+      && p.label.charAt(0) === "@" && /^[0-9]+@(s\.whatsapp\.net|lid)$/.test(String(p.jid || ""))
+  }).sort(function(a, b) { return b.label.length - a.label.length })
+  var output = ""
+  var mentions = []
+  for (var i = 0; i < input.length;) {
+    var selected = null
+    if (input.charAt(i) === "@" && (i === 0 || /[\s([{]/.test(input.charAt(i - 1)))) {
+      for (var j = 0; j < choices.length; j++) {
+        var p = choices[j]
+        var end = i + p.label.length
+        if (input.slice(i, end) === p.label
+            && (end === input.length || /[\s.,!?;:)\]}]/.test(input.charAt(end)))) {
+          selected = p
+          break
+        }
+      }
+    }
+    if (selected) {
+      output += "@" + selected.jid.split("@")[0]
+      if (mentions.indexOf(selected.jid) < 0) mentions.push(selected.jid)
+      i += selected.label.length
+    } else {
+      output += input.charAt(i++)
+    }
+  }
+  return { text: output, mentions: mentions }
 }
 
 function connectionLabel(state) {

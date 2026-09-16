@@ -277,13 +277,17 @@ TestCase {
       },
       { jid: "100000@lid", phone_number: "+31 (6) 222", name: "Bob" },
       { jid: "316333@s.whatsapp.net", name: "316333@s.whatsapp.net" },
-      { jid: "316444@s.whatsapp.net", name: "Me", is_me: true }
+      { jid: "316444@s.whatsapp.net", name: "", is_me: true,
+        aliases: ["100444@lid"] }
     ]
     compare(Model.contactMention("316111", contacts).name, "Alice")
     compare(Model.contactMention("246204789186724", contacts).name, "Alice")
     compare(Model.contactMention("+31 6 222", contacts).jid, "100000@lid")
     compare(Model.contactMention("316333", contacts), null)
-    compare(Model.contactMention("316444", contacts), null)
+    compare(Model.contactMention("316444", contacts).name, "You")
+    compare(Model.contactMention("100444", contacts).is_me, true)
+    compare(Model.linkifiedMessage("@100444", "#00ff00", contacts),
+      "<font color=\"#00ff00\">@You</font>")
     compare(Model.contactMention("999", contacts), null)
     compare(Model.contactMention("", contacts), null)
     compare(Model.contactMention("316111", null), null)
@@ -300,6 +304,40 @@ TestCase {
         + "@Alice &lt;Admin&gt;</font></a> and @999. Mail a@316111.test "
         + "<a href=\"https://example.test/@316111\"><font color=\"#00ff00\">"
         + "https://example.test/@316111</font></a>")
+  }
+
+  function test_mention_composer_helpers() {
+    compare(Model.mentionQuery("Hi @Al", 6), { start: 3, query: "Al" })
+    compare(Model.mentionQuery("@", 1), { start: 0, query: "" })
+    compare(Model.mentionQuery("mail@Alice", 10), null)
+    compare(Model.mentionQuery("https://test/@Alice", 18), null)
+    compare(Model.mentionQuery(null, null), null)
+    var participants = [
+      { jid: "100@lid", name: "Alice & Sons" },
+      { jid: "200@s.whatsapp.net", name: "Bob" },
+      { jid: "300@lid", name: "Bob" },
+      { jid: "400@lid", name: "Me", is_me: true },
+      null, { jid: "group@g.us", name: "Group" }
+    ]
+    var choices = Model.mentionChoices(participants, "")
+    compare(choices.length, 3)
+    compare(choices[0].label, "@Alice & Sons")
+    compare(choices[1].label, "@Bob (200)")
+    compare(choices[2].label, "@Bob (300)")
+    compare(Model.mentionChoices(participants, "aLiCe").length, 1)
+    compare(Model.mentionChoices(participants, "200").length, 1)
+    compare(Model.mentionChoices(participants, "missing").length, 0)
+    compare(Model.mentionChoices(null, ""), [])
+    compare(Model.composeMentions("Hi @Alice & Sons, @Bob (200)! @Alice & Sons", choices), {
+      text: "Hi @100, @200! @100", mentions: ["100@lid", "200@s.whatsapp.net"]
+    })
+    compare(Model.composeMentions("@Alice & SonsExtra mail@Alice & Sons https://test/@Alice & Sons", choices).mentions, [])
+    compare(Model.composeMentions("edited away", choices), { text: "edited away", mentions: [] })
+    compare(Model.composeMentions(null, [null, {}, { label: "@Bad", jid: "group@g.us" }]), { text: "", mentions: [] })
+    compare(Model.composeMentions("@Bob (300)", null).text, "@Bob (300)")
+    compare(Model.composeMentions("@Alice & Sons", [
+      { jid: "200@lid", label: "@Alice" }, choices[0]
+    ]).text, "@100")
   }
 
   function test_connectionLabel_data() {

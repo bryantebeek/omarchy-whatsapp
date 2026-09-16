@@ -20,6 +20,7 @@ test_home="$test_dir/home"
 shim_dir="$test_dir/bin"
 systemctl_log="$test_dir/systemctl.log"
 mise_log="$test_dir/mise.log"
+desktop_log="$test_dir/desktop.log"
 real_install=$(command -v install)
 test_state_home="$test_dir/xdg-state"
 mkdir -p -- "$test_state_home/omarchy-whatsapp" "$shim_dir"
@@ -56,14 +57,46 @@ printf '%s\n' \
   '"$REAL_INSTALL" -m 755 "${TEST_RELEASE_DAEMON:?}" "$CARGO_TARGET_DIR/release/omarchy-whatsappd"' \
   '"$REAL_INSTALL" -m 755 "${TEST_RELEASE_CTL:?}" "$CARGO_TARGET_DIR/release/omarchy-whatsappctl"' \
   >"$shim_dir/mise"
-chmod 755 "$shim_dir/systemctl" "$shim_dir/install" "$shim_dir/mise"
+# Changing HOME does not isolate commands that talk to the running desktop.
+# Stub both entry points used by install/uninstall and the reload helper.
+cat >"$shim_dir/omarchy" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'omarchy %s\n' "$*" >>"${DESKTOP_LOG:?}"
+case "$*" in
+  'shell shell listPlugins')
+    printf '%s\n' '[{"id":"io.github.bryantebeek.whatsapp"}]' ;;
+  'plugin validate '*) [[ -f $3/manifest.json ]] ;;
+  'plugin enable io.github.bryantebeek.whatsapp' | \
+  'plugin disable io.github.bryantebeek.whatsapp' | \
+  'plugin disable io.github.bryantebeek.whatsapp-native' | \
+  'shell shell rescanPlugins' | 'shell shell ping' | 'restart shell') ;;
+  *) echo "Unexpected desktop command: $*" >&2; exit 72 ;;
+esac
+SH
+cat >"$shim_dir/qs" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'qs %s\n' "$*" >>"${DESKTOP_LOG:?}"
+[[ $# == 5 && $1 == ipc && $2 == -n && $3 == -p && $5 == show ]] || exit 73
+printf '%s\n' 'target io.github.bryantebeek.whatsapp'
+SH
+chmod 755 "$shim_dir/systemctl" "$shim_dir/install" "$shim_dir/mise" \
+  "$shim_dir/omarchy" "$shim_dir/qs"
 
 export HOME="$test_home"
 export XDG_STATE_HOME="$test_state_home"
+export XDG_CONFIG_HOME="$test_home/.config"
+export XDG_CACHE_HOME="$test_home/.cache"
+export XDG_DATA_HOME="$test_home/.local/share"
+export XDG_RUNTIME_DIR="$test_dir/runtime"
+mkdir -m 700 -- "$XDG_RUNTIME_DIR"
+unset DBUS_SESSION_BUS_ADDRESS WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE
 export PATH="$shim_dir:/usr/bin:/bin"
 export REAL_INSTALL="$real_install"
 export SYSTEMCTL_LOG="$systemctl_log"
 export MISE_LOG="$mise_log"
+export DESKTOP_LOG="$desktop_log"
 export TEST_RELEASE_DAEMON="$release_daemon"
 export TEST_RELEASE_CTL="$release_ctl"
 
@@ -127,5 +160,12 @@ assert_state_preserved
 grep -F -- '--user enable omarchy-whatsapp.service' "$systemctl_log" >/dev/null
 grep -F -- '--user restart omarchy-whatsapp.service' "$systemctl_log" >/dev/null
 grep -F -- '--user disable --now omarchy-whatsapp.service' "$systemctl_log" >/dev/null
+for command in \
+  'plugin enable io.github.bryantebeek.whatsapp' \
+  'plugin disable io.github.bryantebeek.whatsapp' \
+  'shell shell rescanPlugins' 'restart shell' 'shell shell ping'; do
+  grep -Fx "omarchy $command" "$desktop_log" >/dev/null
+done
+grep -F 'qs ipc -n -p ' "$desktop_log" >/dev/null
 
 echo "Deployment lifecycle regression test passed."

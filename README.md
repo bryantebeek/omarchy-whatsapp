@@ -82,7 +82,10 @@ live-deployment work required by this repository's quality gates.
 - [x] Record, upload, and send Ogg Opus voice notes, including recording-state
   updates, idempotent retry, crash recovery, and private local-cache retention.
 - [ ] Reply to and quote messages, including group-participant context.
-- [ ] Compose user and group mentions.
+- [x] Compose participant mentions in group text messages and image captions.
+  Type `@`, filter by name, and select a member with the mouse or arrow keys
+  and Enter/Tab. Escape dismisses the suggestions.
+- [ ] Compose group mentions.
 - [ ] Forward existing text and media messages with the correct forwarded
   metadata.
 - [ ] Edit sent messages.
