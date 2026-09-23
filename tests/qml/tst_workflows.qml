@@ -1782,4 +1782,30 @@ TestCase {
     tryCompare(popup, "opened", true)
     popup.close()
   }
+
+  function test_composer_grows_and_shift_enter_adds_newline() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var composer = control("composer")
+    var scroll = control("composerScroll")
+    var sendButton = control("sendButton")
+    var singleLine = sendButton.height
+    compare(scroll.height, singleLine)
+
+    composer.text = "one\ntwo\nthree"
+    tryVerify(function() { return scroll.height > singleLine })
+    compare(sendButton.height, singleLine)
+    composer.text = new Array(40).join("line\n")
+    tryCompare(scroll, "height", singleLine * 6)
+
+    var shiftEnter = { modifiers: Qt.ShiftModifier, accepted: true }
+    composer.handleReturn(shiftEnter)
+    compare(shiftEnter.accepted, false)
+    compare(service.sentMessages.length, 0)
+
+    composer.text = "first\nsecond"
+    composer.handleReturn({ modifiers: Qt.NoModifier, accepted: true })
+    compare(service.sentMessages.length, 1)
+    compare(service.sentMessages[0], "first\nsecond")
+    tryCompare(scroll, "height", singleLine)
+  }
 }

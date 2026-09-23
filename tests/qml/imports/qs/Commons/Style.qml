@@ -21,6 +21,7 @@ QtObject {
     property real controlGap: 6
     property real controlPaddingX: 6
     property real controlPaddingY: 4
+    property real inputPaddingY: 7
   }
   readonly property QtObject bar: QtObject { property real statusSlot: 26 }
 
@@ -29,5 +30,6 @@ QtObject {
   function hoverFillFor() { return "#222222" }
   function normalFillFor() { return "transparent" }
   function selectedFillFor() { return "#333333" }
+  function selectionFillFor() { return "#444444" }
   function normalBorderFor() { return Border.none() }
 }

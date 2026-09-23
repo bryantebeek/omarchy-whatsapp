@@ -256,6 +256,10 @@ Item {
     devicePixelRatio: root.devicePixelRatio
   }
 
+  component CrispTextArea: DevicePixelTextArea {
+    devicePixelRatio: root.devicePixelRatio
+  }
+
   function groupConversationSubtitle() {
     if (!service || !service.selectedChat
         || service.selectedChat.is_group !== true) return ""
@@ -3432,7 +3436,8 @@ Item {
                   Item {
                     id: composerRow
                     width: parent.width
-                    height: Style.space(66)
+                    height: Style.space(66) + composerScroll.height
+                      - messageComposerControls.controlHeight
                     Rectangle {
                       anchors.left: parent.left
                       anchors.right: parent.right
@@ -3492,8 +3497,10 @@ Item {
                     Row {
                       id: messageComposerControls
 
+                      // The composer grows with its text; the buttons keep
+                      // its single-line height.
                       readonly property real controlHeight:
-                        root.snapToDevicePixel(composer.implicitHeight)
+                        root.snapToDevicePixel(composer.singleLineHeight)
 
                       anchors.left: parent.left
                       anchors.right: parent.right
@@ -3505,6 +3512,7 @@ Item {
                         && !root.textOutboxEntry
                       Image {
                         id: pastedThumbnail
+                        anchors.bottom: parent.bottom
                         objectName: "pastedThumbnail"
                         visible: root.service && root.service.stagedImage !== null
                         width: messageComposerControls.controlHeight
@@ -3518,6 +3526,7 @@ Item {
                       }
                       SquareControlButton {
                         id: discardStagedButton
+                        anchors.bottom: parent.bottom
                         objectName: "discardStagedButton"
                         controlHeight: messageComposerControls.controlHeight
                         centeredIconText: "󰅖"
@@ -3528,72 +3537,82 @@ Item {
                         tooltipText: "Discard pasted image"
                         onClicked: root.service.clearStagedImage()
                       }
-                      CrispTextField {
-                        id: composer
-                        objectName: "composer"
-                        height: messageComposerControls.controlHeight
+                      QQC.ScrollView {
+                        id: composerScroll
+                        objectName: "composerScroll"
+                        anchors.bottom: parent.bottom
+                        height: root.snapToDevicePixel(Math.min(
+                          Math.max(messageComposerControls.controlHeight,
+                            composer.implicitHeight),
+                          messageComposerControls.controlHeight * 6))
                         width: parent.width - pollButton.width
                           - voiceRecordButton.width - sendButton.width
                           - parent.spacing * 3 - (root.service
                             && root.service.stagedImage
                             ? pastedThumbnail.width + discardStagedButton.width
                               + parent.spacing * 2 : 0)
-                        enabled: root.service && root.service.selectedChatJid !== ""
-                        placeholderText: root.service && root.service.stagedImage
-                          ? "Add a caption"
-                          : (enabled ? "Message" : "Select a conversation")
-                        onTextChanged: {
-                          root.mentionPickerDismissed = false
-                          if (!text) root.composerMentions = []
-                          if (root.service && typeof root.service.noteComposerActivity === "function")
-                            root.service.noteComposerActivity(text)
-                        }
-                        onCursorPositionChanged: root.mentionPickerDismissed = false
-                        onAccepted: {
-                          if (root.composerMentionChoices.length > 0)
-                            root.insertComposerMention(root.composerMentionChoices[mentionList.currentIndex])
-                          else root.submitMessage()
-                        }
-                        Keys.onPressed: function(event) {
-                          if (root.composerMentionChoices.length > 0) {
-                            if (event.key === Qt.Key_Down || event.key === Qt.Key_Up) {
-                              mentionList.currentIndex = (mentionList.currentIndex
-                                + (event.key === Qt.Key_Down ? 1 : mentionList.count - 1)) % mentionList.count
-                              event.accepted = true
-                              return
-                            }
-                            if (event.key === Qt.Key_Escape) {
-                              root.mentionPickerDismissed = true
-                              event.accepted = true
-                              return
-                            }
-                            if (event.key === Qt.Key_Tab) {
+
+                        CrispTextArea {
+                          id: composer
+                          objectName: "composer"
+                          enabled: root.service && root.service.selectedChatJid !== ""
+                          placeholderText: root.service && root.service.stagedImage
+                            ? "Add a caption"
+                            : (enabled ? "Message" : "Select a conversation")
+                          onTextChanged: {
+                            root.mentionPickerDismissed = false
+                            if (!text) root.composerMentions = []
+                            if (root.service && typeof root.service.noteComposerActivity === "function")
+                              root.service.noteComposerActivity(text)
+                          }
+                          onCursorPositionChanged: root.mentionPickerDismissed = false
+                          onAccepted: {
+                            if (root.composerMentionChoices.length > 0)
                               root.insertComposerMention(root.composerMentionChoices[mentionList.currentIndex])
+                            else root.submitMessage()
+                          }
+                          Keys.onPressed: function(event) {
+                            if (root.composerMentionChoices.length > 0) {
+                              if (event.key === Qt.Key_Down || event.key === Qt.Key_Up) {
+                                mentionList.currentIndex = (mentionList.currentIndex
+                                  + (event.key === Qt.Key_Down ? 1 : mentionList.count - 1)) % mentionList.count
+                                event.accepted = true
+                                return
+                              }
+                              if (event.key === Qt.Key_Escape) {
+                                root.mentionPickerDismissed = true
+                                event.accepted = true
+                                return
+                              }
+                              if (event.key === Qt.Key_Tab) {
+                                root.insertComposerMention(root.composerMentionChoices[mentionList.currentIndex])
+                                event.accepted = true
+                                return
+                              }
+                            }
+                            if (root.handleControlShortcut(event)) {
                               event.accepted = true
                               return
                             }
-                          }
-                          if (root.handleControlShortcut(event)) {
+                            if (event.key === Qt.Key_Left && event.modifiers === Qt.NoModifier
+                                && cursorPosition === 0 && !selectedText) {
+                              root.focusChatList()
+                              event.accepted = true
+                              return
+                            }
+                            var pasteKey = (event.modifiers & Qt.ControlModifier
+                                && event.key === Qt.Key_V)
+                              || (event.modifiers & Qt.ShiftModifier
+                                && event.key === Qt.Key_Insert)
+                            if (!pasteKey) return
+                            root.pasteImageFromClipboard()
                             event.accepted = true
-                            return
                           }
-                          if (event.key === Qt.Key_Left && event.modifiers === Qt.NoModifier
-                              && cursorPosition === 0 && !selectedText) {
-                            root.focusChatList()
-                            event.accepted = true
-                            return
-                          }
-                          var pasteKey = (event.modifiers & Qt.ControlModifier
-                              && event.key === Qt.Key_V)
-                            || (event.modifiers & Qt.ShiftModifier
-                              && event.key === Qt.Key_Insert)
-                          if (!pasteKey) return
-                          root.pasteImageFromClipboard()
-                          event.accepted = true
                         }
                       }
                       SquareControlButton {
                         id: pollButton
+                        anchors.bottom: parent.bottom
                         objectName: "pollButton"
                         controlHeight: messageComposerControls.controlHeight
                         centeredIconText: "󰘻"
@@ -3605,6 +3624,7 @@ Item {
                       }
                       SquareControlButton {
                         id: voiceRecordButton
+                        anchors.bottom: parent.bottom
                         objectName: "voiceRecordButton"
                         controlHeight: messageComposerControls.controlHeight
                         centeredIconText: "󰍬"
@@ -3618,6 +3638,7 @@ Item {
                       }
                       SquareControlButton {
                         id: sendButton
+                        anchors.bottom: parent.bottom
                         objectName: "sendButton"
                         controlHeight: messageComposerControls.controlHeight
                         centeredIconText: "󰒊"

@@ -32,6 +32,7 @@ QQC.Popup {
     ] },
     { title: "Messages", shortcuts: [
       { keys: "Enter", action: "Send the message" },
+      { keys: "Shift+Enter", action: "Start a new line" },
       { keys: "Ctrl+V", action: "Paste an image" },
       { keys: "Ctrl+↓", action: "Jump to the latest message" },
       { keys: "Tab", action: "Insert the highlighted mention" }
