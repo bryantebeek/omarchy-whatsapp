@@ -21,7 +21,9 @@ user can immediately see or exercise it.
 
 Once a change passes its checks and is deployed, commit it and push it to
 `main` without waiting to be asked, following the public-repository review
-above. Split unrelated work into separate focused commits. In the reply to the
+above. When a request or session covers several things, commit them in bits:
+one focused commit per feature, fix, or documentation change, never a single
+combined commit. In the reply to the
 user, link each commit's short SHA to GitHub so it can be opened directly, for
 example
 [`870973a`](https://github.com/bryantebeek/omarchy-whatsapp/commit/870973a).
