@@ -1712,4 +1712,18 @@ TestCase {
     tryCompare(panel.filteredChats, "length", 1)
     compare(panel.filteredChats[0].jid, "alice@s.whatsapp.net")
   }
+
+  function test_search_clear_button() {
+    panel.open("{}")
+    var search = control("chatSearch")
+    var clear = control("chatSearchClear")
+    compare(clear.enabled, false)
+    compare(search.rightPadding, search.leftPadding)
+    search.text = "team"
+    compare(clear.enabled, true)
+    compare(search.rightPadding, search.height)
+    clear.clicked(null)
+    compare(search.text, "")
+    compare(clear.enabled, false)
+  }
 }

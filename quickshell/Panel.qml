@@ -1945,9 +1945,33 @@ Item {
                         height: sidebarFilterRow.controlHeight
                         width: parent.width - unreadFilterButton.width
                           - newChatButton.width - parent.spacing * 2
+                        rightPadding: text ? height : leftPadding
                         placeholderText: "Search conversations"
                         onAccepted: if (root.filteredChats.length)
                           root.chooseChat(root.filteredChats[0].jid)
+
+                        MouseArea {
+                          objectName: "chatSearchClear"
+                          enabled: chatSearch.text !== ""
+                          visible: enabled
+                          anchors.right: parent.right
+                          width: parent.height
+                          height: parent.height
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: {
+                            chatSearch.clear()
+                            chatSearch.forceActiveFocus()
+                          }
+
+                          Text {
+                            anchors.centerIn: parent
+                            text: "󰅖"
+                            color: parent.containsMouse ? root.accent : root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.icon
+                          }
+                        }
                       }
                       SquareControlButton {
                         id: unreadFilterButton
