@@ -2503,8 +2503,21 @@ Item {
                   ListView {
                     id: messageList
                     objectName: "messageList"
+                    property real previousHeight: 0
                     width: parent.width
                     height: parent.height - conversationHeader.height - composerRow.height
+                    Component.onCompleted: previousHeight = height
+                    // Keep the bottom edge in place when the list is resized,
+                    // e.g. while the composer grows, so the latest message
+                    // stays visible instead of sliding under the composer.
+                    onHeightChanged: {
+                      var delta = previousHeight - height
+                      previousHeight = height
+                      if (!delta || !count || !root.conversationReady) return
+                      contentY = Math.max(originY - topMargin, Math.min(
+                        contentY + delta,
+                        originY + contentHeight + bottomMargin - height))
+                    }
                     clip: true
                     opacity: root.conversationReady
                       || !(root.service && root.service.selectedChatJid) ? 1 : 0

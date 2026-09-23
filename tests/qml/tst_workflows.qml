@@ -1808,4 +1808,20 @@ TestCase {
     compare(service.sentMessages[0], "first\nsecond")
     tryCompare(scroll, "height", singleLine)
   }
+
+  function test_growing_composer_keeps_latest_message_visible() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    service.loadMessages(syntheticMessages(40), "")
+    var list = control("messageList")
+    tryCompare(list, "count", 40)
+    tryVerify(function() { return panel.conversationReady && list.atYEnd })
+
+    var listHeight = list.height
+    control("composer").text = "one\ntwo\nthree\nfour"
+    tryVerify(function() { return list.height < listHeight })
+    verify(list.atYEnd)
+    control("composer").text = ""
+    tryCompare(list, "height", listHeight)
+    tryVerify(function() { return list.atYEnd })
+  }
 }
