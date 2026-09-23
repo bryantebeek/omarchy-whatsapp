@@ -1764,4 +1764,22 @@ TestCase {
     tryCompare(panel.filteredChats, "length", 0)
     compare(panel.focusFirstChatResult(), false)
   }
+
+  function test_shortcuts_overlay_opens_from_keyboard_and_menu() {
+    panel.open("{}")
+    var popup = panel.shortcutsViewer
+    compare(popup.opened, false)
+    verify(panel.handleControlShortcut({
+      key: Qt.Key_Question, modifiers: Qt.ControlModifier | Qt.ShiftModifier }))
+    tryCompare(popup, "opened", true)
+    verify(popup.sections.length > 0)
+    popup.close()
+    tryCompare(popup, "opened", false)
+
+    control("headerMoreButton").click()
+    tryCompare(panel.appMenu, "opened", true)
+    control("headerShortcutsAction").click()
+    tryCompare(popup, "opened", true)
+    popup.close()
+  }
 }

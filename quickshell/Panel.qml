@@ -45,6 +45,7 @@ Item {
   property alias appMenu: headerMenu
   property alias appMenuFirstAction: headerLicenseAction
   property alias licenseViewer: licensesPopup
+  property alias shortcutsViewer: shortcutsPopup
   property alias chatStateResyncAction: headerResyncAction
   property alias chatStateResyncConfirmation: resyncConfirmation
   readonly property bool unreadOnly: service && service.unreadOnly === true
@@ -407,6 +408,10 @@ Item {
   // shortcuts win over editing bindings such as Ctrl+U and Ctrl+K.
   function handleControlShortcut(event) {
     if (!(event.modifiers & Qt.ControlModifier)) return false
+    if (event.key === Qt.Key_Question || event.key === Qt.Key_Slash) {
+      shortcutsPopup.open()
+      return true
+    }
     if (event.key === Qt.Key_Down) {
       animateConversationViewportToBottom()
       return true
@@ -1734,6 +1739,11 @@ Item {
         parent: focusScope
         devicePixelRatio: root.devicePixelRatio
       }
+      ShortcutsPopup {
+        id: shortcutsPopup
+        parent: focusScope
+        devicePixelRatio: root.devicePixelRatio
+      }
       Rectangle { anchors.fill: parent; color: root.background }
 
       Column {
@@ -1851,6 +1861,20 @@ Item {
                     onClicked: {
                       headerMenu.close()
                       Qt.callLater(function() { licensesPopup.open() })
+                    }
+                  }
+
+                  CrispMenuButton {
+                    objectName: "headerShortcutsAction"
+                    width: parent.width
+                    menuIconText: "󰌌"
+                    menuText: "Keyboard shortcuts"
+                    foreground: Color.popups.text
+                    accent: root.accent
+                    focusable: true
+                    onClicked: {
+                      headerMenu.close()
+                      Qt.callLater(function() { shortcutsPopup.open() })
                     }
                   }
 
