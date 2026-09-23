@@ -1700,4 +1700,16 @@ TestCase {
     tryCompare(panel.filteredChats, "length", 1)
     compare(panel.filteredChats[0].jid, "alice@s.whatsapp.net")
   }
+
+  function test_search_ignores_unread_filter() {
+    service.selectedChatJid = ""
+    service.unreadOnly = true
+    tryCompare(panel.filteredChats, "length", 1)
+    control("chatSearch").text = "team"
+    tryCompare(panel.filteredChats, "length", 1)
+    compare(panel.filteredChats[0].jid, "team@g.us")
+    control("chatSearch").text = ""
+    tryCompare(panel.filteredChats, "length", 1)
+    compare(panel.filteredChats[0].jid, "alice@s.whatsapp.net")
+  }
 }

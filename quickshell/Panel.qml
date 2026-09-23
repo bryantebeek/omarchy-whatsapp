@@ -98,7 +98,7 @@ Item {
     for (var i = 0; i < source.length; i++) {
       var chat = source[i] || {}
       var isSelected = String(chat.jid || "") === selectedJid
-      if (unreadOnly && Number(chat.unread || 0) <= 0 && !isSelected) continue
+      if (!query && unreadOnly && Number(chat.unread || 0) <= 0 && !isSelected) continue
       var haystack = (Model.friendlyName(chat.name, chat.jid) + "\n"
         + String(chat.last_message || "") + "\n" + String(chat.jid || "")).toLowerCase()
       if (!query || haystack.indexOf(query) >= 0) output.push(chat)
@@ -2287,12 +2287,9 @@ Item {
                     Text {
                       anchors.centerIn: parent
                       visible: chatList.count === 0
-                      text: root.unreadOnly
-                        ? (chatSearch.text
-                          ? "No matching unread conversations"
-                          : "No unread conversations")
-                        : (chatSearch.text
-                          ? "No matching conversations" : "No conversations yet")
+                      text: chatSearch.text ? "No matching conversations"
+                        : root.unreadOnly ? "No unread conversations"
+                        : "No conversations yet"
                       color: root.muted
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
