@@ -1726,4 +1726,42 @@ TestCase {
     compare(search.text, "")
     compare(clear.enabled, false)
   }
+
+  function test_sidebar_arrow_keys_navigate_chats() {
+    panel.open("{}")
+    service.selectedChatJid = "alice@s.whatsapp.net"
+    verify(panel.handleChatListKey(Qt.Key_Down))
+    compare(service.selectedChatJid, "team@g.us")
+    verify(panel.handleChatListKey(Qt.Key_Up))
+    compare(service.selectedChatJid, "alice@s.whatsapp.net")
+    verify(panel.handleChatListKey(Qt.Key_Up))
+    compare(service.selectedChatJid, "alice@s.whatsapp.net")
+    verify(panel.handleChatListKey(Qt.Key_Right))
+    verify(!panel.handleChatListKey(Qt.Key_Left))
+    verify(!panel.handleChatListKey(Qt.Key_A))
+    compare(service.selectedChatJid, "alice@s.whatsapp.net")
+  }
+
+  function test_control_shortcuts_toggle_unread_and_search() {
+    panel.open("{}")
+    compare(panel.handleControlShortcut({ key: Qt.Key_U, modifiers: Qt.NoModifier }), false)
+    verify(panel.handleControlShortcut({ key: Qt.Key_U, modifiers: Qt.ControlModifier }))
+    compare(service.unreadOnly, true)
+    verify(panel.handleControlShortcut({ key: Qt.Key_U, modifiers: Qt.ControlModifier }))
+    compare(service.unreadOnly, false)
+    verify(panel.handleControlShortcut({ key: Qt.Key_F, modifiers: Qt.ControlModifier }))
+    verify(panel.handleControlShortcut({ key: Qt.Key_L, modifiers: Qt.ControlModifier }))
+    compare(panel.handleControlShortcut({ key: Qt.Key_A, modifiers: Qt.ControlModifier }), false)
+  }
+
+  function test_search_down_selects_first_result() {
+    panel.open("{}")
+    service.selectedChatJid = ""
+    control("chatSearch").text = "release"
+    verify(panel.focusFirstChatResult())
+    compare(service.selectedChatJid, "team@g.us")
+    control("chatSearch").text = "nobody"
+    tryCompare(panel.filteredChats, "length", 0)
+    compare(panel.focusFirstChatResult(), false)
+  }
 }

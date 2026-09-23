@@ -389,13 +389,71 @@ Item {
     else close()
   }
 
-  function chooseChat(jid) {
+  function chooseChat(jid, keepFocus) {
     if (!service) return
     service.selectChat(String(jid || ""))
     Qt.callLater(function() {
       root.revealSelectedChat()
-      composer.forceActiveFocus()
+      if (!keepFocus) composer.forceActiveFocus()
     })
+  }
+
+  function focusChatList() {
+    revealSelectedChat()
+    chatList.forceActiveFocus()
+  }
+
+  // Text fields call this before their own key handling so that panel
+  // shortcuts win over editing bindings such as Ctrl+U and Ctrl+K.
+  function handleControlShortcut(event) {
+    if (!(event.modifiers & Qt.ControlModifier)) return false
+    if (event.key === Qt.Key_Down) {
+      animateConversationViewportToBottom()
+      return true
+    }
+    if (event.key === Qt.Key_BracketLeft || event.key === Qt.Key_BracketRight)
+      return chooseRelativeChat(event.key === Qt.Key_BracketLeft ? -1 : 1)
+    if (event.key === Qt.Key_U) {
+      toggleUnreadOnly()
+      return true
+    }
+    var shortcutSlot = chatShortcutSlot(event.key)
+    if (shortcutSlot >= 0 && chooseChatShortcut(shortcutSlot)) return true
+    if (!isChatSearchShortcut(event.key)) return false
+    if (chatSearch.activeFocus) chatSearch.clear()
+    else chatSearch.forceActiveFocus()
+    return true
+  }
+
+  function toggleUnreadOnly() {
+    if (service) service.setUnreadOnly(!unreadOnly)
+    Qt.callLater(revealSelectedChat)
+  }
+
+  function focusFirstChatResult() {
+    if (!filteredChats.length) return false
+    chooseChat(filteredChats[0].jid, true)
+    chatList.forceActiveFocus()
+    return true
+  }
+
+  function selectedChatIndex() {
+    var selectedJid = service ? String(service.selectedChatJid || "") : ""
+    for (var i = 0; i < filteredChats.length; i++)
+      if (String(filteredChats[i].jid || "") === selectedJid) return i
+    return -1
+  }
+
+  function handleChatListKey(key) {
+    if (key === Qt.Key_Up && selectedChatIndex() <= 0) {
+      chatSearch.forceActiveFocus()
+      return true
+    }
+    if (key === Qt.Key_Up || key === Qt.Key_Down)
+      return chooseRelativeChat(key === Qt.Key_Up ? -1 : 1, true)
+    if (key !== Qt.Key_Right) return false
+    composer.forceActiveFocus()
+    return true
   }
 
   function mentionContactForJid(jid) {
@@ -438,6 +496,10 @@ Item {
     if (!chatList || !chatList.count) return -1
     var index = chatList.indexAt(1, chatList.contentY + 1)
     return index >= 0 ? index : 0
+  }
+
+  function isChatSearchShortcut(key) {
+    return key === Qt.Key_F || key === Qt.Key_K || key === Qt.Key_L
   }
 
   function chatShortcutSlot(key) {
@@ -486,20 +548,13 @@ Item {
     return true
   }
 
-  function chooseRelativeChat(offset) {
+  function chooseRelativeChat(offset, keepFocus) {
     if (!filteredChats.length) return false
-    var selectedIndex = -1
-    var selectedJid = service ? String(service.selectedChatJid || "") : ""
-    for (var i = 0; i < filteredChats.length; i++) {
-      if (String(filteredChats[i].jid || "") === selectedJid) {
-        selectedIndex = i
-        break
-      }
-    }
+    var selectedIndex = selectedChatIndex()
     var index = selectedIndex < 0
       ? (offset < 0 ? filteredChats.length - 1 : 0)
       : (selectedIndex + offset + filteredChats.length) % filteredChats.length
-    chooseChat(filteredChats[index].jid)
+    chooseChat(filteredChats[index].jid, keepFocus)
     return true
   }
 
@@ -1260,25 +1315,7 @@ Item {
           event.accepted = true
           return
         }
-        if (!(event.modifiers & Qt.ControlModifier)) return
-        if (event.key === Qt.Key_Down) {
-          root.animateConversationViewportToBottom()
-          event.accepted = true
-          return
-        }
-        if (event.key === Qt.Key_BracketLeft
-            || event.key === Qt.Key_BracketRight) {
-          root.chooseRelativeChat(event.key === Qt.Key_BracketLeft ? -1 : 1)
-          event.accepted = true
-          return
-        }
-        var shortcutSlot = root.chatShortcutSlot(event.key)
-        if (shortcutSlot >= 0 && root.chooseChatShortcut(shortcutSlot)) {
-          event.accepted = true
-        } else if (event.key === Qt.Key_K || event.key === Qt.Key_F) {
-          chatSearch.forceActiveFocus()
-          event.accepted = true
-        }
+        if (root.handleControlShortcut(event)) event.accepted = true
       }
 
       Keys.onReleased: function(event) {
@@ -1949,6 +1986,14 @@ Item {
                         placeholderText: "Search conversations"
                         onAccepted: if (root.filteredChats.length)
                           root.chooseChat(root.filteredChats[0].jid)
+                        Keys.onEscapePressed: root.focusChatList()
+                        Keys.onPressed: function(event) {
+                          if (root.handleControlShortcut(event)
+                              || (event.key === Qt.Key_Down
+                                && event.modifiers === Qt.NoModifier
+                                && root.focusFirstChatResult()))
+                            event.accepted = true
+                        }
 
                         MouseArea {
                           objectName: "chatSearchClear"
@@ -1982,12 +2027,9 @@ Item {
                         selected: root.unreadOnly
                         foreground: root.foreground
                         tooltipText: root.unreadOnly
-                          ? "Show all conversations" : "Show unread conversations"
-                        onClicked: {
-                          if (root.service)
-                            root.service.setUnreadOnly(!root.unreadOnly)
-                          Qt.callLater(root.revealSelectedChat)
-                        }
+                          ? "Show all conversations (Ctrl+U)"
+                          : "Show unread conversations (Ctrl+U)"
+                        onClicked: root.toggleUnreadOnly()
                       }
                       SquareControlButton {
                         id: newChatButton
@@ -2039,6 +2081,12 @@ Item {
                     reuseItems: true
                     QQC.ScrollBar.vertical: QQC.ScrollBar {}
 
+                    Keys.onPressed: function(event) {
+                      if (event.modifiers === Qt.NoModifier
+                          && root.handleChatListKey(event.key))
+                        event.accepted = true
+                    }
+
                     onDraggingChanged: {
                       if (dragging) root.clearMediaDownloadAnchor()
                     }
@@ -2077,6 +2125,8 @@ Item {
                         anchors.topMargin: Style.space(2)
                         anchors.bottomMargin: Style.space(2)
                         radius: Style.cornerRadius + Style.space(6)
+                        border.width: parent.selected && chatList.activeFocus ? 1 : 0
+                        border.color: root.accent
                         color: parent.selected
                           ? Style.selectedFillFor(root.foreground, root.accent)
                           : (rowMouse.containsMouse
@@ -3498,6 +3548,16 @@ Item {
                               event.accepted = true
                               return
                             }
+                          }
+                          if (root.handleControlShortcut(event)) {
+                            event.accepted = true
+                            return
+                          }
+                          if (event.key === Qt.Key_Left && event.modifiers === Qt.NoModifier
+                              && cursorPosition === 0 && !selectedText) {
+                            root.focusChatList()
+                            event.accepted = true
+                            return
                           }
                           var pasteKey = (event.modifiers & Qt.ControlModifier
                               && event.key === Qt.Key_V)
