@@ -17,6 +17,15 @@ the plugin is installed. Unless the user explicitly asks for a source-only
 change, do not stop after editing repository files: deploy the result so the
 user can immediately see or exercise it.
 
+## Commit and push every change
+
+Once a change passes its checks and is deployed, commit it and push it to
+`main` without waiting to be asked, following the public-repository review
+above. Split unrelated work into separate focused commits. In the reply to the
+user, link each commit's short SHA to GitHub so it can be opened directly, for
+example
+[`870973a`](https://github.com/bryantebeek/omarchy-whatsapp/commit/870973a).
+
 ## Keep the QML test suites current
 
 Treat the Qt Quick tests under `tests/qml/` as part of the production contract,
