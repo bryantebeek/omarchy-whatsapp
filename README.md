@@ -37,16 +37,21 @@ mind.
   retry or discard a failed send; mark visible conversations read; inspect
   sent, delivered, read, and played receipts (including participant detail in
   groups); and add, change, or remove emoji reactions. History uses local date
-  dividers and preserves the reader position while older or incoming messages
-  are added.
+  dividers and preserves the reader position while incoming messages are added.
+  The composer grows with multiline text; Enter sends and Shift+Enter inserts
+  a newline. Keyboard navigation and a shortcuts overlay are available.
 - **Polls and voice notes:** create single- or multiple-answer polls, see live
   vote totals, and cast or revise a vote. Record Ogg Opus voice notes and retry
   interrupted sends; received voice notes download on demand and play inline.
-- **Media:** render encrypted images and videos with in-app preview or playback,
-  voice and regular audio, documents with open/save actions, static locations
-  and final snapshots of live-location shares, and static or animated WebP stickers. Sticker downloads start when
-  their conversation loads. Lottie stickers use only their embedded static
-  preview, so sender-controlled animation JSON is not loaded into Qt's
+- **Media:** paste clipboard images, preview them, and send with optional
+  captions and participant mentions; render encrypted images and videos with
+  in-app preview or playback, voice and regular audio, documents with open/save
+  actions, static locations and final snapshots of live-location shares, and
+  static or animated WebP stickers. Sticker downloads start when
+  their conversation loads. Consecutive uncaptioned images and videos appear
+  in album mosaics, and images can open in a floating viewer. Lottie stickers
+  use only their embedded static preview, so sender-controlled animation JSON
+  is not loaded into Qt's
   in-process Lottie renderer.
 - **Presence and shell integration:** show online and last-seen presence plus
   direct and group typing/recording indicators; publish local availability and
@@ -60,17 +65,17 @@ mind.
   clearing the linked account or local history.
 
 Calls, message-content search, group administration, replies/forwarding/editing,
-and outbound attachments other than recorded voice notes are not yet
-implemented. The roadmap below separates package-backed work from app-specific
-scope.
+and outbound attachments other than clipboard images and recorded voice notes
+are not yet implemented. The roadmap below separates package-backed work from
+app-specific scope.
 
 ## Roadmap
 
 This roadmap tracks user-facing capabilities exposed by the pinned
-`whatsapp-rust` release that are not yet available end-to-end through the
-daemon, IPC protocol, and Quickshell interface. A synchronized setting or a
-text placeholder does not count as complete until the user can inspect and
-operate it in this app.
+`whatsapp-rust` revision, including completed work and capabilities still
+missing end-to-end support through the daemon, IPC protocol, and Quickshell
+interface. A synchronized setting or a text placeholder does not count as
+complete until the user can inspect and operate it in this app.
 
 The order is directional rather than a release promise. Each item also needs
 the corresponding Rust, IPC, QML, workflow, coverage, packaging, and
@@ -78,14 +83,18 @@ live-deployment work required by this repository's quality gates.
 
 ### Rich messaging
 
-- [ ] Upload and send images, videos, GIFs, documents, and regular audio.
+- [x] Paste, preview, upload, and send clipboard images with optional captions
+  and participant mentions.
+- [ ] Select image files to upload and send from the interface.
+- [ ] Upload and send videos, GIFs, documents, and regular audio.
 - [x] Record, upload, and send Ogg Opus voice notes, including recording-state
   updates, idempotent retry, crash recovery, and private local-cache retention.
 - [ ] Reply to and quote messages, including group-participant context.
 - [x] Compose participant mentions in group text messages and image captions.
   Type `@`, filter by name, and select a member with the mouse or arrow keys
   and Enter/Tab. Escape dismisses the suggestions.
-- [ ] Compose group mentions.
+- [ ] Compose whole-group mentions, distinct from the participant mentions
+  already supported in group conversations.
 - [ ] Forward existing text and media messages with the correct forwarded
   metadata.
 - [ ] Edit sent messages.
@@ -113,6 +122,8 @@ live-deployment work required by this repository's quality gates.
 
 ### Chats, history, and organization
 
+- [ ] Browse local history beyond the latest 300 messages in the panel, up to
+  the retained 1,000-message limit per chat.
 - [ ] Archive and unarchive chats.
 - [ ] Mute, timed-mute, and unmute chats.
 - [ ] Star and unstar messages, and expose a starred-message view.
@@ -320,8 +331,8 @@ only the explicit `--purge-data` option removes it.
 - Linked-device cryptographic state lives in
   `~/.local/state/omarchy-whatsapp/session.db`.
 - The UI index lives separately in `history.db` and retains at most 1,000
-  messages per chat; the panel opens the latest 300 and pages back to that
-  limit on request. Poll creation secrets and each participant's latest vote
+  messages per chat; the panel displays the latest 300 without older-message
+  pagination. Poll creation secrets and each participant's latest vote
   stay in this private database and are not exposed through shell IPC. Incoming
   work, outgoing text, and read intents are committed locally before their
   asynchronous processing completes, so reconnects or daemon restarts can
