@@ -324,6 +324,10 @@ TestCase {
     compare(control("messageDelegate-reply").showMessageBubble, true)
     compare(quote.quote.sender_name, "Bob")
     verify(quote.height > 0)
+    var replyText = control("messageText-reply")
+    tryVerify(function () {
+      return Math.abs(replyText.y - quote.y - quote.height - Style.space(7)) < 0.01
+    })
     panel.chooseChat("alice@s.whatsapp.net")
     var image = albumMessage("quoted-image")
     image.quote = { message_id: "original", sender_jid: "200@lid", sender_name: "Bob", text: "Photo?" }

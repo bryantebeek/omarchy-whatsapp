@@ -2980,7 +2980,7 @@ Item {
                             ? bubble.borderRight
                             : (bubble.stickerOnlyMedia ? 0 : Style.space(11))
                           anchors.verticalCenter: parent.verticalCenter
-                          spacing: Style.space(3)
+                          spacing: Style.space(modelData.quote ? 7 : 3)
                           Text {
                             id: senderLabel
                             visible: messageDelegate.showSenderLabel
