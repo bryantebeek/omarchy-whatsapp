@@ -105,6 +105,8 @@ Item {
   property bool launcherSyncPending: false
   property string lastError: ""
   property string lastErrorRequestId: ""
+  property string lastErrorMediaKey: ""
+  onLastErrorChanged: lastErrorMediaKey = ""
   property string chatStateResyncStatus: "idle"
   property string chatStateResyncMessage: ""
   property int chatStateResyncRequestId: 0
@@ -1109,6 +1111,7 @@ Item {
     })
     if (!requestId) return false
     var key = mediaDownloadKey(message)
+    if (lastErrorMediaKey === key) lastError = ""
     var requests = Object.assign({}, mediaDownloadRequests)
     var requestIds = Object.assign({}, mediaDownloadRequestIds)
     requests[key] = true
@@ -1553,10 +1556,17 @@ Item {
     } else if (frame.event === "media_downloaded") {
       clearMediaDownloadState(frame.chat_jid, frame.message_id)
       applyDownloadedMedia(frame)
+      if (lastErrorMediaKey === String(frame.chat_jid || "") + "\n"
+          + String(frame.message_id || "")) lastError = ""
     } else if (frame.event === "media_download_failed") {
       clearMediaDownloadState(frame.chat_jid, frame.message_id)
-      lastError = String(frame.message || "WhatsApp media download failed")
-      lastErrorRequestId = ""
+      if (frame.chat_jid && frame.message_id
+          && String(frame.chat_jid) === selectedChatJid) {
+        lastError = "WhatsApp media download failed"
+          + (frame.message ? ": " + String(frame.message) : "")
+        lastErrorRequestId = ""
+        lastErrorMediaKey = String(frame.chat_jid) + "\n" + String(frame.message_id)
+      }
     } else if (frame.event === "presence") {
       applyPresence(frame)
     } else if (frame.event === "chat_state") {
@@ -1663,6 +1673,7 @@ Item {
     if (panelFocused && panelVisible) markSelectedRead()
   }
   onSelectedChatJidChanged: {
+    if (lastErrorMediaKey) lastError = ""
     replyTarget = null
     pauseComposing()
     updateActiveChat()

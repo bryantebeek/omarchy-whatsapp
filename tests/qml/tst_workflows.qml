@@ -1067,6 +1067,20 @@ TestCase {
     tryCompare(panel, "paired", true)
   }
 
+  function test_dismiss_error_banner() {
+    panel.open("{}")
+    service.lastError = "WhatsApp media download failed: downloading WhatsApp sticker"
+    service.lastErrorRequestId = "12"
+    compare(panel.visibleError, service.lastError)
+    control("dismissErrorButton").click()
+    compare(panel.visibleError, "")
+    compare(service.lastErrorRequestId, "")
+    service.daemonSetupError = "Setup failed"
+    compare(panel.visibleError, "Setup failed")
+    control("dismissErrorButton").click()
+    compare(panel.visibleError, "")
+  }
+
   function test_image_viewer_popup_fits_panel() {
     panel.open("{}")
     panel.openImagePreview(fixturePath("pixel.svg"), "1")

@@ -4030,7 +4030,7 @@ Item {
             anchors.leftMargin: Style.space(18)
             anchors.rightMargin: Style.space(18)
             anchors.bottomMargin: Style.space(12)
-            height: errorText.implicitHeight + Style.space(16)
+            height: Math.max(errorText.implicitHeight, dismissErrorButton.height) + Style.space(16)
             radius: Style.cornerRadius
             color: Style.selectedFillFor(root.foreground, Color.urgent)
             sourceBorderSpec: Border.flat(Color.urgent,
@@ -4039,11 +4039,29 @@ Item {
               id: errorText
               anchors.fill: parent
               anchors.margins: Style.space(8)
+              anchors.rightMargin: dismissErrorButton.width + Style.space(16)
               text: root.visibleError
+              textFormat: Text.PlainText
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.Wrap
+            }
+            SquareControlButton {
+              id: dismissErrorButton
+              objectName: "dismissErrorButton"
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.rightMargin: Style.space(8)
+              centeredIconText: "󰅖"
+              tooltipText: "Dismiss error"
+              Accessible.name: "Dismiss error"
+              controlHeight: Style.space(24)
+              onClicked: {
+                root.service.daemonSetupError = ""
+                root.service.lastError = ""
+                root.service.lastErrorRequestId = ""
+              }
             }
           }
         }

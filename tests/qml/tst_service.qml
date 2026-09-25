@@ -830,7 +830,7 @@ TestCase {
       message: "WhatsApp did not return download details for this image"
     }))
     compare(service.mediaDownloading(service.messages[0]), false)
-    compare(service.lastError, "WhatsApp did not return download details for this image")
+    compare(service.lastError, "WhatsApp media download failed: WhatsApp did not return download details for this image")
     compare(service.lastErrorRequestId, "")
     service.mediaDownloadRequests = ({ "group@g.us\nm1": true })
     service.handleLine(JSON.stringify({
@@ -838,6 +838,39 @@ TestCase {
     }))
     compare(service.lastError, "WhatsApp media download failed")
 
+  }
+
+  function test_media_error_lifecycle() {
+    service.selectedChatJid = "chat"
+    var message = { chat_jid: "chat", id: "sticker", media: { kind: "sticker" } }
+    var failure = { event: "media_download_failed", chat_jid: "chat",
+      message_id: "sticker", message: "downloading WhatsApp sticker" }
+    service.handleLine(JSON.stringify(failure))
+    compare(service.lastError, "WhatsApp media download failed: downloading WhatsApp sticker")
+    verify(service.downloadMedia(message))
+    compare(service.lastError, "")
+    service.handleLine(JSON.stringify(failure))
+    service.handleLine(JSON.stringify({ event: "media_downloaded", chat_jid: "chat",
+      message_id: "other", media: {} }))
+    verify(service.lastError !== "")
+    service.handleLine(JSON.stringify({ event: "media_downloaded", chat_jid: "chat",
+      message_id: "sticker", media: {} }))
+    compare(service.lastError, "")
+    service.handleLine(JSON.stringify(failure))
+    service.selectedChatJid = "other"
+    compare(service.lastError, "")
+    service.lastError = "Unrelated error"
+    service.handleLine(JSON.stringify(failure))
+    compare(service.lastError, "Unrelated error")
+    service.selectedChatJid = "chat"
+    service.handleLine(JSON.stringify(failure))
+    service.lastError = "Send failed"
+    service.handleLine(JSON.stringify({ event: "media_downloaded", chat_jid: "chat",
+      message_id: "sticker", media: {} }))
+    service.selectedChatJid = "other"
+    compare(service.lastError, "Send failed")
+    service.handleLine(JSON.stringify({ event: "media_download_failed" }))
+    compare(service.lastError, "Send failed")
   }
 
   function test_event_sent_incoming_avatars_and_hello() {

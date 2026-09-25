@@ -9,6 +9,7 @@ QtObject {
   property string qrImageUrl: ""
   property int unreadTotal: 0
   property string lastError: ""
+  property string lastErrorRequestId: ""
   property string chatStateResyncStatus: "idle"
   property string chatStateResyncMessage: ""
   readonly property bool chatStateResyncBusy:
