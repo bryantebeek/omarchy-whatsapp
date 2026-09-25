@@ -17,6 +17,52 @@ use whatsapp_rust::prelude::*;
 use whatsapp_rust::wacore::types::message::EncMediaType;
 use whatsapp_rust::wacore_binary::JidExt;
 
+pub(crate) fn message_quote(
+    message: &wa::Message,
+) -> Option<omarchy_whatsapp_protocol::MessageQuote> {
+    let base = message.get_base_message();
+    let context = [
+        base.extended_text_message.context_info.as_option(),
+        base.image_message.context_info.as_option(),
+        base.video_message.context_info.as_option(),
+        base.ptv_message.context_info.as_option(),
+        base.audio_message.context_info.as_option(),
+        base.document_message.context_info.as_option(),
+        base.sticker_message.context_info.as_option(),
+        base.location_message.context_info.as_option(),
+        base.live_location_message.context_info.as_option(),
+        base.contact_message.context_info.as_option(),
+        base.contacts_array_message.context_info.as_option(),
+        base.poll_creation_message.context_info.as_option(),
+        base.poll_creation_message_v2.context_info.as_option(),
+        base.poll_creation_message_v3.context_info.as_option(),
+        base.group_invite_message.context_info.as_option(),
+        base.event_message.context_info.as_option(),
+    ]
+    .into_iter()
+    .flatten()
+    .next()?;
+    let message_id = context.stanza_id.as_deref().and_then(nonempty)?;
+    let sender_jid = context
+        .participant
+        .as_deref()?
+        .parse::<Jid>()
+        .ok()?
+        .to_non_ad_string();
+    let quoted = context.quoted_message.as_option()?.get_base_message();
+    let text = quoted
+        .text_content()
+        .or_else(|| quoted.get_caption())
+        .map(str::to_owned)
+        .or_else(|| media_text(quoted, ""))?;
+    Some(omarchy_whatsapp_protocol::MessageQuote {
+        message_id,
+        sender_name: sender_jid.clone(),
+        sender_jid,
+        text,
+    })
+}
+
 impl Shared {
     // Adapter from upstream protobuf contexts into the durable local model.
     pub(crate) async fn receive_message(
@@ -234,6 +280,15 @@ impl Shared {
             read_by: Vec::new(),
             media,
             reactions: Vec::new(),
+            quote: message_quote(base).map(|mut quote| {
+                quote.sender_name = self
+                    .database
+                    .contact_name(&quote.sender_jid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| quote.sender_jid.clone());
+                quote
+            }),
         };
         if !self.clock.is_current(generation) {
             return false;
@@ -873,6 +928,7 @@ mod tests {
             read_by: Vec::new(),
             media: None,
             reactions: Vec::new(),
+            quote: None,
         }
     }
 
@@ -1397,6 +1453,94 @@ mod tests {
         );
 
         assert!(shared.database.messages(CHAT, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incoming_quotes_are_decoded_persisted_and_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shared, generation, fake) = linked(&directory);
+        shared
+            .database
+            .update_contact_name("200@lid", "Bob")
+            .unwrap();
+        let context = whatsapp_rust::wacore::proto_helpers::build_quote_context(
+            "ORIGINAL",
+            "200@lid",
+            &wa::Message::text("Question"),
+        );
+        let message = wa::Message::text_with_context("Answer", context.clone());
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(message.clone()),
+                    info(CHAT, "REPLY"),
+                    wire(&fake)
+                )
+                .await
+        );
+        let stored = shared.database.messages(CHAT, 10).unwrap();
+        let quote = stored[0].quote.as_ref().unwrap();
+        assert_eq!(quote.message_id, "ORIGINAL");
+        assert_eq!(quote.sender_jid, "200@lid");
+        assert_eq!(quote.sender_name, "Bob");
+        assert_eq!(quote.text, "Question");
+        let mut unknown = context.clone();
+        unknown.participant = Some("300@lid".into());
+        assert!(
+            shared
+                .receive_message(
+                    generation,
+                    Arc::new(wa::Message::text_with_context("Other", unknown)),
+                    info(CHAT, "REPLY-2"),
+                    wire(&fake)
+                )
+                .await
+        );
+        assert!(message_quote(&wa::Message::text("plain")).is_none());
+        for malformed in [
+            wa::ContextInfo {
+                stanza_id: None,
+                ..context.clone()
+            },
+            wa::ContextInfo {
+                participant: Some("invalid".into()),
+                ..context.clone()
+            },
+            wa::ContextInfo {
+                quoted_message: MessageField::default(),
+                ..context.clone()
+            },
+        ] {
+            assert!(message_quote(&wa::Message::text_with_context("Answer", malformed)).is_none());
+        }
+        let media = wa::Message {
+            image_message: MessageField::some(wa::message::ImageMessage {
+                caption: Some("Photo".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let context =
+            whatsapp_rust::wacore::proto_helpers::build_quote_context("PHOTO", "200@lid", &media);
+        assert_eq!(
+            message_quote(&wa::Message::text_with_context("Nice", context))
+                .unwrap()
+                .text,
+            "Photo"
+        );
+        let media = wa::Message {
+            audio_message: MessageField::some(wa::message::AudioMessage::default()),
+            ..Default::default()
+        };
+        let context =
+            whatsapp_rust::wacore::proto_helpers::build_quote_context("AUDIO", "200@lid", &media);
+        assert!(
+            message_quote(&wa::Message::text_with_context("Heard", context))
+                .unwrap()
+                .text
+                .contains("Voice message")
+        );
     }
 
     #[tokio::test]

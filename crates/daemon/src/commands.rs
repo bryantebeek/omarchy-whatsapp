@@ -673,6 +673,7 @@ async fn send_voice_message(
                 voice_message: true,
             }),
             reactions: Vec::new(),
+            quote: None,
         };
         let chat_name = shared
             .database
@@ -779,6 +780,51 @@ async fn paste_image(shared: &Arc<Shared>) -> Result<ServerEvent> {
     }
 }
 
+async fn resolve_reply(
+    shared: &Shared,
+    chat: &Jid,
+    target: Option<omarchy_whatsapp_protocol::ReplyTarget>,
+) -> Result<Option<omarchy_whatsapp_protocol::MessageQuote>> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    ensure!(
+        !target.message_id.is_empty() && target.message_id.len() <= 256,
+        "invalid reply message ID"
+    );
+    let message = shared
+        .database
+        .message_by_identity(
+            &chat.to_non_ad_string(),
+            &target.message_id,
+            &target.sender_jid,
+        )?
+        .context("reply target is no longer available in this conversation")?;
+    let transport = shared.client.read().await.clone();
+    let mut sender_jid = if message.from_me {
+        let transport = transport.as_ref().context("WhatsApp is not connected")?;
+        own_poll_creator_jid(transport.as_ref(), chat)
+            .await?
+            .to_non_ad_string()
+    } else {
+        message
+            .sender_jid
+            .parse::<Jid>()
+            .context("invalid reply participant")?
+            .to_non_ad_string()
+    };
+    if let Some(transport) = transport {
+        sender_jid = crate::identity::quote_participant(transport.as_ref(), chat, sender_jid).await;
+    }
+    Ok(Some(omarchy_whatsapp_protocol::MessageQuote {
+        message_id: message.id,
+        sender_jid,
+        sender_name: message.sender_name,
+        text: message.text,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn send_image(
     shared: &Arc<Shared>,
     chat_jid: String,
@@ -786,6 +832,7 @@ async fn send_image(
     caption: String,
     delivery_id: String,
     mentions: Vec<String>,
+    reply_to: Option<omarchy_whatsapp_protocol::ReplyTarget>,
 ) -> Result<ServerEvent> {
     let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
     let mentions = text_outbox::validate_mentions(&requested, &caption, mentions)?;
@@ -807,6 +854,7 @@ async fn send_image(
     let canonical = canonical_contact_jid(shared, transport.as_ref(), &requested).await;
     let jid: Jid = canonical.parse().context("invalid canonical chat JID")?;
     let canonical_jid = jid.to_non_ad_string();
+    let quote = resolve_reply(shared, &jid, reply_to).await?;
     let message_id = text_outbox::stable_message_id(&delivery_id);
     if let Some(message) = shared.database.message_by_id(&canonical_jid, &message_id)? {
         return Ok(ServerEvent::Sent { message });
@@ -825,7 +873,12 @@ async fn send_image(
     if let Some(image) = outbound.image_message.as_option_mut() {
         image.width = Some(width);
         image.height = Some(height);
-        image.context_info.get_or_insert_default().mentioned_jid = mentions;
+        image.context_info = buffa::MessageField::some(wa::ContextInfo {
+            mentioned_jid: mentions,
+            ..quote
+                .as_ref()
+                .map_or_else(wa::ContextInfo::default, text_outbox::quote_context)
+        });
     }
     let sent = transport
         .send_message(
@@ -886,6 +939,7 @@ async fn send_image(
             height,
         }),
         reactions: Vec::new(),
+        quote,
     };
     let chat_name = shared
         .database
@@ -999,12 +1053,14 @@ pub(crate) async fn handle_command(
             text,
             delivery_id,
             mentions,
+            reply_to,
         } => {
-            let _outbox_guard = shared.text_outbox_gate.lock().await;
             let text = text_outbox::validate(&delivery_id, &text)?;
             let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
             let mentions = text_outbox::validate_mentions(&requested, &text, mentions)?;
+            let quote = resolve_reply(shared, &requested, reply_to).await?;
             let message_id = text_outbox::stable_message_id(&delivery_id);
+            let _outbox_guard = shared.text_outbox_gate.lock().await;
             shared.database.enqueue_text_message(
                 &delivery_id,
                 &requested.to_non_ad_string(),
@@ -1012,6 +1068,7 @@ pub(crate) async fn handle_command(
                 &message_id,
                 Utc::now().timestamp(),
                 &mentions,
+                quote.as_ref(),
             )?;
             broadcast_text_outbox(shared);
             shared.text_outbox_notify.notify_one();
@@ -1036,7 +1093,19 @@ pub(crate) async fn handle_command(
             caption,
             delivery_id,
             mentions,
-        } => send_image(shared, chat_jid, path, caption, delivery_id, mentions).await,
+            reply_to,
+        } => {
+            send_image(
+                shared,
+                chat_jid,
+                path,
+                caption,
+                delivery_id,
+                mentions,
+                reply_to,
+            )
+            .await
+        }
         // Listing an outbox is a snapshot of atomically written job files or a
         // single query. Taking a delivery gate here would make the panel's
         // first request wait for an in-flight upload and time out.
@@ -1129,6 +1198,7 @@ pub(crate) async fn handle_command(
                     end_timestamp: 0,
                 }),
                 reactions: Vec::new(),
+                quote: None,
             };
             let chat_name = shared
                 .database
@@ -1561,6 +1631,7 @@ mod tests {
                 text: "  ".into(),
                 delivery_id: "synthetic".into(),
                 mentions: Vec::new(),
+                reply_to: None,
             },
             &shared,
             0,
@@ -1721,6 +1792,7 @@ mod tests {
             read_by: Vec::new(),
             media,
             reactions: Vec::new(),
+            quote: None,
         }
     }
 
@@ -2185,6 +2257,189 @@ mod tests {
     // --- text outbox ------------------------------------------------------
 
     #[tokio::test]
+    async fn replies_resolve_exact_chat_and_participant_before_durable_acceptance() {
+        use omarchy_whatsapp_protocol::ReplyTarget;
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let mut original = stored_message("123@g.us", "ORIGINAL", None);
+        original.sender_jid = "200@lid".into();
+        original.text = "Question".into();
+        shared
+            .database
+            .insert_message(&original, "Group", true, false)
+            .unwrap();
+        let target = ReplyTarget {
+            message_id: original.id.clone(),
+            sender_jid: original.sender_jid.clone(),
+        };
+        for (chat, reply_to) in [
+            (
+                "123@g.us",
+                ReplyTarget {
+                    message_id: String::new(),
+                    ..target.clone()
+                },
+            ),
+            (
+                "123@g.us",
+                ReplyTarget {
+                    message_id: "x".repeat(257),
+                    ..target.clone()
+                },
+            ),
+            (
+                "123@g.us",
+                ReplyTarget {
+                    sender_jid: "300@lid".into(),
+                    ..target.clone()
+                },
+            ),
+            ("456@g.us", target.clone()),
+        ] {
+            assert!(
+                run(
+                    &shared,
+                    Command::SendMessage {
+                        chat_jid: chat.into(),
+                        text: "Reply".into(),
+                        delivery_id: "reply".into(),
+                        mentions: vec![],
+                        reply_to: Some(reply_to)
+                    }
+                )
+                .await
+                .is_err()
+            );
+        }
+        run(
+            &shared,
+            Command::SendMessage {
+                chat_jid: "123@g.us".into(),
+                text: "Reply".into(),
+                delivery_id: "reply".into(),
+                mentions: vec![],
+                reply_to: Some(target.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        let pending = shared.database.claim_text_message().unwrap().unwrap();
+        let quote = pending.quote.unwrap();
+        assert_eq!(quote.message_id, "ORIGINAL");
+        assert_eq!(quote.sender_jid, "200@lid");
+        assert_eq!(quote.sender_name, "Ada");
+        assert_eq!(quote.text, "Question");
+
+        let direct = stored_message("200@s.whatsapp.net", "DIRECT", None);
+        shared
+            .database
+            .insert_message(&direct, "Ada", false, false)
+            .unwrap();
+        let target_direct = ReplyTarget {
+            message_id: "DIRECT".into(),
+            sender_jid: "200@s.whatsapp.net".into(),
+        };
+        assert_eq!(
+            resolve_reply(
+                &shared,
+                &"200@s.whatsapp.net".parse().unwrap(),
+                Some(target_direct)
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .text,
+            "synthetic"
+        );
+        original.id = "OWN".into();
+        original.sender_jid = "me".into();
+        original.from_me = true;
+        shared
+            .database
+            .insert_message(&original, "Group", true, false)
+            .unwrap();
+        let own = ReplyTarget {
+            message_id: "OWN".into(),
+            sender_jid: "me".into(),
+        };
+        let group = "123@g.us".parse().unwrap();
+        assert!(
+            resolve_reply(&shared, &group, Some(own.clone()))
+                .await
+                .is_err()
+        );
+        let fake = Arc::new(
+            FakeTransport::new()
+                .with_pn("100@s.whatsapp.net")
+                .with_lid("100@lid"),
+        );
+        attach(&shared, &fake).await;
+        assert_eq!(
+            resolve_reply(&shared, &group, Some(own))
+                .await
+                .unwrap()
+                .unwrap()
+                .sender_jid,
+            "100@s.whatsapp.net"
+        );
+        for lid_mode in [false, true] {
+            let fake = Arc::new(
+                FakeTransport::new()
+                    .with_pn("100@s.whatsapp.net")
+                    .with_lid("100@lid")
+                    .with_group_metadata(
+                        "123@g.us",
+                        GroupMetadata {
+                            addressing_mode: if lid_mode {
+                                whatsapp_rust::wacore::types::message::AddressingMode::Lid
+                            } else {
+                                whatsapp_rust::wacore::types::message::AddressingMode::Pn
+                            },
+                            participants: vec![whatsapp_rust::GroupParticipant {
+                                jid: "200@lid".parse().unwrap(),
+                                phone_number: Some("200@s.whatsapp.net".parse().unwrap()),
+                                lid: Some("200@lid".parse().unwrap()),
+                                username: None,
+                                participant_type: whatsapp_rust::ParticipantType::Member,
+                                details: None,
+                            }],
+                            ..Default::default()
+                        },
+                    ),
+            );
+            attach(&shared, &fake).await;
+            assert_eq!(
+                resolve_reply(&shared, &group, Some(target.clone()))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sender_jid,
+                if lid_mode {
+                    "200@lid"
+                } else {
+                    "200@s.whatsapp.net"
+                }
+            );
+            let own = omarchy_whatsapp_protocol::ReplyTarget {
+                message_id: "OWN".into(),
+                sender_jid: "me".into(),
+            };
+            assert_eq!(
+                resolve_reply(&shared, &group, Some(own))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .sender_jid,
+                if lid_mode {
+                    "100@lid"
+                } else {
+                    "100@s.whatsapp.net"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn text_mentions_are_validated_before_durable_acceptance() {
         let directory = tempfile::tempdir().unwrap();
         let shared = shared_with_dirs(&directory);
@@ -2197,6 +2452,7 @@ mod tests {
                         text: text.into(),
                         delivery_id: "mention".into(),
                         mentions: vec!["200@lid".into()],
+                        reply_to: None,
                     }
                 )
                 .await
@@ -2211,6 +2467,7 @@ mod tests {
                 text: "Hi @200".into(),
                 delivery_id: "mention".into(),
                 mentions: vec!["200@lid".into()],
+                reply_to: None,
             },
         )
         .await
@@ -2242,6 +2499,7 @@ mod tests {
                     text: "hi".into(),
                     delivery_id: String::new(),
                     mentions: Vec::new(),
+                    reply_to: None,
                 }
             )
             .await
@@ -2257,6 +2515,7 @@ mod tests {
                     text: "hi".into(),
                     delivery_id: "d1".into(),
                     mentions: Vec::new(),
+                    reply_to: None,
                 }
             )
             .await
@@ -2268,6 +2527,7 @@ mod tests {
             text: "  hi  ".into(),
             delivery_id: "d1".into(),
             mentions: Vec::new(),
+            reply_to: None,
         };
         assert_eq!(run(&shared, send()).await.unwrap(), accepted);
         assert_eq!(run(&shared, send()).await.unwrap(), accepted);
@@ -2279,6 +2539,7 @@ mod tests {
                     text: "different".into(),
                     delivery_id: "d1".into(),
                     mentions: Vec::new(),
+                    reply_to: None,
                 }
             )
             .await
@@ -3631,7 +3892,31 @@ mod tests {
         let shared = shared_with_dirs(&directory);
         let fake = Arc::new(FakeTransport::new());
         attach(&shared, &fake).await;
+        let mut original = stored_message("123@g.us", "ORIGINAL", None);
+        original.sender_jid = "200@lid".into();
+        shared
+            .database
+            .insert_message(&original, "Group", true, false)
+            .unwrap();
         let staged = stage_paste(&shared, "mention.png", &pasted_png(2, 3));
+        assert!(
+            run(
+                &shared,
+                Command::SendImage {
+                    chat_jid: "123@g.us".into(),
+                    path: staged.clone(),
+                    caption: String::new(),
+                    delivery_id: "missing-reply".into(),
+                    mentions: vec![],
+                    reply_to: Some(omarchy_whatsapp_protocol::ReplyTarget {
+                        message_id: "MISSING".into(),
+                        sender_jid: "200@lid".into()
+                    }),
+                }
+            )
+            .await
+            .is_err()
+        );
         run(
             &shared,
             Command::SendImage {
@@ -3640,6 +3925,10 @@ mod tests {
                 caption: "For @200".into(),
                 delivery_id: "image-mention".into(),
                 mentions: vec!["200@lid".into()],
+                reply_to: Some(omarchy_whatsapp_protocol::ReplyTarget {
+                    message_id: "ORIGINAL".into(),
+                    sender_jid: "200@lid".into(),
+                }),
             },
         )
         .await
@@ -3648,6 +3937,22 @@ mod tests {
         let Call::SendMessage { message, .. } = &calls[0] else {
             panic!("expected send")
         };
+        assert_eq!(
+            message.image_message.context_info.stanza_id.as_deref(),
+            Some("ORIGINAL")
+        );
+        assert_eq!(
+            message.image_message.context_info.participant.as_deref(),
+            Some("200@lid")
+        );
+        assert!(
+            shared
+                .database
+                .messages("123@g.us", 10)
+                .unwrap()
+                .iter()
+                .any(|m| m.quote.is_some())
+        );
         assert_eq!(
             message.image_message.context_info.mentioned_jid,
             ["200@lid"]
@@ -3670,6 +3975,7 @@ mod tests {
                 caption: "hi".into(),
                 delivery_id: "img-1".into(),
                 mentions: Vec::new(),
+                reply_to: None,
             },
         )
         .await
@@ -3721,6 +4027,7 @@ mod tests {
                 caption: String::new(),
                 delivery_id: "img-2".into(),
                 mentions: Vec::new(),
+                reply_to: None,
             },
         )
         .await
@@ -3744,6 +4051,7 @@ mod tests {
             caption: String::new(),
             delivery_id: "img-1".into(),
             mentions: Vec::new(),
+            reply_to: None,
         };
         run(&shared, send()).await.unwrap();
         run(&shared, send()).await.unwrap();
@@ -3765,6 +4073,7 @@ mod tests {
                 caption,
                 delivery_id: delivery_id.into(),
                 mentions: Vec::new(),
+                reply_to: None,
             };
         assert!(
             run(
@@ -3851,6 +4160,7 @@ mod tests {
             caption: String::new(),
             delivery_id: "img-1".into(),
             mentions: Vec::new(),
+            reply_to: None,
         };
         assert_eq!(
             run(&shared, send()).await.unwrap_err().to_string(),
@@ -3900,6 +4210,7 @@ mod tests {
                 caption: String::new(),
                 delivery_id: "img-1".into(),
                 mentions: Vec::new(),
+                reply_to: None,
             },
         )
         .await

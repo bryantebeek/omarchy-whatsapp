@@ -281,6 +281,59 @@ TestCase {
     }
   }
 
+  function test_reply_preview_cancel_send_and_switch_chat() {
+    panel.open('{"chatJid":"team@g.us"}')
+    service.loadMessages([{ id: "quote-source", chat_jid: "team@g.us", sender_jid: "200@lid",
+      sender_name: "Bob", text: "Ready?", timestamp: 1000, from_me: false }], "")
+    var delegate = control("messageDelegate-quote-source")
+    var picker = delegate.actions
+    delegate.openReactionPicker(0, 0)
+    findChild(picker, "replyToMessageButton").clicked()
+    compare(service.replyTarget.message_id, "quote-source")
+    verify(control("replyPreview").quote !== null)
+    verify(!control("voiceRecordButton").visible)
+    compare(panel.startVoiceRecording(), false)
+    control("cancelReplyButton").clicked()
+    compare(service.replyTarget, null)
+    delegate.openReactionPicker(0, 0)
+    findChild(picker, "replyToMessageButton").clicked()
+    control("composer").text = "Yes"
+    control("sendButton").clicked()
+    compare(service.sentReplies[0].sender_jid, "200@lid")
+    compare(service.replyTarget, null)
+    service.beginReply(service.messages[0])
+    control("composer").text = "New answer"
+    service.textMessageAccepted("old", "team@g.us", "New answer")
+    compare(control("composer").text, "New answer")
+    service.pasteImage()
+    control("sendButton").clicked()
+    compare(service.sentImages.length, 1)
+    compare(service.sentReplies[1].message_id, "quote-source")
+    compare(service.replyTarget, null)
+    service.beginReply(service.messages[0])
+    panel.chooseChat("alice@s.whatsapp.net")
+    compare(service.replyTarget, null)
+  }
+
+  function test_received_quotes_render_with_group_participant() {
+    panel.open('{"chatJid":"team@g.us"}')
+    service.loadMessages([{ id: "reply", chat_jid: "team@g.us", sender_jid: "300@lid",
+      sender_name: "Alice", text: "Yes", timestamp: 1000,
+      quote: { message_id: "original", sender_jid: "200@lid", sender_name: "Bob", text: "Ready?" } }], "")
+    var quote = control("messageQuote-reply")
+    compare(control("messageDelegate-reply").showMessageBubble, true)
+    compare(quote.quote.sender_name, "Bob")
+    verify(quote.height > 0)
+    panel.chooseChat("alice@s.whatsapp.net")
+    var image = albumMessage("quoted-image")
+    image.quote = { message_id: "original", sender_jid: "200@lid", sender_name: "Bob", text: "Photo?" }
+    service.loadMessages([image, albumMessage("second-image")], "")
+    var delegate = control("messageDelegate-quoted-image")
+    compare(delegate.hasAlbumMosaic, false)
+    compare(delegate.showMessageBubble, true)
+    compare(control("messageQuote-quoted-image").quote.text, "Photo?")
+  }
+
   function test_compose_group_mentions() {
     panel.open('{"chatJid":"team@g.us"}')
     service.groupParticipantsChatJid = "team@g.us"

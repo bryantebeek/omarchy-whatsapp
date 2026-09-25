@@ -567,6 +567,7 @@ fn history_message(
         read_by: Vec::new(),
         media,
         reactions: Vec::new(),
+        quote: crate::messages::message_quote(base),
     })
 }
 
@@ -624,6 +625,37 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn history_keeps_quote_participant_and_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = whatsapp_rust::wacore::proto_helpers::build_quote_context(
+            "ORIGINAL",
+            "200@lid",
+            &wa::Message::text("Question"),
+        );
+        let wire = wa::WebMessageInfo {
+            key: MessageField::some(wa::MessageKey {
+                id: Some("REPLY".into()),
+                participant: Some("300@lid".into()),
+                ..Default::default()
+            }),
+            message: MessageField::some(wa::Message::text_with_context("Answer", context)),
+            ..Default::default()
+        };
+        let message = history_message(
+            "123@g.us",
+            "Group",
+            &wire,
+            directory.path(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let quote = message.quote.unwrap();
+        assert_eq!(quote.message_id, "ORIGINAL");
+        assert_eq!(quote.sender_jid, "200@lid");
+        assert_eq!(quote.text, "Question");
     }
 
     fn media_body(media: wa::Message) -> wa::Message {

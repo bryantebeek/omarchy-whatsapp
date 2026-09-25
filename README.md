@@ -36,7 +36,8 @@ mind.
 - **Text and interaction:** send text through a durable, idempotent outbox;
   retry or discard a failed send; mark visible conversations read; inspect
   sent, delivered, read, and played receipts (including participant detail in
-  groups); and add, change, or remove emoji reactions. History uses local date
+  groups); reply with text or a clipboard image, showing the quoted sender and
+  message; and add, change, or remove emoji reactions. History uses local date
   dividers and preserves the reader position while incoming messages are added.
   The composer grows with multiline text; Enter sends and Shift+Enter inserts
   a newline. Keyboard navigation and a shortcuts overlay are available.
@@ -64,7 +65,7 @@ mind.
   chat-state resync for unread, pinned, archived, and muted state without
   clearing the linked account or local history.
 
-Calls, message-content search, group administration, replies/forwarding/editing,
+Calls, message-content search, group administration, forwarding/editing,
 and outbound attachments other than clipboard images and recorded voice notes
 are not yet implemented. The roadmap below separates package-backed work from
 app-specific scope.
@@ -89,7 +90,11 @@ live-deployment work required by this repository's quality gates.
 - [ ] Upload and send videos, GIFs, documents, and regular audio.
 - [x] Record, upload, and send Ogg Opus voice notes, including recording-state
   updates, idempotent retry, crash recovery, and private local-cache retention.
-- [ ] Reply to and quote messages, including group-participant context.
+- [x] Reply with text or clipboard images and display quoted messages, including
+  group-participant context. Right-click a message and choose **Reply**;
+  cancel the quote with the **×** button above the composer. Text replies retain
+  their quote through outbox retries and restarts. Media quotes show their caption
+  or media-type label; recording a voice reply is not yet supported.
 - [x] Compose participant mentions in group text messages and image captions.
   Type `@`, filter by name, and select a member with the mouse or arrow keys
   and Enter/Tab. Escape dismisses the suggestions.

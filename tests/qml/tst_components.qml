@@ -20,6 +20,7 @@ TestCase {
     Whatsapp.BarWidget {}
   }
 
+  Component { id: quoteComponent; Whatsapp.QuoteCard {} }
   Component { id: serviceComponent; WorkflowService {} }
   Component { id: avatarComponent; Whatsapp.Avatar {} }
   Component { id: albumMosaicComponent; Whatsapp.AlbumMosaic {} }
@@ -76,6 +77,19 @@ TestCase {
     compare(panel.composerMentionChoices.length, 1)
     panel.insertComposerMention(null)
     compare(composer.text, "@Ali")
+  }
+
+  function test_quote_card_plain_text_and_empty_state() {
+    var card = createTemporaryObject(quoteComponent, testCase, { width: 240 })
+    verify(card !== null)
+    compare(card.implicitHeight, 0)
+    card.quote = { sender_name: "<b>Alice</b>", text: "<img src=bad> quoted & text" }
+    verify(card.implicitHeight > 0)
+    compare(card.Accessible.name, "Reply to <b>Alice</b>: <img src=bad> quoted & text")
+    card.quote = { sender_jid: "100@lid" }
+    compare(card.Accessible.name, "Reply to 100@lid: Message")
+    card.quote = null
+    compare(card.implicitHeight, 0)
   }
 
   function test_panel_loads() {

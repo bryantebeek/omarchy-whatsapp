@@ -723,6 +723,7 @@ pub(crate) mod test_support {
             read_by: Vec::new(),
             media: None,
             reactions: Vec::new(),
+            quote: None,
         }
     }
 

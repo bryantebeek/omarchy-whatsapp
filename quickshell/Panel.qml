@@ -604,6 +604,7 @@ Item {
   }
 
   function startVoiceRecording() {
+    if (service && service.replyTarget) return false
     if (voiceRecordingActive || !service
         || voiceOutboxEntry
         || typeof service.newVoiceRecording !== "function"
@@ -1205,6 +1206,7 @@ Item {
     target: root.service
     function onTextMessageAccepted(_deliveryId, chatJid, text) {
       if (root.service && root.service.selectedChatJid === String(chatJid || "")
+          && !root.service.replyTarget
           && composer.text === String(text || "")) composer.text = ""
       root.scheduleConversationScroll("bottom", "")
     }
@@ -2533,6 +2535,7 @@ Item {
 
                     delegate: Item {
                       id: messageDelegate
+                      property alias actions: reactionPicker
                       objectName: "messageDelegate-" + String(modelData.id || "")
                       required property string messageJson
                       required property int index
@@ -2580,7 +2583,7 @@ Item {
                         ? senderHeader.height + Style.space(4) : 0
                       readonly property bool showMessageBubble: !isAlbumFollower
                         && (!hasStandalonePreview && !hasAlbumMosaic
-                          || hasMediaCaption)
+                          || hasMediaCaption || !!modelData.quote)
                       readonly property string senderLabelText: modelData.from_me
                         ? "Me" : Model.friendlyName(modelData.sender_name,
                           modelData.sender_jid)
@@ -2603,7 +2606,7 @@ Item {
                         return media ? String(media.kind || "") : ""
                       }
                       function albumGroupable(message) {
-                        if (!message) return false
+                        if (!message || message.quote) return false
                         var kind = albumMediaKind(message)
                         if (kind !== "image" && kind !== "video") return false
                         if (String(message.text || "").charAt(0) !== "[")
@@ -2938,7 +2941,7 @@ Item {
                             && !(messageDelegate.hasStandalonePreview
                               || messageDelegate.hasAlbumMosaic)
                           ? Math.min(maximumWidth, Style.space(340))
-                          : textLikeWidth
+                          : modelData.quote ? Math.max(textLikeWidth, Math.min(maximumWidth, Style.space(260))) : textLikeWidth
                         height: !showMessageBubble
                           ? 0
                           : messageColumn.implicitHeight
@@ -2992,6 +2995,12 @@ Item {
                             elide: Text.ElideRight
                             horizontalAlignment: modelData.from_me
                               ? Text.AlignRight : Text.AlignLeft
+                          }
+                          QuoteCard {
+                            objectName: "messageQuote-" + String(modelData.id || "")
+                            width: parent.width
+                            visible: !!modelData.quote
+                            quote: modelData.quote || null
                           }
                           Text {
                             id: messageText
@@ -3291,6 +3300,10 @@ Item {
                             ? messageDelegate.reactionPickerX - width
                             : messageDelegate.reactionPickerX
                           y: messageDelegate.reactionPickerY + Style.space(4)
+                          replyEnabled: !!root.service && !root.voiceRecordingActive
+                          onReplyChosen: {
+                            if (root.service.beginReply(modelData)) composer.forceActiveFocus()
+                          }
                           shell: root.shell
                           ownReactionEmoji: messageDelegate.ownReactionEmoji()
                           fontFamily: root.fontFamily
@@ -3448,8 +3461,9 @@ Item {
 
                   Item {
                     id: composerRow
+                    readonly property bool replying: !!root.service && !!root.service.replyTarget
                     width: parent.width
-                    height: Style.space(66) + composerScroll.height
+                    height: Style.space(66) + (replying ? replyPreview.height + Style.space(8) : 0) + composerScroll.height
                       - messageComposerControls.controlHeight
                     Rectangle {
                       anchors.left: parent.left
@@ -3457,6 +3471,28 @@ Item {
                       anchors.top: parent.top
                       height: Math.max(1, Style.normalBorderWidth)
                       color: Style.normalBorderFor(root.foreground, root.accent)
+                    }
+                    QuoteCard {
+                      id: replyPreview
+                      objectName: "replyPreview"
+                      anchors.left: parent.left
+                      anchors.right: cancelReplyButton.left
+                      anchors.top: parent.top
+                      anchors.margins: Style.space(8)
+                      visible: composerRow.replying
+                      quote: root.service ? root.service.replyTarget : null
+                    }
+                    SquareControlButton {
+                      id: cancelReplyButton
+                      objectName: "cancelReplyButton"
+                      anchors.right: parent.right
+                      anchors.top: parent.top
+                      anchors.margins: Style.space(8)
+                      visible: composerRow.replying
+                      centeredIconText: "󰅖"
+                      tooltipText: "Cancel reply"
+                      controlHeight: Style.space(32)
+                      onClicked: root.service.replyTarget = null
                     }
                     Rectangle {
                       id: mentionPopover
@@ -3520,6 +3556,7 @@ Item {
                       anchors.leftMargin: Style.space(14)
                       anchors.rightMargin: Style.space(14)
                       anchors.verticalCenter: parent.verticalCenter
+                      anchors.verticalCenterOffset: composerRow.replying ? (replyPreview.height + Style.space(8)) / 2 : 0
                       spacing: Style.space(8)
                       visible: !root.voiceRecordingActive && !root.voiceOutboxEntry
                         && !root.textOutboxEntry
@@ -3637,6 +3674,7 @@ Item {
                       }
                       SquareControlButton {
                         id: voiceRecordButton
+                        visible: !composerRow.replying
                         anchors.bottom: parent.bottom
                         objectName: "voiceRecordButton"
                         controlHeight: messageComposerControls.controlHeight

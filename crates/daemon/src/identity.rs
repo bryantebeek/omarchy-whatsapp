@@ -87,6 +87,38 @@ pub(crate) async fn canonical_contact_jid(
     canonical
 }
 
+// Resolve at delivery as well as acceptance: an offline reply may have been
+// queued with a phone-number identity before group LID metadata was available.
+pub(crate) async fn quote_participant(
+    transport: &dyn Transport,
+    chat: &Jid,
+    mut sender_jid: String,
+) -> String {
+    if chat.is_group()
+        && let Ok(metadata) = transport.group_metadata(chat).await
+        && let Some(participant) = metadata.participants.into_iter().find(|participant| {
+            [
+                Some(&participant.jid),
+                participant.phone_number.as_ref(),
+                participant.lid.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|jid| jid.to_non_ad_string() == sender_jid)
+        })
+    {
+        sender_jid = if metadata.addressing_mode
+            == whatsapp_rust::wacore::types::message::AddressingMode::Lid
+        {
+            participant.lid.unwrap_or(participant.jid)
+        } else {
+            participant.phone_number.unwrap_or(participant.jid)
+        }
+        .to_non_ad_string();
+    }
+    sender_jid
+}
+
 pub(crate) async fn own_poll_creator_jid(transport: &dyn Transport, chat: &Jid) -> Result<Jid> {
     if chat.is_group()
         && transport.group_metadata(chat).await.is_ok_and(|metadata| {

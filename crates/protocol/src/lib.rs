@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 31;
+pub const PROTOCOL_VERSION: u16 = 32;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -70,6 +70,21 @@ pub enum ChatStateResyncStatus {
     Failed,
 }
 
+/// Same-chat message identity selected by the user; the daemon resolves its contents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplyTarget {
+    pub message_id: String,
+    pub sender_jid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageQuote {
+    pub message_id: String,
+    pub sender_jid: String,
+    pub sender_name: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     pub id: String,
@@ -94,6 +109,8 @@ pub struct Message {
     pub media: Option<MessageMedia>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<Reaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<MessageQuote>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -278,6 +295,8 @@ pub enum Command {
         delivery_id: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mentions: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<ReplyTarget>,
     },
     SendVoiceMessage {
         chat_jid: String,
@@ -292,6 +311,8 @@ pub enum Command {
         delivery_id: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mentions: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<ReplyTarget>,
     },
     DiscardVoiceRecording {
         recording_id: String,
@@ -571,6 +592,7 @@ mod tests {
                 text: "hello".into(),
                 delivery_id: "synthetic-7".into(),
                 mentions: Vec::new(),
+                reply_to: None,
             },
         );
         let json = serde_json::to_string(&frame).unwrap();
@@ -590,6 +612,10 @@ mod tests {
                 text: "Hi @200".into(),
                 delivery_id: "text".into(),
                 mentions: vec!["200@lid".into()],
+                reply_to: Some(ReplyTarget {
+                    message_id: "original".into(),
+                    sender_jid: "200@lid".into(),
+                }),
             },
             Command::SendImage {
                 chat_jid: "123@g.us".into(),
@@ -597,6 +623,10 @@ mod tests {
                 caption: "Hi @200".into(),
                 delivery_id: "image".into(),
                 mentions: vec!["200@lid".into()],
+                reply_to: Some(ReplyTarget {
+                    message_id: "original".into(),
+                    sender_jid: "200@lid".into(),
+                }),
             },
         ] {
             assert_eq!(
@@ -647,6 +677,7 @@ mod tests {
                 caption: "look".into(),
                 delivery_id: "img-9".into(),
                 mentions: Vec::new(),
+                reply_to: None,
             },
         ] {
             let frame = ClientFrame::new(Some(9), command);
@@ -663,6 +694,7 @@ mod tests {
                 caption: String::new(),
                 delivery_id: "img-9".into(),
                 mentions: Vec::new(),
+                reply_to: None,
             },
         ))
         .unwrap();
@@ -1039,6 +1071,12 @@ mod tests {
                 mime_type: "image/jpeg".into(),
                 width: 640,
                 height: 480,
+            }),
+            quote: Some(MessageQuote {
+                message_id: "original".into(),
+                sender_jid: "2@lid".into(),
+                sender_name: "Grace".into(),
+                text: "A question".into(),
             }),
             reactions: vec![Reaction {
                 emoji: "👍".into(),

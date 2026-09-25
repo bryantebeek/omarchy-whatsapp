@@ -858,6 +858,62 @@ TestCase {
     verify(sentFrames().length > 0)
   }
 
+  function test_reply_lifecycle_and_stale_acceptance() {
+    service.selectedChatJid = "group@g.us"
+    var original = { id: "original", chat_jid: "group@g.us", sender_jid: "200@lid", sender_name: "Bob", text: "Question" }
+    compare(service.beginReply(null), false)
+    compare(service.beginReply({ id: "x", sender_jid: "a", chat_jid: "other" }), false)
+    compare(service.replyReference(), null)
+    compare(service.beginReply(original), true)
+    compare(service.replyTarget.sender_name, "Bob")
+    compare(service.sendMessage("Answer"), true)
+    var request = lastFrame()
+    compare(request.reply_to, { message_id: "original", sender_jid: "200@lid" })
+    service.handleLine(JSON.stringify({ id: request.id + 1000, event: "text_accepted", delivery_id: request.delivery_id }))
+    verify(service.replyTarget !== null)
+    service.handleLine(JSON.stringify({ id: request.id, event: "error", message: "Rejected" }))
+    verify(service.replyTarget !== null)
+    compare(service.sendMessage("Answer"), true)
+    request = lastFrame()
+    service.handleLine(JSON.stringify({ id: request.id, event: "text_accepted", delivery_id: request.delivery_id }))
+    compare(service.replyTarget, null)
+
+    service.beginReply(original)
+    service.sendMessage("First")
+    request = lastFrame()
+    service.beginReply({ id: "next", chat_jid: "group@g.us", sender_jid: "me", from_me: true, text: "Own" })
+    compare(service.replyTarget.sender_name, "You")
+    service.handleLine(JSON.stringify({ id: request.id, event: "text_accepted", delivery_id: request.delivery_id }))
+    compare(service.replyTarget.message_id, "next")
+    service.resetRequestState("Reconnect")
+    compare(service.replyTarget.message_id, "next")
+    service.selectChat("other@s.whatsapp.net")
+    compare(service.replyTarget, null)
+  }
+
+  function test_image_reply_success_failure_and_new_selection() {
+    service.selectedChatJid = "group@g.us"
+    var target = { id: "quoted", chat_jid: "group@g.us", sender_jid: "200@lid", text: "Photo?" }
+    service.beginReply(target)
+    service.stagedImage = { path: "/synthetic/image.png" }
+    verify(service.sendImageMessage("Here"))
+    var request = lastFrame()
+    compare(request.reply_to.message_id, "quoted")
+    service.finishImageSendRequest({ id: request.id, event: "error" })
+    verify(service.replyTarget !== null)
+    verify(service.sendImageMessage("Here"))
+    request = lastFrame()
+    service.finishImageSendRequest({ id: request.id, event: "sent" })
+    compare(service.replyTarget, null)
+    service.beginReply(target)
+    service.stagedImage = { path: "/synthetic/image.png" }
+    service.sendImageMessage("Again")
+    request = lastFrame()
+    service.beginReply(target)
+    service.finishImageSendRequest({ id: request.id, event: "sent" })
+    verify(service.replyTarget !== null)
+  }
+
   function test_mentions_preserve_draft_until_acknowledged() {
     service.selectedChatJid = "group@g.us"
     var selections = [{ label: "@Bob", jid: "200@lid" }]

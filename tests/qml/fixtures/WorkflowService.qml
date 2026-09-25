@@ -49,6 +49,9 @@ QtObject {
   property var calls: []
   property var sentMessages: []
   property var sentMentionMessages: []
+  property var replyTarget: null
+  property var sentReplies: []
+  onSelectedChatJidChanged: replyTarget = null
   property var sentVoiceMessages: []
   property var discardedVoiceRecordings: []
   property var pinnedChats: []
@@ -225,11 +228,20 @@ QtObject {
 
   function setUnreadOnly(value) { unreadOnly = value === true }
 
+  function beginReply(message) {
+    if (!message || !message.id || !message.sender_jid || message.chat_jid !== selectedChatJid) return false
+    replyTarget = { message_id: message.id, sender_jid: message.sender_jid,
+      sender_name: message.from_me ? "You" : message.sender_name, text: message.text }
+    return true
+  }
+
   function sendMessage(text, selections) {
     var body = String(text || "")
     if (!selectedChatJid || !body.trim()) return false
     sentMessages = sentMessages.concat([body])
     sentMentionMessages = sentMentionMessages.concat([Model.composeMentions(body, selections)])
+    sentReplies = sentReplies.concat([replyTarget])
+    replyTarget = null
     messageSentSerial++
     textMessageAccepted(
       "fixture-" + String(messageSentSerial), selectedChatJid, body)
@@ -264,6 +276,8 @@ QtObject {
   function sendImageMessage(text) {
     var body = String(text || "")
     if (!selectedChatJid || !stagedImage || !stagedImage.path) return false
+    sentReplies = sentReplies.concat([replyTarget])
+    replyTarget = null
     messageSentSerial++
     var deliveryId = "fixture-image-" + String(messageSentSerial)
     sentImages = sentImages.concat([{

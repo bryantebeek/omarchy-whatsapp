@@ -23,6 +23,8 @@ QQC.Popup {
       Color.popups.border, Color.popups.border,
       Math.max(1, Style.normalBorderWidth))
 
+  property bool replyEnabled: false
+  signal replyChosen()
   signal reactionChosen(string emoji)
 
   function openOmarchyEmojiPicker() {
@@ -73,6 +75,18 @@ QQC.Popup {
   contentItem: Column {
     id: reactionPickerColumn
     spacing: Style.space(8)
+
+    DevicePixelButton {
+      objectName: "replyToMessageButton"
+      visible: root.replyEnabled
+      width: parent.width
+      text: "Reply"
+      iconText: ""
+      foreground: Color.popups.text
+      accent: root.accent
+      devicePixelRatio: root.devicePixelRatio
+      onClicked: { root.close(); root.replyChosen() }
+    }
 
     Item {
       width: parent.width

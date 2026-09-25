@@ -375,6 +375,7 @@ mod tests {
             read_by: Vec::new(),
             media: None,
             reactions: Vec::new(),
+            quote: None,
         }
     }
 

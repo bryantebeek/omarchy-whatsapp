@@ -18,7 +18,7 @@ const CHAT_NAME_ADDRESS_BOOK: i64 = 40;
 const READ_BOUNDARY_IDS_CAP: usize = 256;
 // The last step of the ordered migration ladder in `Database::migrate`. Every
 // opened database ends on this `user_version`.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Clone, Copy)]
 enum ChatSetting {
@@ -546,6 +546,9 @@ fn decode_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         read_by: Vec::new(),
         media,
         reactions: Vec::new(),
+        quote: row
+            .get::<_, Option<String>>(11)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -620,6 +623,7 @@ pub struct StoredPoll {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingTextMessage {
+    pub quote: Option<omarchy_whatsapp_protocol::MessageQuote>,
     pub mentions: Vec<String>,
     pub delivery_id: String,
     pub chat_jid: String,
@@ -848,6 +852,10 @@ impl Database {
                 "mentions TEXT NOT NULL DEFAULT '[]'",
             )
         })?;
+        run_migration(connection, &mut version, 9, |transaction| {
+            ensure_column(transaction, "messages", "quote_json", "quote_json TEXT")?;
+            ensure_column(transaction, "text_outbox", "quote_json", "quote_json TEXT")
+        })?;
         Ok(())
     }
 
@@ -987,6 +995,7 @@ impl Database {
         )? > 0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue_text_message(
         &self,
         delivery_id: &str,
@@ -995,13 +1004,15 @@ impl Database {
         message_id: &str,
         created_at: i64,
         mentions: &[String],
+        quote: Option<&omarchy_whatsapp_protocol::MessageQuote>,
     ) -> Result<bool> {
         let mentions = serde_json::to_string(mentions)?;
+        let quote = quote.map(serde_json::to_string).transpose()?;
         let mut connection = self.connection();
         let transaction = connection.transaction()?;
         let existing = transaction
             .query_row(
-                "SELECT chat_jid, text, message_id, mentions FROM text_outbox WHERE delivery_id = ?1",
+                "SELECT chat_jid, text, message_id, mentions, quote_json FROM text_outbox WHERE delivery_id = ?1",
                 [delivery_id],
                 |row| {
                     Ok((
@@ -1009,6 +1020,7 @@ impl Database {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -1020,7 +1032,8 @@ impl Database {
                         chat_jid.to_owned(),
                         text.to_owned(),
                         message_id.to_owned(),
-                        mentions.clone()
+                        mentions.clone(),
+                        quote.clone()
                     ),
                 "delivery ID is already assigned to another message"
             );
@@ -1029,15 +1042,16 @@ impl Database {
         }
         transaction.execute(
             "INSERT INTO text_outbox
-             (delivery_id, chat_jid, text, message_id, status, created_at, mentions)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+             (delivery_id, chat_jid, text, message_id, status, created_at, mentions, quote_json)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
             params![
                 delivery_id,
                 chat_jid,
                 text,
                 message_id,
                 created_at,
-                mentions
+                mentions,
+                quote
             ],
         )?;
         transaction.execute(
@@ -1081,12 +1095,23 @@ impl Database {
         let transaction = connection.transaction()?;
         let pending = transaction
             .query_row(
-                "SELECT delivery_id, chat_jid, text, message_id, mentions
+                "SELECT delivery_id, chat_jid, text, message_id, mentions, quote_json
                  FROM text_outbox WHERE status = 0
                  ORDER BY created_at, delivery_id LIMIT 1",
                 [],
                 |row| {
                     Ok(PendingTextMessage {
+                        quote: row
+                            .get::<_, Option<String>>(5)?
+                            .map(|json| serde_json::from_str(&json))
+                            .transpose()
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    5,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
                         delivery_id: row.get(0)?,
                         chat_jid: row.get(1)?,
                         text: row.get(2)?,
@@ -1408,10 +1433,10 @@ impl Database {
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO messages
              (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me, read,
-              receipt, delivered_at, receipt_read_at, media_json)
+              receipt, delivered_at, receipt_read_at, media_json, quote_json)
              VALUES (?1, ?2, ?3,
                 COALESCE((SELECT name FROM contacts WHERE jid = ?3 AND source = 1), ?4),
-                ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 message.chat_jid,
                 message.id,
@@ -1425,6 +1450,11 @@ impl Database {
                 message.delivered_at,
                 message.read_at,
                 media_json,
+                message
+                    .quote
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
             ],
         )? > 0;
         if inserted && message_is_unread {
@@ -1745,8 +1775,22 @@ impl Database {
         Ok(Self::load_messages(&connection, chat_jid, 1, Some(message_id))?.pop())
     }
 
+    pub fn message_by_identity(
+        &self,
+        chat_jid: &str,
+        message_id: &str,
+        sender_jid: &str,
+    ) -> Result<Option<Message>> {
+        let connection = self.connection();
+        Ok(
+            Self::load_messages(&connection, chat_jid, 1000, Some(message_id))?
+                .into_iter()
+                .find(|message| message.sender_jid == sender_jid),
+        )
+    }
+
     // The single read path for rendered messages. `message_id` selects one
-    // conversation entry without loading the surrounding page, and both callers
+    // conversation entry without loading the surrounding page, and all callers
     // therefore observe identical media, reaction, and receipt state.
     fn load_messages(
         connection: &Connection,
@@ -1757,11 +1801,11 @@ impl Database {
         // Equal timestamps are common in a synced conversation, so insertion
         // order breaks the tie and keeps repeated reads in the same sequence.
         let sql = "SELECT id, chat_jid, sender_jid, sender_name, text, timestamp, from_me,
-                    receipt, delivered_at, receipt_read_at, media_json
+                    receipt, delivered_at, receipt_read_at, media_json, quote_json
              FROM (
                 SELECT rowid AS insertion, id, chat_jid, sender_jid, sender_name, text,
                        timestamp, from_me, receipt, delivered_at, receipt_read_at,
-                       media_json
+                       media_json, quote_json
                 FROM messages
                 WHERE chat_jid = ?1 AND (?3 IS NULL OR id = ?3)
                 ORDER BY timestamp DESC, insertion DESC LIMIT ?2
@@ -2896,9 +2940,9 @@ impl Database {
         transaction.execute(
             "INSERT INTO messages
              (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me,
-              read, receipt, delivered_at, receipt_read_at, media_json, media_download)
+              read, receipt, delivered_at, receipt_read_at, media_json, media_download, quote_json)
              SELECT chat_jid, id, ?2, sender_name, text, timestamp, from_me,
-                    read, receipt, delivered_at, receipt_read_at, media_json, media_download
+                    read, receipt, delivered_at, receipt_read_at, media_json, media_download, quote_json
              FROM messages WHERE sender_jid = ?1
              ON CONFLICT(chat_jid, sender_jid, id) DO UPDATE SET
                 sender_name = CASE
@@ -2912,6 +2956,7 @@ impl Database {
                 receipt = MAX(messages.receipt, excluded.receipt),
                 delivered_at = COALESCE(messages.delivered_at, excluded.delivered_at),
                 receipt_read_at = COALESCE(messages.receipt_read_at, excluded.receipt_read_at),
+                quote_json = COALESCE(messages.quote_json, excluded.quote_json),
                 media_json = COALESCE(messages.media_json, excluded.media_json),
                 media_download = COALESCE(messages.media_download, excluded.media_download)",
             params![old_jid, new_jid],
@@ -2954,15 +2999,16 @@ impl Database {
         transaction.execute(
             "INSERT INTO messages
              (chat_jid, id, sender_jid, sender_name, text, timestamp, from_me,
-              read, receipt, delivered_at, receipt_read_at, media_json, media_download)
+              read, receipt, delivered_at, receipt_read_at, media_json, media_download, quote_json)
              SELECT ?2, id, sender_jid, sender_name, text, timestamp, from_me,
-                    read, receipt, delivered_at, receipt_read_at, media_json, media_download
+                    read, receipt, delivered_at, receipt_read_at, media_json, media_download, quote_json
              FROM messages WHERE chat_jid = ?1
              ON CONFLICT(chat_jid, sender_jid, id) DO UPDATE SET
                 read = MAX(messages.read, excluded.read),
                 receipt = MAX(messages.receipt, excluded.receipt),
                 delivered_at = COALESCE(messages.delivered_at, excluded.delivered_at),
                 receipt_read_at = COALESCE(messages.receipt_read_at, excluded.receipt_read_at),
+                quote_json = COALESCE(messages.quote_json, excluded.quote_json),
                 media_json = COALESCE(messages.media_json, excluded.media_json),
                 media_download = COALESCE(messages.media_download, excluded.media_download)",
             params![old_jid, new_jid],
@@ -3306,6 +3352,7 @@ mod tests {
             read_by: Vec::new(),
             media: None,
             reactions: Vec::new(),
+            quote: None,
         }
     }
 
@@ -5611,13 +5658,101 @@ mod tests {
     }
 
     #[test]
+    fn quotes_migrate_survive_history_aliases_and_reject_corrupt_outbox_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        {
+            let database = Database::open(&path).unwrap();
+            database
+                .insert_message(&message("old", 1), "Ada", false, false)
+                .unwrap();
+            database.execute_test_sql("ALTER TABLE messages DROP COLUMN quote_json; ALTER TABLE text_outbox DROP COLUMN quote_json; PRAGMA user_version = 8;").unwrap();
+        }
+        let database = Database::open(&path).unwrap();
+        assert!(
+            database.messages("1@s.whatsapp.net", 10).unwrap()[0]
+                .quote
+                .is_none()
+        );
+        let quote = omarchy_whatsapp_protocol::MessageQuote {
+            message_id: "original".into(),
+            sender_jid: "200@lid".into(),
+            sender_name: "Bob".into(),
+            text: "Question".into(),
+        };
+        let mut reply = message("reply", 2);
+        reply.quote = Some(quote.clone());
+        database
+            .insert_history_message(&reply, "Ada", false)
+            .unwrap();
+        database
+            .migrate_contact_jid("1@s.whatsapp.net", "2@s.whatsapp.net")
+            .unwrap();
+        assert_eq!(
+            database
+                .message_by_id("2@s.whatsapp.net", "reply")
+                .unwrap()
+                .unwrap()
+                .quote,
+            Some(quote.clone())
+        );
+        database
+            .enqueue_text_message(
+                "reply",
+                "2@s.whatsapp.net",
+                "Answer",
+                "REPLY",
+                3,
+                &[],
+                Some(&quote),
+            )
+            .unwrap();
+        let mut changed_quote = quote.clone();
+        changed_quote.message_id = "different".into();
+        assert!(
+            database
+                .enqueue_text_message(
+                    "reply",
+                    "2@s.whatsapp.net",
+                    "Answer",
+                    "REPLY",
+                    3,
+                    &[],
+                    Some(&changed_quote)
+                )
+                .is_err()
+        );
+        assert!(
+            !database
+                .enqueue_text_message(
+                    "reply",
+                    "2@s.whatsapp.net",
+                    "Answer",
+                    "REPLY",
+                    3,
+                    &[],
+                    Some(&quote)
+                )
+                .unwrap()
+        );
+        database
+            .execute_test_sql("UPDATE text_outbox SET quote_json = 'invalid'")
+            .unwrap();
+        assert!(database.claim_text_message().is_err());
+        assert_eq!(
+            database.text_outbox().unwrap()[0].status,
+            TextOutboxStatus::Queued
+        );
+    }
+
+    #[test]
     fn legacy_outbox_mentions_migrate_and_corrupt_metadata_is_not_sent() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("history.db");
         {
             let database = Database::open(&path).unwrap();
             database
-                .enqueue_text_message("old", "123@g.us", "hello", "MSG", 1, &[])
+                .enqueue_text_message("old", "123@g.us", "hello", "MSG", 1, &[], None)
                 .unwrap();
             database
                 .execute_test_sql(
@@ -5652,17 +5787,17 @@ mod tests {
         let database = Database::open(&directory.path().join("history.db")).unwrap();
         assert!(
             database
-                .enqueue_text_message("delivery", "chat", "hello", "message", 10, &[])
+                .enqueue_text_message("delivery", "chat", "hello", "message", 10, &[], None)
                 .unwrap()
         );
         assert!(
             !database
-                .enqueue_text_message("delivery", "chat", "hello", "message", 10, &[])
+                .enqueue_text_message("delivery", "chat", "hello", "message", 10, &[], None)
                 .unwrap()
         );
         assert!(
             database
-                .enqueue_text_message("delivery", "other", "hello", "message", 10, &[])
+                .enqueue_text_message("delivery", "other", "hello", "message", 10, &[], None)
                 .is_err()
         );
         assert_eq!(
@@ -5674,6 +5809,7 @@ mod tests {
             pending,
             PendingTextMessage {
                 mentions: Vec::new(),
+                quote: None,
                 delivery_id: "delivery".into(),
                 chat_jid: "chat".into(),
                 text: "hello".into(),
@@ -5700,7 +5836,7 @@ mod tests {
         assert!(!database.complete_text_message("delivery").unwrap());
 
         database
-            .enqueue_text_message("discard", "chat", "bye", "message-2", 11, &[])
+            .enqueue_text_message("discard", "chat", "bye", "message-2", 11, &[], None)
             .unwrap();
         assert!(database.discard_text_message("discard").unwrap());
         assert!(!database.discard_text_message("discard").unwrap());
@@ -6275,7 +6411,7 @@ mod tests {
         {
             let database = Database::open(&path).unwrap();
             database
-                .enqueue_text_message("delivery", "chat", "hello", "message", 10, &[])
+                .enqueue_text_message("delivery", "chat", "hello", "message", 10, &[], None)
                 .unwrap();
             database.claim_text_message().unwrap().unwrap();
         }

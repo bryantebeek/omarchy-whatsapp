@@ -33,7 +33,7 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
-  readonly property int protocolVersion: 31
+  readonly property int protocolVersion: 32
   readonly property int requestTimeoutMs: 135000
   readonly property int avatarRequestIntervalMs: 60000
 
@@ -91,6 +91,8 @@ Item {
   property int imageSendRequestId: 0
   property string imageSendChatJid: ""
   property string imageSendCaption: ""
+  property var replyTarget: null
+  property var imageSendReplyTarget: null
   property string imageSendDeliveryId: ""
   property int sentPresenceState: -1
   property var pollVoteRequests: ({})
@@ -559,6 +561,7 @@ Item {
       path: String(stagedImage.path),
       caption: composed.text,
       mentions: composed.mentions,
+      reply_to: replyReference(),
       delivery_id: deliveryId
     })
     if (!imageSendRequestId) {
@@ -568,6 +571,7 @@ Item {
     }
     imageSendChatJid = selectedChatJid
     imageSendCaption = body
+    imageSendReplyTarget = replyTarget
     imageSendDeliveryId = deliveryId
     return true
   }
@@ -576,12 +580,14 @@ Item {
     if (!frame || Number(frame.id || 0) !== imageSendRequestId) return false
     if (frame.event === "sent") {
       stagedImage = null
+      if (replyTarget === imageSendReplyTarget) replyTarget = null
       textMessageAccepted(imageSendDeliveryId, imageSendChatJid,
         imageSendCaption)
     }
     imageSendRequestId = 0
     imageSendChatJid = ""
     imageSendCaption = ""
+    imageSendReplyTarget = null
     imageSendDeliveryId = ""
     return true
   }
@@ -921,6 +927,7 @@ Item {
     imageSendRequestId = 0
     imageSendChatJid = ""
     imageSendCaption = ""
+    imageSendReplyTarget = null
     imageSendDeliveryId = ""
   }
 
@@ -1187,6 +1194,23 @@ Item {
     updateActiveChat()
   }
 
+  function beginReply(message) {
+    if (!message || !message.id || !message.sender_jid
+        || String(message.chat_jid || "") !== selectedChatJid) return false
+    replyTarget = {
+      message_id: String(message.id),
+      sender_jid: String(message.sender_jid),
+      sender_name: message.from_me ? "You" : String(message.sender_name || message.sender_jid),
+      text: String(message.text || "")
+    }
+    return true
+  }
+
+  function replyReference() {
+    return replyTarget ? { message_id: replyTarget.message_id,
+      sender_jid: replyTarget.sender_jid } : null
+  }
+
   function sendMessage(text, selections) {
     var body = String(text || "")
     if (!selectedChatJid || !body.trim()) return false
@@ -1197,6 +1221,7 @@ Item {
       chat_jid: selectedChatJid,
       text: composed.text,
       mentions: composed.mentions,
+      reply_to: replyReference(),
       delivery_id: deliveryId
     })
     if (!requestId) return false
@@ -1204,7 +1229,8 @@ Item {
     requests[String(requestId)] = {
       delivery_id: deliveryId,
       chat_jid: selectedChatJid,
-      text: body
+      text: body,
+      reply_target: replyTarget
     }
     textMessageRequests = requests
     lastError = ""
@@ -1223,6 +1249,7 @@ Item {
     textMessageRequests = requests
     if (frame.event === "text_accepted"
         && String(frame.delivery_id || "") === String(pending.delivery_id || "")) {
+      if (replyTarget === pending.reply_target) replyTarget = null
       textMessageAccepted(
         String(pending.delivery_id), String(pending.chat_jid), String(pending.text))
       return true
@@ -1636,6 +1663,7 @@ Item {
     if (panelFocused && panelVisible) markSelectedRead()
   }
   onSelectedChatJidChanged: {
+    replyTarget = null
     pauseComposing()
     updateActiveChat()
   }

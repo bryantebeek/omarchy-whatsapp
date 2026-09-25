@@ -63,9 +63,13 @@ pub fn validate_mentions(
     Ok(mentions)
 }
 
-pub fn message(text: String, mentions: Vec<String>) -> whatsapp_rust::prelude::wa::Message {
+pub fn message(
+    text: String,
+    mentions: Vec<String>,
+    quote: Option<&omarchy_whatsapp_protocol::MessageQuote>,
+) -> whatsapp_rust::prelude::wa::Message {
     use whatsapp_rust::prelude::{MessageBuilderExt, wa};
-    if mentions.is_empty() {
+    if mentions.is_empty() && quote.is_none() {
         return wa::Message::text(text);
     }
     wa::Message {
@@ -73,12 +77,23 @@ pub fn message(text: String, mentions: Vec<String>) -> whatsapp_rust::prelude::w
             text: Some(text),
             context_info: buffa::MessageField::some(wa::ContextInfo {
                 mentioned_jid: mentions,
-                ..Default::default()
+                ..quote.map_or_else(wa::ContextInfo::default, quote_context)
             }),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+pub fn quote_context(
+    quote: &omarchy_whatsapp_protocol::MessageQuote,
+) -> whatsapp_rust::prelude::wa::ContextInfo {
+    use whatsapp_rust::prelude::{MessageBuilderExt, wa};
+    whatsapp_rust::wacore::proto_helpers::build_quote_context(
+        &quote.message_id,
+        &quote.sender_jid,
+        &wa::Message::text(&quote.text),
+    )
 }
 
 #[must_use]
@@ -118,12 +133,14 @@ mod tests {
         ];
         let mentions = validate_mentions(&group, "Hi @100, (@200)!", mentions).unwrap();
         assert_eq!(mentions, ["100@s.whatsapp.net", "200@lid"]);
-        let wire = message("Hi @100, (@200)!".into(), mentions.clone());
+        let wire = message("Hi @100, (@200)!".into(), mentions.clone(), None);
         let extended = wire.extended_text_message.as_option().unwrap();
         assert_eq!(extended.text.as_deref(), Some("Hi @100, (@200)!"));
         assert_eq!(extended.context_info.mentioned_jid, mentions);
         assert_eq!(
-            message("plain".into(), vec![]).conversation.as_deref(),
+            message("plain".into(), vec![], None)
+                .conversation
+                .as_deref(),
             Some("plain")
         );
         for jid in ["", "bad", "100@g.us", "100:2@lid", "abc@lid"] {
@@ -150,6 +167,27 @@ mod tests {
             .is_err()
         );
         assert!(validate_mentions(&group, "@100", vec!["100@lid".into()]).is_ok());
+    }
+
+    #[test]
+    fn plain_reply_carries_only_the_selected_quote() {
+        let quote = omarchy_whatsapp_protocol::MessageQuote {
+            message_id: "ORIGINAL".into(),
+            sender_jid: "200@lid".into(),
+            sender_name: "Bob".into(),
+            text: "A <question> & answer".into(),
+        };
+        let wire = message("Answer".into(), vec![], Some(&quote));
+        assert_eq!(wire.extended_text_message.text.as_deref(), Some("Answer"));
+        let context = &wire.extended_text_message.context_info;
+        assert_eq!(context.stanza_id.as_deref(), Some("ORIGINAL"));
+        assert_eq!(context.participant.as_deref(), Some("200@lid"));
+        assert_eq!(
+            context.quoted_message.conversation.as_deref(),
+            Some("A <question> & answer")
+        );
+        assert!(context.mentioned_jid.is_empty());
+        assert!(context.remote_jid.is_none());
     }
 
     #[test]

@@ -144,6 +144,7 @@ fn command_for_action(action: Action) -> Result<Command> {
         },
         Action::Send { chat, text } => Command::SendMessage {
             mentions: Vec::new(),
+            reply_to: None,
             chat_jid: chat,
             text,
             delivery_id: format!(
