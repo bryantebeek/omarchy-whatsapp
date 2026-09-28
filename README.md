@@ -44,8 +44,9 @@ mind.
 - **Polls and voice notes:** create single- or multiple-answer polls, see live
   vote totals, and cast or revise a vote. Record Ogg Opus voice notes and retry
   interrupted sends; received voice notes download on demand and play inline.
-- **Media:** paste clipboard images, preview them, and send with optional
-  captions and participant mentions; render encrypted images and videos with
+- **Media:** paste clipboard images or drag image files and documents onto a
+  conversation, preview them, and send with optional captions and participant
+  mentions; render encrypted images and videos with
   in-app preview or playback, voice and regular audio, documents with open/save
   actions, static locations and final snapshots of live-location shares, and
   static or animated WebP stickers. Sticker downloads start when
@@ -66,8 +67,8 @@ mind.
   clearing the linked account or local history.
 
 Calls, message-content search, group administration, forwarding/editing,
-and outbound attachments other than clipboard images and recorded voice notes
-are not yet implemented. The roadmap below separates package-backed work from
+and native outbound videos, GIFs, and regular audio (dropped ones are sent as
+documents) are not yet implemented. The roadmap below separates package-backed work from
 app-specific scope.
 
 ## Roadmap
@@ -86,8 +87,11 @@ live-deployment work required by this repository's quality gates.
 
 - [x] Paste, preview, upload, and send clipboard images with optional captions
   and participant mentions.
-- [ ] Select image files to upload and send from the interface.
-- [ ] Upload and send videos, GIFs, documents, and regular audio.
+- [x] Drag and drop PNG/JPEG images and documents (up to 100 MiB) onto a
+  conversation to stage and send them.
+- [ ] Pick files to send from a file dialog.
+- [ ] Upload and send videos, GIFs, and regular audio as native media rather
+  than documents.
 - [x] Record, upload, and send Ogg Opus voice notes, including recording-state
   updates, idempotent retry, crash recovery, and private local-cache retention.
 - [x] Reply with text or clipboard images and display quoted messages, including
