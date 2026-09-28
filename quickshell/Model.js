@@ -163,6 +163,14 @@ function fileSize(bytes) {
   return value.toFixed(precision) + " " + units[unit]
 }
 
+// Local path of a dropped file:// URL, or "" for anything else.
+function localFilePath(url) {
+  var value = String(url || "")
+  if (value.indexOf("file:///") !== 0) return ""
+  try { return decodeURIComponent(value.substring(7)) }
+  catch (error) { return "" }
+}
+
 function documentDetails(mimeType, bytes, pageCount) {
   var mime = String(mimeType || "application/octet-stream")
   var type = mime === "application/pdf" ? "PDF" : mime.split("/").pop().toUpperCase()

@@ -36,6 +36,7 @@ pub fn timeout(command: &Command) -> Duration {
     match command {
         Command::SendVoiceMessage { .. }
         | Command::SendImage { .. }
+        | Command::SendDocument { .. }
         | Command::CreatePoll { .. } => Duration::from_secs(120),
         Command::GetGroupParticipants { .. } => Duration::from_secs(60),
         _ => Duration::from_secs(30),
@@ -47,6 +48,7 @@ pub fn conflict_key(command: &Command) -> Option<String> {
     let key = match command {
         Command::SendMessage { chat_jid, .. }
         | Command::SendImage { chat_jid, .. }
+        | Command::SendDocument { chat_jid, .. }
         | Command::CreatePoll { chat_jid, .. }
         | Command::VotePoll { chat_jid, .. }
         | Command::React { chat_jid, .. }
@@ -65,6 +67,7 @@ pub fn conflict_key(command: &Command) -> Option<String> {
         // local and idempotent.
         Command::DownloadMedia { .. }
         | Command::PasteImage
+        | Command::StageFile { .. }
         | Command::RequestAvatar { .. }
         | Command::GetState
         | Command::ListChats { .. }
@@ -158,6 +161,18 @@ mod tests {
                     chat_jid: "chat".into(),
                     text: "x".into(),
                     delivery_id: "d".into(),
+                    mentions: Vec::new(),
+                    reply_to: None,
+                },
+                "chat:chat",
+            ),
+            (
+                Command::SendDocument {
+                    chat_jid: "chat".into(),
+                    path: "/cache/paste-2".into(),
+                    file_name: "a.pdf".into(),
+                    caption: String::new(),
+                    delivery_id: "doc-1".into(),
                     mentions: Vec::new(),
                     reply_to: None,
                 },
@@ -262,6 +277,9 @@ mod tests {
             Command::ListTextOutbox,
             Command::ListAvatars,
             Command::PasteImage,
+            Command::StageFile {
+                path: "/home/me/a.pdf".into(),
+            },
             Command::Ping,
         ] {
             assert_eq!(conflict_key(&command), None);

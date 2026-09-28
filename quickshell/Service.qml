@@ -33,7 +33,7 @@ Item {
     return String(Quickshell.env("HOME") || "") + "/.local/state/omarchy-whatsapp"
   }
   readonly property string uiPreferencesPath: statePath + "/ui-preferences.json"
-  readonly property int protocolVersion: 32
+  readonly property int protocolVersion: 33
   readonly property int requestTimeoutMs: 135000
   readonly property int avatarRequestIntervalMs: 60000
 
@@ -86,7 +86,7 @@ Item {
   property string voiceMessageRequestChatJid: ""
   property int voiceMessageRequestDurationMs: 0
   property var voiceOutboxEntries: []
-  property var stagedImage: null
+  property var stagedAttachment: null
   property int imagePasteRequestId: 0
   property int imageSendRequestId: 0
   property string imageSendChatJid: ""
@@ -530,14 +530,38 @@ Item {
     return true
   }
 
+  // Drag and drop hands the daemon a local path; it answers like a paste, or
+  // with document_staged for anything that is not a PNG or JPEG image.
+  function stageFile(path) {
+    var value = String(path || "")
+    if (!selectedChatJid || value.charAt(0) !== "/" || imagePasteRequestId > 0)
+      return false
+    imagePasteRequestId = send("stage_file", { path: value })
+    if (!imagePasteRequestId) {
+      lastError = "Daemon is unavailable; retry is safe"
+      lastErrorRequestId = ""
+      return false
+    }
+    return true
+  }
+
   function finishImagePasteRequest(frame) {
     if (!frame || Number(frame.id || 0) !== imagePasteRequestId) return false
     if (frame.event === "image_pasted" && frame.path) {
-      stagedImage = {
+      stagedAttachment = {
         path: String(frame.path || ""),
         width: Number(frame.width || 0),
         height: Number(frame.height || 0),
         mime_type: String(frame.mime_type || "")
+      }
+    } else if (frame.event === "document_staged" && frame.path
+        && frame.file_name) {
+      stagedAttachment = {
+        path: String(frame.path),
+        file_name: String(frame.file_name),
+        mime_type: String(frame.mime_type || ""),
+        file_size: Number(frame.file_size || 0),
+        document: true
       }
     } else if (frame.event === "image_paste_empty") {
       clipboardTextPasteRequested()
@@ -546,26 +570,30 @@ Item {
     return true
   }
 
-  function clearStagedImage() {
-    stagedImage = null
+  function clearStagedAttachment() {
+    stagedAttachment = null
   }
 
   function sendImageMessage(caption, selections) {
     var body = String(caption || "")
-    if (!selectedChatJid || !stagedImage || !stagedImage.path
+    if (!selectedChatJid || !stagedAttachment || !stagedAttachment.path
         || imageSendRequestId > 0) return false
     nextDeliverySerial++
     var deliveryId = "img-" + String(Date.now()) + "-"
       + String(nextDeliverySerial)
     var composed = Model.composeMentions(body, selections)
-    imageSendRequestId = send("send_image", {
+    var payload = {
       chat_jid: selectedChatJid,
-      path: String(stagedImage.path),
+      path: String(stagedAttachment.path),
       caption: composed.text,
       mentions: composed.mentions,
       reply_to: replyReference(),
       delivery_id: deliveryId
-    })
+    }
+    if (stagedAttachment.document)
+      payload.file_name = String(stagedAttachment.file_name || "")
+    imageSendRequestId = send(stagedAttachment.document
+      ? "send_document" : "send_image", payload)
     if (!imageSendRequestId) {
       lastError = "Daemon is unavailable; retry is safe"
       lastErrorRequestId = ""
@@ -581,7 +609,7 @@ Item {
   function finishImageSendRequest(frame) {
     if (!frame || Number(frame.id || 0) !== imageSendRequestId) return false
     if (frame.event === "sent") {
-      stagedImage = null
+      stagedAttachment = null
       if (replyTarget === imageSendReplyTarget) replyTarget = null
       textMessageAccepted(imageSendDeliveryId, imageSendChatJid,
         imageSendCaption)

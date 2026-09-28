@@ -226,6 +226,23 @@ TestCase {
     compare(Model.documentDetails(data.mime, data.bytes, data.pages), data.expected)
   }
 
+  function test_localFilePath_data() {
+    return [
+      { tag: "plain", input: "file:///home/me/a.pdf", expected: "/home/me/a.pdf" },
+      { tag: "escaped", input: "file:///tmp/My%20Report%20%231.pdf", expected: "/tmp/My Report #1.pdf" },
+      { tag: "unicode", input: "file:///tmp/caf%C3%A9.txt", expected: "/tmp/café.txt" },
+      { tag: "malformed escape", input: "file:///tmp/%E0%A4%A.txt", expected: "" },
+      { tag: "remote", input: "https://example.com/a.png", expected: "" },
+      { tag: "host", input: "file://server/share/a.png", expected: "" },
+      { tag: "empty", input: "", expected: "" },
+      { tag: "null", input: null, expected: "" }
+    ]
+  }
+
+  function test_localFilePath(data) {
+    compare(Model.localFilePath(data.input), data.expected)
+  }
+
   function test_escapeHtml() {
     compare(Model.escapeHtml(null), "")
     compare(Model.escapeHtml("<&>\"'"), "&lt;&amp;&gt;&quot;&#39;")

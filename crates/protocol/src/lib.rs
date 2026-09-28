@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-pub const PROTOCOL_VERSION: u16 = 32;
+pub const PROTOCOL_VERSION: u16 = 33;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -303,9 +303,26 @@ pub enum Command {
         recording_id: String,
     },
     PasteImage,
+    /// Copies a local file (for example a drag-and-drop source) into the
+    /// daemon's private staging area so it can be sent like a pasted image.
+    StageFile {
+        path: String,
+    },
     SendImage {
         chat_jid: String,
         path: String,
+        caption: String,
+        /// Stable client-generated identity used for idempotent delivery.
+        delivery_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<ReplyTarget>,
+    },
+    SendDocument {
+        chat_jid: String,
+        path: String,
+        file_name: String,
         caption: String,
         /// Stable client-generated identity used for idempotent delivery.
         delivery_id: String,
@@ -433,6 +450,12 @@ pub enum ServerEvent {
         mime_type: String,
     },
     ImagePasteEmpty,
+    DocumentStaged {
+        path: String,
+        file_name: String,
+        mime_type: String,
+        file_size: u64,
+    },
     Sent {
         message: Message,
     },
@@ -671,6 +694,18 @@ mod tests {
     fn image_paste_and_send_commands_round_trip_are_stable() {
         for command in [
             Command::PasteImage,
+            Command::StageFile {
+                path: "/home/user/report.pdf".into(),
+            },
+            Command::SendDocument {
+                chat_jid: "1@s.whatsapp.net".into(),
+                path: "/cache/paste-2".into(),
+                file_name: "report.pdf".into(),
+                caption: String::new(),
+                delivery_id: "doc-9".into(),
+                mentions: Vec::new(),
+                reply_to: None,
+            },
             Command::SendImage {
                 chat_jid: "1@s.whatsapp.net".into(),
                 path: "/cache/paste-1.png".into(),
@@ -708,6 +743,12 @@ mod tests {
                 mime_type: "image/png".into(),
             },
             ServerEvent::ImagePasteEmpty,
+            ServerEvent::DocumentStaged {
+                path: "/cache/paste-2".into(),
+                file_name: "report.pdf".into(),
+                mime_type: "application/pdf".into(),
+                file_size: 42,
+            },
         ] {
             let frame = ServerFrame::event(event);
             let json = serde_json::to_string(&frame).unwrap();

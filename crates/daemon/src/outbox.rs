@@ -317,6 +317,13 @@ mod tests {
         ) -> Result<wa::Message> {
             unimplemented!("pasted images send without an outbox")
         }
+        async fn upload_document_message(
+            &self,
+            _data: Vec<u8>,
+            _options: media::DocumentOptions,
+        ) -> Result<wa::Message> {
+            unimplemented!("dropped documents send without an outbox")
+        }
         async fn send_reaction(
             &self,
             _chat: &Jid,

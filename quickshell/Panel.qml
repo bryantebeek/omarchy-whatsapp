@@ -591,8 +591,15 @@ Item {
 
   function submitMessage() {
     if (!service) return
-    if (service.stagedImage) service.sendImageMessage(composer.text, composerMentions)
+    if (service.stagedAttachment) service.sendImageMessage(composer.text, composerMentions)
     else service.sendMessage(composer.text, composerMentions)
+  }
+
+  // Only the first dropped file is attached; the composer stages one at a time.
+  function attachDroppedFile(url) {
+    var path = Model.localFilePath(url)
+    if (!path || !service || typeof service.stageFile !== "function") return false
+    return service.stageFile(path)
   }
 
   function pasteImageFromClipboard() {
@@ -3564,15 +3571,27 @@ Item {
                         id: pastedThumbnail
                         anchors.bottom: parent.bottom
                         objectName: "pastedThumbnail"
-                        visible: root.service && root.service.stagedImage !== null
+                        visible: root.service && root.service.stagedAttachment !== null
                         width: messageComposerControls.controlHeight
                         height: messageComposerControls.controlHeight
-                        source: root.service && root.service.stagedImage
+                        source: root.service && root.service.stagedAttachment
+                          && !root.service.stagedAttachment.document
                           ? root.service.fileUrl(
-                            root.service.stagedImage.path, 0) : ""
+                            root.service.stagedAttachment.path, 0) : ""
                         asynchronous: true
                         cache: false
                         fillMode: Image.PreserveAspectCrop
+
+                        Text {
+                          objectName: "stagedDocumentIcon"
+                          anchors.centerIn: parent
+                          visible: root.service && root.service.stagedAttachment
+                            && !!root.service.stagedAttachment.document
+                          text: "󰈙"
+                          color: root.muted
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.displayLarge
+                        }
                       }
                       SquareControlButton {
                         id: discardStagedButton
@@ -3581,11 +3600,11 @@ Item {
                         controlHeight: messageComposerControls.controlHeight
                         centeredIconText: "󰅖"
                         bordered: true
-                        visible: root.service && root.service.stagedImage !== null
+                        visible: root.service && root.service.stagedAttachment !== null
                         enabled: visible
                         foreground: root.foreground
-                        tooltipText: "Discard pasted image"
-                        onClicked: root.service.clearStagedImage()
+                        tooltipText: "Discard attachment"
+                        onClicked: root.service.clearStagedAttachment()
                       }
                       QQC.ScrollView {
                         id: composerScroll
@@ -3598,7 +3617,7 @@ Item {
                         width: parent.width - pollButton.width
                           - voiceRecordButton.width - sendButton.width
                           - parent.spacing * 3 - (root.service
-                            && root.service.stagedImage
+                            && root.service.stagedAttachment
                             ? pastedThumbnail.width + discardStagedButton.width
                               + parent.spacing * 2 : 0)
 
@@ -3606,9 +3625,11 @@ Item {
                           id: composer
                           objectName: "composer"
                           enabled: root.service && root.service.selectedChatJid !== ""
-                          placeholderText: root.service && root.service.stagedImage
-                            ? "Add a caption"
-                            : (enabled ? "Message" : "Select a conversation")
+                          placeholderText: !root.service || !root.service.stagedAttachment
+                            ? (enabled ? "Message" : "Select a conversation")
+                            : root.service.stagedAttachment.document
+                              ? "Add a caption to " + root.service.stagedAttachment.file_name
+                              : "Add a caption"
                           onTextChanged: {
                             root.mentionPickerDismissed = false
                             if (!text) root.composerMentions = []
@@ -3696,8 +3717,10 @@ Item {
                         bordered: true
                         enabled: composer.enabled
                         foreground: root.foreground
-                        tooltipText: root.service && root.service.stagedImage
-                          ? "Send image" : "Send message"
+                        tooltipText: !root.service || !root.service.stagedAttachment
+                          ? "Send message"
+                          : root.service.stagedAttachment.document
+                            ? "Send document" : "Send image"
                         onClicked: root.submitMessage()
                       }
                     }
@@ -3913,6 +3936,40 @@ Item {
                     NumberAnimation {
                       duration: 140
                       easing.type: Easing.OutCubic
+                    }
+                  }
+                }
+
+                DropArea {
+                  id: attachmentDropArea
+                  objectName: "attachmentDropArea"
+                  anchors.fill: parent
+                  z: 2
+                  enabled: composer.enabled
+                  onEntered: function(drag) { drag.accepted = drag.hasUrls }
+                  onDropped: function(drop) {
+                    if (!drop.hasUrls) return
+                    if (root.attachDroppedFile(drop.urls[0])) drop.accept(Qt.CopyAction)
+                    composer.forceActiveFocus()
+                  }
+
+                  Rectangle {
+                    objectName: "attachmentDropOverlay"
+                    anchors.fill: parent
+                    anchors.margins: Style.space(8)
+                    visible: attachmentDropArea.containsDrag
+                    color: Qt.rgba(root.background.r, root.background.g,
+                      root.background.b, 0.85)
+                    border.width: Math.max(1, Style.normalBorderWidth)
+                    border.color: root.accent
+                    radius: Style.cornerRadius
+
+                    Text {
+                      anchors.centerIn: parent
+                      text: "󰁦  Drop to attach"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
                     }
                   }
                 }

@@ -35,7 +35,7 @@ QtObject {
   property int voiceRecordingSerial: 0
   property var voiceOutboxEntries: []
   property var textOutboxEntries: []
-  property var stagedImage: null
+  property var stagedAttachment: null
   property bool pasteImageEmpty: false
   property var sentImages: []
   property var pollVotes: []
@@ -261,7 +261,7 @@ QtObject {
       clipboardTextPasteRequested()
       return true
     }
-    stagedImage = {
+    stagedAttachment = {
       path: stagedFixturePath(),
       width: 800,
       height: 600,
@@ -270,24 +270,38 @@ QtObject {
     return true
   }
 
-  function clearStagedImage() {
-    stagedImage = null
+  function stageFile(path) {
+    if (!selectedChatJid || !path) return false
+    record("stageFile", path)
+    stagedAttachment = {
+      path: String(path),
+      file_name: String(path).split("/").pop(),
+      mime_type: "application/pdf",
+      file_size: 42,
+      document: true
+    }
+    return true
+  }
+
+  function clearStagedAttachment() {
+    stagedAttachment = null
   }
 
   function sendImageMessage(text) {
     var body = String(text || "")
-    if (!selectedChatJid || !stagedImage || !stagedImage.path) return false
+    if (!selectedChatJid || !stagedAttachment || !stagedAttachment.path) return false
     sentReplies = sentReplies.concat([replyTarget])
     replyTarget = null
     messageSentSerial++
     var deliveryId = "fixture-image-" + String(messageSentSerial)
     sentImages = sentImages.concat([{
       chat_jid: selectedChatJid,
-      path: String(stagedImage.path),
+      path: String(stagedAttachment.path),
+      document: !!stagedAttachment.document,
       text: body,
       delivery_id: deliveryId
     }])
-    stagedImage = null
+    stagedAttachment = null
     textMessageAccepted(deliveryId, selectedChatJid, body)
     return true
   }

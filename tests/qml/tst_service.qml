@@ -928,7 +928,7 @@ TestCase {
     service.selectedChatJid = "group@g.us"
     var target = { id: "quoted", chat_jid: "group@g.us", sender_jid: "200@lid", text: "Photo?" }
     service.beginReply(target)
-    service.stagedImage = { path: "/synthetic/image.png" }
+    service.stagedAttachment = { path: "/synthetic/image.png" }
     verify(service.sendImageMessage("Here"))
     var request = lastFrame()
     compare(request.reply_to.message_id, "quoted")
@@ -939,7 +939,7 @@ TestCase {
     service.finishImageSendRequest({ id: request.id, event: "sent" })
     compare(service.replyTarget, null)
     service.beginReply(target)
-    service.stagedImage = { path: "/synthetic/image.png" }
+    service.stagedAttachment = { path: "/synthetic/image.png" }
     service.sendImageMessage("Again")
     request = lastFrame()
     service.beginReply(target)
@@ -960,7 +960,7 @@ TestCase {
     compare(acceptedText, "Hi @Bob")
     compare(textAcceptedCount, 1)
 
-    service.stagedImage = { path: "/synthetic/image.png" }
+    service.stagedAttachment = { path: "/synthetic/image.png" }
     compare(service.sendImageMessage("Photo for @Bob", selections), true)
     request = lastFrame()
     compare(request.caption, "Photo for @200")
@@ -1340,14 +1340,14 @@ TestCase {
       height: 1,
       mime_type: "image/png"
     }))
-    compare(service.stagedImage, null)
+    compare(service.stagedAttachment, null)
     compare(service.imagePasteRequestId, request.id)
 
     service.handleLine(JSON.stringify({
       id: request.id, event: "image_paste_empty"
     }))
     compare(clipboardPasteCount, 1)
-    compare(service.stagedImage, null)
+    compare(service.stagedAttachment, null)
     compare(service.imagePasteRequestId, 0)
 
     compare(service.pasteImage(), true)
@@ -1360,18 +1360,18 @@ TestCase {
       height: 600,
       mime_type: "image/png"
     }))
-    compare(service.stagedImage.path, "/cache/paste-1.png")
-    compare(service.stagedImage.width, 800)
+    compare(service.stagedAttachment.path, "/cache/paste-1.png")
+    compare(service.stagedAttachment.width, 800)
     compare(service.imagePasteRequestId, 0)
-    service.clearStagedImage()
-    compare(service.stagedImage, null)
+    service.clearStagedAttachment()
+    compare(service.stagedAttachment, null)
 
     compare(service.pasteImage(), true)
     request = lastFrame()
     service.handleLine(JSON.stringify({
       id: request.id, event: "error", message: "clipboard broken"
     }))
-    compare(service.stagedImage, null)
+    compare(service.stagedAttachment, null)
     compare(service.imagePasteRequestId, 0)
     compare(service.lastError, "clipboard broken")
 
@@ -1379,7 +1379,7 @@ TestCase {
     compare(service.sendImageMessage("hi"), false)
     service.selectedChatJid = "chat"
     compare(service.sendImageMessage("hi"), false)
-    service.stagedImage = {
+    service.stagedAttachment = {
       path: "/cache/paste-1.png", width: 800, height: 600,
       mime_type: "image/png"
     }
@@ -1395,13 +1395,13 @@ TestCase {
     service.handleLine(JSON.stringify({
       id: send.id + 1, event: "sent", message: {}
     }))
-    compare(service.stagedImage !== null, true)
+    compare(service.stagedAttachment !== null, true)
     compare(service.imageSendRequestId, send.id)
 
     service.handleLine(JSON.stringify({
       id: send.id, event: "error", message: "offline"
     }))
-    compare(service.stagedImage.path, "/cache/paste-1.png")
+    compare(service.stagedAttachment.path, "/cache/paste-1.png")
     compare(service.lastError, "offline")
     compare(service.imageSendRequestId, 0)
 
@@ -1412,7 +1412,7 @@ TestCase {
       event: "sent",
       message: { id: "m1", chat_jid: "chat" }
     }))
-    compare(service.stagedImage, null)
+    compare(service.stagedAttachment, null)
     compare(textAcceptedCount, 1)
     compare(acceptedText, "hello")
     verify(acceptedDeliveryId.indexOf("img-") === 0)
@@ -1425,13 +1425,13 @@ TestCase {
     compare(service.imagePasteRequestId, 0)
     verify(service.lastError.indexOf("paste image timed out") >= 0)
 
-    service.stagedImage = { path: "/cache/paste-1.png" }
+    service.stagedAttachment = { path: "/cache/paste-1.png" }
     compare(service.sendImageMessage("x"), true)
     send = lastFrame()
     service.requestDeadlines[String(send.id)] = 1
     compare(service.expireRequests(2), 1)
     compare(service.imageSendRequestId, 0)
-    compare(service.stagedImage.path, "/cache/paste-1.png")
+    compare(service.stagedAttachment.path, "/cache/paste-1.png")
     verify(service.lastError.indexOf("send image timed out") >= 0)
 
     compare(service.pasteImage(), true)
@@ -1440,6 +1440,71 @@ TestCase {
     socket.connected = false
     compare(service.imagePasteRequestId, 0)
     compare(service.imageSendRequestId, 0)
-    compare(service.stagedImage.path, "/cache/paste-1.png")
+    compare(service.stagedAttachment.path, "/cache/paste-1.png")
+  }
+
+  function test_dropped_file_stage_and_document_send_lifecycle() {
+    service.stagedAttachment = null
+    service.selectedChatJid = ""
+    compare(service.stageFile("/home/me/report.pdf"), false)
+    service.selectedChatJid = "chat"
+    compare(service.stageFile(""), false)
+    compare(service.stageFile("relative/report.pdf"), false)
+    compare(service.stageFile("/home/me/report.pdf"), true)
+    var request = lastFrame()
+    compare(request.command, "stage_file")
+    compare(request.path, "/home/me/report.pdf")
+    compare(service.stageFile("/home/me/other.pdf"), false)
+
+    service.handleLine(JSON.stringify({
+      id: request.id, event: "document_staged", path: "/cache/paste-2"
+    }))
+    compare(service.stagedAttachment, null)
+    compare(service.imagePasteRequestId, 0)
+
+    compare(service.stageFile("/home/me/report.pdf"), true)
+    request = lastFrame()
+    service.handleLine(JSON.stringify({
+      id: request.id,
+      event: "document_staged",
+      path: "/cache/paste-2",
+      file_name: "report.pdf",
+      mime_type: "application/pdf",
+      file_size: 42
+    }))
+    compare(service.stagedAttachment.document, true)
+    compare(service.stagedAttachment.file_name, "report.pdf")
+    compare(service.stagedAttachment.file_size, 42)
+
+    compare(service.sendImageMessage("the numbers"), true)
+    var send = lastFrame()
+    compare(send.command, "send_document")
+    compare(send.path, "/cache/paste-2")
+    compare(send.file_name, "report.pdf")
+    compare(send.caption, "the numbers")
+    service.handleLine(JSON.stringify({
+      id: send.id, event: "sent", message: { id: "m2", chat_jid: "chat" }
+    }))
+    compare(service.stagedAttachment, null)
+
+    compare(service.stageFile("/home/me/photo.png"), true)
+    request = lastFrame()
+    service.handleLine(JSON.stringify({
+      id: request.id, event: "image_pasted", path: "/cache/paste-3.png",
+      width: 2, height: 3, mime_type: "image/png"
+    }))
+    compare(service.stagedAttachment.width, 2)
+    compare(service.stagedAttachment.document, undefined)
+    compare(service.sendImageMessage(""), true)
+    compare(lastFrame().command, "send_image")
+    compare(lastFrame().file_name, undefined)
+
+    compare(service.stageFile("/home/me/gone.pdf"), true)
+    request = lastFrame()
+    service.handleLine(JSON.stringify({
+      id: request.id, event: "error", message: "file is not available"
+    }))
+    compare(service.imagePasteRequestId, 0)
+    compare(service.lastError, "file is not available")
   }
 }

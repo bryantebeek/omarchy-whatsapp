@@ -1667,7 +1667,7 @@ TestCase {
     var plainWidth = composer.width
 
     panel.pasteImageFromClipboard()
-    compare(service.stagedImage !== null, true)
+    compare(service.stagedAttachment !== null, true)
     compare(composer.placeholderText, "Add a caption")
     compare(control("sendButton").tooltipText, "Send image")
     verify(composer.width < plainWidth)
@@ -1679,16 +1679,16 @@ TestCase {
     compare(service.sentImages.length, 1)
     compare(service.sentImages[0].text, "look at this")
     compare(service.sentImages[0].chat_jid, "alice@s.whatsapp.net")
-    compare(service.stagedImage, null)
+    compare(service.stagedAttachment, null)
     compare(composer.text, "")
     compare(composer.placeholderText, "Message")
     compare(control("sendButton").tooltipText, "Send message")
 
     panel.pasteImageFromClipboard()
-    compare(service.stagedImage !== null, true)
+    compare(service.stagedAttachment !== null, true)
     composer.text = "keep me"
     control("discardStagedButton").click()
-    compare(service.stagedImage, null)
+    compare(service.stagedAttachment, null)
     compare(composer.text, "keep me")
 
     service.pasteImageEmpty = true
@@ -1698,7 +1698,32 @@ TestCase {
     })
     panel.pasteImageFromClipboard()
     compare(pasted.length, 1)
-    compare(service.stagedImage, null)
+    compare(service.stagedAttachment, null)
+  }
+
+  function test_drop_file_stage_and_send_document() {
+    panel.open('{"chatJid":"alice@s.whatsapp.net"}')
+    var composer = control("composer")
+    compare(control("attachmentDropArea").enabled, true)
+
+    compare(panel.attachDroppedFile("https://example.com/report.pdf"), false)
+    compare(service.stagedAttachment, null)
+
+    compare(panel.attachDroppedFile("file:///home/me/Q3%20report.pdf"), true)
+    compare(service.stagedAttachment.path, "/home/me/Q3 report.pdf")
+    compare(control("pastedThumbnail").source.toString(), "")
+    compare(composer.placeholderText, "Add a caption to Q3 report.pdf")
+    compare(control("sendButton").tooltipText, "Send document")
+    compare(control("discardStagedButton").tooltipText, "Discard attachment")
+
+    control("sendButton").click()
+    compare(service.sentImages.length, 1)
+    compare(service.sentImages[0].document, true)
+    compare(service.stagedAttachment, null)
+    compare(control("sendButton").tooltipText, "Send message")
+
+    service.selectedChatJid = ""
+    compare(control("attachmentDropArea").enabled, false)
   }
 
   function test_render_and_download_stickers() {

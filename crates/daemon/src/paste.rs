@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail, ensure};
 use tracing::warn;
 
-use crate::assets::{self, MAX_IMAGE_BYTES};
+use crate::assets::{self, MAX_DOCUMENT_BYTES, MAX_IMAGE_BYTES};
 
 static PASTE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -381,6 +381,101 @@ pub(crate) fn paste_image_from_clipboard(
     })
 }
 
+/// Outcome of staging a local file for sending.
+#[derive(Debug)]
+pub(crate) enum StagedFile {
+    Image {
+        path: PathBuf,
+        width: u32,
+        height: u32,
+        mime_type: String,
+    },
+    Document {
+        path: PathBuf,
+        file_name: String,
+        mime_type: String,
+        file_size: u64,
+    },
+}
+
+/// MIME type `WhatsApp` shows for a document, guessed from its extension.
+pub(crate) fn document_mime(file_name: &str) -> &'static str {
+    let extension = Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // ponytail: common types only; unknown extensions fall back to a generic
+    // binary type, which WhatsApp still delivers as a downloadable document.
+    match extension.as_str() {
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "odt" => "application/vnd.oasis.opendocument.text",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Copies a local file into the media cache. PNG and JPEG files become staged
+/// images; everything else is staged as a document under its original name.
+pub(crate) fn stage_local_file(media_dir: &Path, source: &str) -> Result<StagedFile> {
+    let source = Path::new(source);
+    ensure!(source.is_absolute(), "file path must be absolute");
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("file name is not valid UTF-8")?
+        .to_owned();
+    let metadata = std::fs::metadata(source).context("file is not available")?;
+    ensure!(metadata.is_file(), "only regular files can be attached");
+    let mut bytes = Vec::new();
+    std::fs::File::open(source)
+        .context("file is not readable")?
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("reading file")?;
+    ensure!(!bytes.is_empty(), "file is empty");
+    ensure!(
+        bytes.len() as u64 <= MAX_DOCUMENT_BYTES,
+        "file exceeds the 100 MB limit"
+    );
+    if let Some(mime_type) = sniff_image_mime(&bytes)
+        && validate_pasted_bytes(&bytes, mime_type).is_ok()
+        && let Ok((width, height)) = pasted_image_dimensions(&bytes, mime_type)
+    {
+        let extension = if mime_type == "image/png" {
+            ".png"
+        } else {
+            ".jpg"
+        };
+        return Ok(StagedFile::Image {
+            path: stage_pasted_image(media_dir, &bytes, extension)?,
+            width,
+            height,
+            mime_type: mime_type.to_owned(),
+        });
+    }
+    Ok(StagedFile::Document {
+        path: stage_pasted_image(media_dir, &bytes, "")?,
+        mime_type: document_mime(&file_name).to_owned(),
+        file_size: bytes.len() as u64,
+        file_name,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,5 +713,57 @@ mod tests {
         let clipboard = fake::FakeClipboard::new();
         clipboard.script_image("image/png", png_bytes(2, 3));
         assert!(paste_image_from_clipboard(&clipboard, &blocker).is_err());
+    }
+
+    #[test]
+    fn staging_local_files_splits_images_from_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let path = |name: &str| directory.path().join(name).to_string_lossy().into_owned();
+
+        std::fs::write(path("photo.png"), png_bytes(2, 3)).unwrap();
+        assert!(matches!(
+            stage_local_file(&media, &path("photo.png")).unwrap(),
+            StagedFile::Image { path, width: 2, height: 3, mime_type }
+                if path.starts_with(&media) && mime_type == "image/png"
+        ));
+        std::fs::write(path("photo.jpeg"), jpeg_bytes(4, 5)).unwrap();
+        assert!(matches!(
+            stage_local_file(&media, &path("photo.jpeg")).unwrap(),
+            StagedFile::Image { path, width: 4, height: 5, mime_type }
+                if path.extension().unwrap() == "jpg" && mime_type == "image/jpeg"
+        ));
+
+        std::fs::write(path("Report.PDF"), b"%PDF-1.7").unwrap();
+        assert!(matches!(
+            stage_local_file(&media, &path("Report.PDF")).unwrap(),
+            StagedFile::Document { path, file_name, mime_type, file_size: 8 }
+                if file_name == "Report.PDF"
+                    && mime_type == "application/pdf"
+                    && std::fs::read(&path).unwrap() == b"%PDF-1.7"
+                    && resolve_staged_image(&media, path.to_string_lossy().as_ref()).is_ok()
+        ));
+
+        // A truncated PNG is still a valid file to send, just not as an image.
+        std::fs::write(path("broken.png"), &png_bytes(2, 3)[..10]).unwrap();
+        assert!(matches!(
+            stage_local_file(&media, &path("broken.png")).unwrap(),
+            StagedFile::Document { .. }
+        ));
+
+        std::fs::write(path("empty.txt"), b"").unwrap();
+        assert!(stage_local_file(&media, &path("empty.txt")).is_err());
+        assert!(stage_local_file(&media, &path("missing.txt")).is_err());
+        assert!(stage_local_file(&media, "relative.txt").is_err());
+        assert!(stage_local_file(&media, &directory.path().to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn document_mime_guesses_common_extensions() {
+        assert_eq!(document_mime("a.PDF"), "application/pdf");
+        assert_eq!(document_mime("notes.txt"), "text/plain");
+        assert_eq!(document_mime("archive"), "application/octet-stream");
+        assert_eq!(document_mime("x.unknown"), "application/octet-stream");
     }
 }

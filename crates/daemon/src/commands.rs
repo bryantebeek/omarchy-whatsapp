@@ -824,7 +824,50 @@ async fn resolve_reply(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
+async fn stage_file(shared: &Arc<Shared>, path: String) -> Result<ServerEvent> {
+    let media_dir = shared.media_dir.clone();
+    let staged = tokio::task::spawn_blocking(move || paste::stage_local_file(&media_dir, &path))
+        .await
+        .context("file staging task failed")??;
+    Ok(match staged {
+        paste::StagedFile::Image {
+            path,
+            width,
+            height,
+            mime_type,
+        } => ServerEvent::ImagePasted {
+            path: path.to_string_lossy().into_owned(),
+            width,
+            height,
+            mime_type,
+        },
+        paste::StagedFile::Document {
+            path,
+            file_name,
+            mime_type,
+            file_size,
+        } => ServerEvent::DocumentStaged {
+            path: path.to_string_lossy().into_owned(),
+            file_name,
+            mime_type,
+            file_size,
+        },
+    })
+}
+
+fn validate_document_name(file_name: &str) -> Result<()> {
+    ensure!(
+        !file_name.is_empty()
+            && file_name.len() <= 255
+            && !file_name.contains('/')
+            && !file_name.chars().any(char::is_control),
+        "invalid document file name"
+    );
+    Ok(())
+}
+
+/// Sends a staged image, or a staged document when `document_name` is set.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn send_image(
     shared: &Arc<Shared>,
     chat_jid: String,
@@ -833,18 +876,32 @@ async fn send_image(
     delivery_id: String,
     mentions: Vec<String>,
     reply_to: Option<omarchy_whatsapp_protocol::ReplyTarget>,
+    document_name: Option<String>,
 ) -> Result<ServerEvent> {
     let requested: Jid = chat_jid.parse().context("invalid chat JID")?;
     let mentions = text_outbox::validate_mentions(&requested, &caption, mentions)?;
     text_outbox::validate_delivery_id(&delivery_id)?;
     let caption = validate_image_caption(&caption)?;
+    if let Some(file_name) = &document_name {
+        validate_document_name(file_name)?;
+    }
     let staged = paste::resolve_staged_image(&shared.media_dir, &path)?;
-    let bytes = std::fs::read(&staged).context("staged image is not available")?;
-    let mime_type = paste::sniff_image_mime(&bytes)
-        .context("staged image is not a supported image")?
-        .to_owned();
-    paste::validate_pasted_bytes(&bytes, &mime_type)?;
-    let (width, height) = paste::pasted_image_dimensions(&bytes, &mime_type)?;
+    let bytes = std::fs::read(&staged).context("staged file is not available")?;
+    let (mime_type, width, height) = if let Some(file_name) = &document_name {
+        ensure!(
+            !bytes.is_empty() && bytes.len() as u64 <= assets::MAX_DOCUMENT_BYTES,
+            "staged document has an invalid size"
+        );
+        (paste::document_mime(file_name).to_owned(), 0, 0)
+    } else {
+        let mime_type = paste::sniff_image_mime(&bytes)
+            .context("staged image is not a supported image")?
+            .to_owned();
+        paste::validate_pasted_bytes(&bytes, &mime_type)?;
+        let (width, height) = paste::pasted_image_dimensions(&bytes, &mime_type)?;
+        (mime_type, width, height)
+    };
+    let file_size = bytes.len() as u64;
     let transport = shared
         .client
         .read()
@@ -859,27 +916,50 @@ async fn send_image(
     if let Some(message) = shared.database.message_by_id(&canonical_jid, &message_id)? {
         return Ok(ServerEvent::Sent { message });
     }
-    let mut outbound = transport
-        .upload_image_message(
-            bytes,
-            media::ImageOptions {
-                caption: (!caption.is_empty()).then(|| caption.clone()),
-                mimetype: Some(mime_type.clone()),
-                ..Default::default()
-            },
-        )
-        .await
-        .context("uploading image")?;
-    if let Some(image) = outbound.image_message.as_option_mut() {
-        image.width = Some(width);
-        image.height = Some(height);
-        image.context_info = buffa::MessageField::some(wa::ContextInfo {
-            mentioned_jid: mentions,
-            ..quote
-                .as_ref()
-                .map_or_else(wa::ContextInfo::default, text_outbox::quote_context)
-        });
-    }
+    let context_info = buffa::MessageField::some(wa::ContextInfo {
+        mentioned_jid: mentions,
+        ..quote
+            .as_ref()
+            .map_or_else(wa::ContextInfo::default, text_outbox::quote_context)
+    });
+    let outbound_caption = (!caption.is_empty()).then(|| caption.clone());
+    let outbound = if let Some(file_name) = &document_name {
+        let mut outbound = transport
+            .upload_document_message(
+                bytes,
+                media::DocumentOptions {
+                    caption: outbound_caption,
+                    mimetype: Some(mime_type.clone()),
+                    file_name: Some(file_name.clone()),
+                    title: Some(file_name.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("uploading document")?;
+        if let Some(document) = outbound.document_message.as_option_mut() {
+            document.context_info = context_info;
+        }
+        outbound
+    } else {
+        let mut outbound = transport
+            .upload_image_message(
+                bytes,
+                media::ImageOptions {
+                    caption: outbound_caption,
+                    mimetype: Some(mime_type.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("uploading image")?;
+        if let Some(image) = outbound.image_message.as_option_mut() {
+            image.width = Some(width);
+            image.height = Some(height);
+            image.context_info = context_info;
+        }
+        outbound
+    };
     let sent = transport
         .send_message(
             &jid,
@@ -890,18 +970,23 @@ async fn send_image(
     if sent.message_id != message_id {
         bail!("WhatsApp returned a different image message ID");
     }
-    let cached_path = assets::message_image_path(&shared.media_dir, &canonical_jid, &message_id);
+    let cached_path = match &document_name {
+        Some(file_name) => {
+            assets::message_document_path(&shared.media_dir, &canonical_jid, &message_id, file_name)
+        }
+        None => assets::message_image_path(&shared.media_dir, &canonical_jid, &message_id),
+    };
     let copy_source = staged.clone();
     let copy_destination = cached_path.clone();
     let downloaded = match tokio::task::spawn_blocking(move || {
         assets::copy_private_file(&copy_source, &copy_destination)
     })
     .await
-    .context("image cache copy task failed")?
+    .context("media cache copy task failed")?
     {
         Ok(()) => true,
         Err(error) => {
-            warn!(%error, "could not retain sent image in the private cache");
+            warn!(%error, "could not retain sent media in the private cache");
             false
         }
     };
@@ -915,10 +1000,12 @@ async fn send_image(
         chat_jid: canonical_jid,
         sender_jid: "me".into(),
         sender_name: "You".into(),
-        text: if caption.is_empty() {
-            "[Image]".into()
-        } else {
+        text: if !caption.is_empty() {
             caption
+        } else if document_name.is_some() {
+            "[Document]".into()
+        } else {
+            "[Image]".into()
         },
         timestamp: Utc::now().timestamp(),
         from_me: true,
@@ -927,16 +1014,25 @@ async fn send_image(
         read_at: None,
         delivered_to: Vec::new(),
         read_by: Vec::new(),
-        media: Some(MessageMedia::Image {
+        media: Some(match document_name {
+            Some(file_name) => MessageMedia::Document {
+                path: cached,
+                file_name,
+                mime_type,
+                file_size,
+                page_count: 0,
+            },
             // Sent images have no separate thumbnail; pointing at the cached
             // copy keeps history recovery from ever flipping them back to
             // undownloaded.
-            path: cached.clone(),
-            thumbnail_path: cached,
-            downloaded,
-            mime_type,
-            width,
-            height,
+            None => MessageMedia::Image {
+                path: cached.clone(),
+                thumbnail_path: cached,
+                downloaded,
+                mime_type,
+                width,
+                height,
+            },
         }),
         reactions: Vec::new(),
         quote,
@@ -1087,6 +1183,7 @@ pub(crate) async fn handle_command(
             Ok(ServerEvent::Ack)
         }
         Command::PasteImage => paste_image(shared).await,
+        Command::StageFile { path } => stage_file(shared, path).await,
         Command::SendImage {
             chat_jid,
             path,
@@ -1103,6 +1200,28 @@ pub(crate) async fn handle_command(
                 delivery_id,
                 mentions,
                 reply_to,
+                None,
+            )
+            .await
+        }
+        Command::SendDocument {
+            chat_jid,
+            path,
+            file_name,
+            caption,
+            delivery_id,
+            mentions,
+            reply_to,
+        } => {
+            send_image(
+                shared,
+                chat_jid,
+                path,
+                caption,
+                delivery_id,
+                mentions,
+                reply_to,
+                Some(file_name),
             )
             .await
         }
@@ -4036,6 +4155,89 @@ mod tests {
             panic!("expected the sent image message");
         };
         assert_eq!(message.text, "[Image]");
+    }
+
+    #[tokio::test]
+    async fn dropped_files_stage_and_send_as_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = shared_with_dirs(&directory);
+        let fake = Arc::new(FakeTransport::new());
+        attach(&shared, &fake).await;
+        let source = directory.path().join("Report.pdf");
+        std::fs::write(&source, b"%PDF-1.7").unwrap();
+
+        let ServerEvent::DocumentStaged {
+            path,
+            file_name,
+            mime_type,
+            file_size,
+        } = run(
+            &shared,
+            Command::StageFile {
+                path: source.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("expected a staged document");
+        };
+        assert_eq!(file_name, "Report.pdf");
+        assert_eq!((mime_type.as_str(), file_size), ("application/pdf", 8));
+
+        let send = |file_name: &str| Command::SendDocument {
+            chat_jid: "1@s.whatsapp.net".into(),
+            path: path.clone(),
+            file_name: file_name.into(),
+            caption: String::new(),
+            delivery_id: "doc-1".into(),
+            mentions: Vec::new(),
+            reply_to: None,
+        };
+        assert!(run(&shared, send("../escape")).await.is_err());
+        assert!(run(&shared, send("")).await.is_err());
+        let ServerEvent::Sent { message } = run(&shared, send("Report.pdf")).await.unwrap() else {
+            panic!("expected the sent document message");
+        };
+        assert_eq!(message.text, "[Document]");
+        let Some(MessageMedia::Document {
+            path: cached,
+            file_name,
+            file_size,
+            ..
+        }) = message.media
+        else {
+            panic!("expected document media");
+        };
+        assert_eq!((file_name.as_str(), file_size), ("Report.pdf", 8));
+        assert_eq!(std::fs::read(&cached).unwrap(), b"%PDF-1.7");
+        assert_eq!(
+            fake.calls_of(CallKind::UploadDocumentMessage),
+            vec![Call::UploadDocumentMessage {
+                byte_count: 8,
+                mimetype: Some("application/pdf".into()),
+                file_name: Some("Report.pdf".into()),
+                caption: None,
+            }]
+        );
+
+        let photo = directory.path().join("photo.png");
+        std::fs::write(&photo, pasted_png(2, 3)).unwrap();
+        assert!(matches!(
+            run(
+                &shared,
+                Command::StageFile {
+                    path: photo.to_string_lossy().into_owned(),
+                },
+            )
+            .await
+            .unwrap(),
+            ServerEvent::ImagePasted {
+                width: 2,
+                height: 3,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
