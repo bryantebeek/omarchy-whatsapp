@@ -1443,6 +1443,29 @@ TestCase {
     compare(service.stagedAttachment.path, "/cache/paste-1.png")
   }
 
+  function test_pasting_a_copied_file_stages_a_document() {
+    service.stagedAttachment = null
+    service.selectedChatJid = "chat"
+    compare(service.pasteImage(), true)
+    var request = lastFrame()
+    compare(request.command, "paste_image")
+    service.handleLine(JSON.stringify({
+      id: request.id,
+      event: "document_staged",
+      path: "/cache/paste-3",
+      file_name: "Pasted image.gif",
+      mime_type: "image/gif",
+      file_size: 10
+    }))
+    compare(service.imagePasteRequestId, 0)
+    compare(service.stagedAttachment.document, true)
+    compare(service.stagedAttachment.file_name, "Pasted image.gif")
+    compare(service.sendImageMessage(""), true)
+    compare(lastFrame().command, "send_document")
+    service.stagedAttachment = null
+    service.imageSendRequestId = 0
+  }
+
   function test_dropped_file_stage_and_document_send_lifecycle() {
     service.stagedAttachment = null
     service.selectedChatJid = ""

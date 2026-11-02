@@ -764,20 +764,10 @@ async fn paste_image(shared: &Arc<Shared>) -> Result<ServerEvent> {
     })
     .await
     .context("clipboard paste task failed")??;
-    match outcome {
-        paste::PasteOutcome::Empty => Ok(ServerEvent::ImagePasteEmpty),
-        paste::PasteOutcome::Pasted {
-            path,
-            width,
-            height,
-            mime_type,
-        } => Ok(ServerEvent::ImagePasted {
-            path: path.to_string_lossy().into_owned(),
-            width,
-            height,
-            mime_type,
-        }),
-    }
+    Ok(match outcome {
+        paste::PasteOutcome::Empty => ServerEvent::ImagePasteEmpty,
+        paste::PasteOutcome::Staged(staged) => staged_event(staged),
+    })
 }
 
 async fn resolve_reply(
@@ -829,7 +819,11 @@ async fn stage_file(shared: &Arc<Shared>, path: String) -> Result<ServerEvent> {
     let staged = tokio::task::spawn_blocking(move || paste::stage_local_file(&media_dir, &path))
         .await
         .context("file staging task failed")??;
-    Ok(match staged {
+    Ok(staged_event(staged))
+}
+
+fn staged_event(staged: paste::StagedFile) -> ServerEvent {
+    match staged {
         paste::StagedFile::Image {
             path,
             width,
@@ -852,7 +846,7 @@ async fn stage_file(shared: &Arc<Shared>, path: String) -> Result<ServerEvent> {
             mime_type,
             file_size,
         },
-    })
+    }
 }
 
 fn validate_document_name(file_name: &str) -> Result<()> {

@@ -197,20 +197,47 @@ pub(crate) mod fake {
 
 /// Preferred clipboard image type with its staged file extension.
 pub(crate) fn pick_image_mime(offered: &[String]) -> Option<(&'static str, &'static str)> {
-    for (mime_type, extension) in [("image/png", ".png"), ("image/jpeg", ".jpg")] {
-        let advertised = offered.iter().any(|candidate| {
-            candidate
-                .split(';')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .eq_ignore_ascii_case(mime_type)
-        });
-        if advertised {
-            return Some((mime_type, extension));
-        }
+    [("image/png", ".png"), ("image/jpeg", ".jpg")]
+        .into_iter()
+        .find(|(mime_type, _)| offers(offered, mime_type))
+}
+
+fn offers(offered: &[String], mime_type: &str) -> bool {
+    offered.iter().any(|candidate| {
+        candidate
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case(mime_type)
+    })
+}
+
+/// First local path in a `text/uri-list`, as file managers put on the
+/// clipboard when files are copied.
+pub(crate) fn first_copied_file(uri_list: &str) -> Option<String> {
+    uri_list
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let path = line
+                .strip_prefix("file://localhost/")
+                .or_else(|| line.strip_prefix("file:///"))?;
+            let path = percent_encoding::percent_decode_str(path)
+                .decode_utf8()
+                .ok()?;
+            Some(format!("/{path}"))
+        })
+}
+
+/// Whether bytes carry the signature of a GIF or `WebP` clipboard image.
+fn matches_document_image(bytes: &[u8], mime_type: &str) -> bool {
+    match mime_type {
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        _ => false,
     }
-    None
 }
 
 /// Sniffs pasted bytes back to a supported image type.
@@ -338,17 +365,14 @@ pub(crate) fn resolve_staged_image(media_dir: &Path, path: &str) -> Result<PathB
 /// Outcome of one clipboard paste attempt.
 pub(crate) enum PasteOutcome {
     Empty,
-    Pasted {
-        path: PathBuf,
-        width: u32,
-        height: u32,
-        mime_type: String,
-    },
+    Staged(StagedFile),
 }
 
-/// Reads an image off the clipboard into a staged file. Clipboard and
-/// mid-flight failures resolve to [`PasteOutcome::Empty`] so ordinary text
-/// pastes keep working; only an offered image that fails validation errors.
+/// Reads the clipboard into a staged attachment: a PNG or JPEG image first,
+/// then the first file copied in a file manager, then a GIF or `WebP` image,
+/// which `WhatsApp` only accepts as a document. Clipboard and mid-flight
+/// failures resolve to [`PasteOutcome::Empty`] so ordinary text pastes keep
+/// working; only offered content that fails validation errors.
 pub(crate) fn paste_image_from_clipboard(
     clipboard: &dyn ClipboardBackend,
     media_dir: &Path,
@@ -360,25 +384,53 @@ pub(crate) fn paste_image_from_clipboard(
             return Ok(PasteOutcome::Empty);
         }
     };
-    let Some((mime_type, extension)) = pick_image_mime(&offered) else {
-        return Ok(PasteOutcome::Empty);
-    };
-    let bytes = match clipboard.read_bytes(mime_type) {
-        Ok(bytes) => bytes,
+    let read = |mime_type: &str| match clipboard.read_bytes(mime_type) {
+        Ok(bytes) => Some(bytes),
         Err(error) => {
-            warn!(%error, mime_type, "clipboard image vanished before it could be read");
-            return Ok(PasteOutcome::Empty);
+            warn!(%error, mime_type, "clipboard content vanished before it could be read");
+            None
         }
     };
-    validate_pasted_bytes(&bytes, mime_type)?;
-    let (width, height) = pasted_image_dimensions(&bytes, mime_type)?;
-    let path = stage_pasted_image(media_dir, &bytes, extension)?;
-    Ok(PasteOutcome::Pasted {
-        path,
-        width,
-        height,
-        mime_type: mime_type.to_owned(),
-    })
+    if let Some((mime_type, extension)) = pick_image_mime(&offered) {
+        let Some(bytes) = read(mime_type) else {
+            return Ok(PasteOutcome::Empty);
+        };
+        validate_pasted_bytes(&bytes, mime_type)?;
+        let (width, height) = pasted_image_dimensions(&bytes, mime_type)?;
+        return Ok(PasteOutcome::Staged(StagedFile::Image {
+            path: stage_pasted_image(media_dir, &bytes, extension)?,
+            width,
+            height,
+            mime_type: mime_type.to_owned(),
+        }));
+    }
+    if offers(&offered, "text/uri-list")
+        && let Some(path) = read("text/uri-list")
+            .and_then(|bytes| first_copied_file(&String::from_utf8_lossy(&bytes)))
+    {
+        return stage_local_file(media_dir, &path).map(PasteOutcome::Staged);
+    }
+    for (mime_type, file_name) in [
+        ("image/gif", "Pasted image.gif"),
+        ("image/webp", "Pasted image.webp"),
+    ] {
+        if !offers(&offered, mime_type) {
+            continue;
+        }
+        let Some(bytes) = read(mime_type) else {
+            return Ok(PasteOutcome::Empty);
+        };
+        ensure!(
+            bytes.len() as u64 <= MAX_IMAGE_BYTES,
+            "pasted image exceeds the 25 MB limit"
+        );
+        ensure!(
+            matches_document_image(&bytes, mime_type),
+            "clipboard image is not a valid {mime_type} file"
+        );
+        return stage_bytes(media_dir, &bytes, file_name.to_owned()).map(PasteOutcome::Staged);
+    }
+    Ok(PasteOutcome::Empty)
 }
 
 /// Outcome of staging a local file for sending.
@@ -452,9 +504,15 @@ pub(crate) fn stage_local_file(media_dir: &Path, source: &str) -> Result<StagedF
         bytes.len() as u64 <= MAX_DOCUMENT_BYTES,
         "file exceeds the 100 MB limit"
     );
-    if let Some(mime_type) = sniff_image_mime(&bytes)
-        && validate_pasted_bytes(&bytes, mime_type).is_ok()
-        && let Ok((width, height)) = pasted_image_dimensions(&bytes, mime_type)
+    stage_bytes(media_dir, &bytes, file_name)
+}
+
+/// PNG and JPEG bytes become staged images; everything else is staged as a
+/// document under `file_name`.
+fn stage_bytes(media_dir: &Path, bytes: &[u8], file_name: String) -> Result<StagedFile> {
+    if let Some(mime_type) = sniff_image_mime(bytes)
+        && validate_pasted_bytes(bytes, mime_type).is_ok()
+        && let Ok((width, height)) = pasted_image_dimensions(bytes, mime_type)
     {
         let extension = if mime_type == "image/png" {
             ".png"
@@ -462,14 +520,14 @@ pub(crate) fn stage_local_file(media_dir: &Path, source: &str) -> Result<StagedF
             ".jpg"
         };
         return Ok(StagedFile::Image {
-            path: stage_pasted_image(media_dir, &bytes, extension)?,
+            path: stage_pasted_image(media_dir, bytes, extension)?,
             width,
             height,
             mime_type: mime_type.to_owned(),
         });
     }
     Ok(StagedFile::Document {
-        path: stage_pasted_image(media_dir, &bytes, "")?,
+        path: stage_pasted_image(media_dir, bytes, "")?,
         mime_type: document_mime(&file_name).to_owned(),
         file_size: bytes.len() as u64,
         file_name,
@@ -638,15 +696,8 @@ mod tests {
         let outcome = paste_image_from_clipboard(&clipboard, directory.path()).unwrap();
         assert!(matches!(
             &outcome,
-            PasteOutcome::Pasted {
-                width: 2,
-                height: 3,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &outcome,
-            PasteOutcome::Pasted { mime_type, .. } if mime_type == "image/png"
+            PasteOutcome::Staged(StagedFile::Image { width: 2, height: 3, mime_type, .. })
+                if mime_type == "image/png"
         ));
         let mut staged = std::fs::read_dir(directory.path()).unwrap();
         let entry = staged.next().unwrap().unwrap();
@@ -675,15 +726,8 @@ mod tests {
         let outcome = paste_image_from_clipboard(&clipboard, directory.path()).unwrap();
         assert!(matches!(
             &outcome,
-            PasteOutcome::Pasted {
-                width: 6,
-                height: 7,
-                ..
-            }
-        ));
-        assert!(matches!(
-            &outcome,
-            PasteOutcome::Pasted { mime_type, .. } if mime_type == "image/png"
+            PasteOutcome::Staged(StagedFile::Image { width: 6, height: 7, mime_type, .. })
+                if mime_type == "image/png"
         ));
     }
 
@@ -757,6 +801,97 @@ mod tests {
         assert!(stage_local_file(&media, &path("missing.txt")).is_err());
         assert!(stage_local_file(&media, "relative.txt").is_err());
         assert!(stage_local_file(&media, &directory.path().to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn copied_file_lists_yield_the_first_local_path() {
+        assert_eq!(
+            first_copied_file(
+                "# comment\r\nhttps://example.com/a.png\r\nfile:///home/u/My%20Photo.png\r\nfile:///b\r\n"
+            ),
+            Some("/home/u/My Photo.png".to_owned())
+        );
+        assert_eq!(
+            first_copied_file("file://localhost/srv/x.pdf"),
+            Some("/srv/x.pdf".to_owned())
+        );
+        assert_eq!(first_copied_file("file://host/x.pdf"), None);
+        assert_eq!(first_copied_file("file:///bad%FF"), None);
+        assert_eq!(first_copied_file(""), None);
+    }
+
+    #[test]
+    fn pasting_a_copied_file_stages_it_like_a_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let clipboard = fake::FakeClipboard::new();
+        let copy = |name: &str, bytes: &[u8]| {
+            let source = directory.path().join(name);
+            std::fs::write(&source, bytes).unwrap();
+            clipboard.script_types(vec!["text/plain".to_owned(), "text/uri-list".to_owned()]);
+            clipboard.script_bytes(
+                "text/uri-list",
+                format!("file://{}\r\n", source.display()).into_bytes(),
+            );
+        };
+
+        copy("photo.png", &png_bytes(2, 3));
+        assert!(matches!(
+            paste_image_from_clipboard(&clipboard, &media).unwrap(),
+            PasteOutcome::Staged(StagedFile::Image {
+                width: 2,
+                height: 3,
+                ..
+            })
+        ));
+        copy("notes.pdf", b"%PDF-1.7");
+        assert!(matches!(
+            paste_image_from_clipboard(&clipboard, &media).unwrap(),
+            PasteOutcome::Staged(StagedFile::Document { file_name, mime_type, .. })
+                if file_name == "notes.pdf" && mime_type == "application/pdf"
+        ));
+
+        // Web links fall back to a text paste; a vanished file is an error.
+        clipboard.script_bytes("text/uri-list", b"https://example.com/a.png".to_vec());
+        assert!(matches!(
+            paste_image_from_clipboard(&clipboard, &media).unwrap(),
+            PasteOutcome::Empty
+        ));
+        clipboard.script_bytes("text/uri-list", b"file:///nonexistent/a.png".to_vec());
+        assert!(paste_image_from_clipboard(&clipboard, &media).is_err());
+    }
+
+    #[test]
+    fn pasting_gif_and_webp_stages_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let clipboard = fake::FakeClipboard::new();
+        clipboard.script_image("image/gif", b"GIF89a\x01\x00\x01\x00".to_vec());
+        assert!(matches!(
+            paste_image_from_clipboard(&clipboard, directory.path()).unwrap(),
+            PasteOutcome::Staged(StagedFile::Document { file_name, mime_type, file_size: 10, .. })
+                if file_name == "Pasted image.gif" && mime_type == "image/gif"
+        ));
+        clipboard.script_image("image/webp", b"RIFF\x04\x00\x00\x00WEBPVP8 ".to_vec());
+        assert!(matches!(
+            paste_image_from_clipboard(&clipboard, directory.path()).unwrap(),
+            PasteOutcome::Staged(StagedFile::Document { file_name, mime_type, .. })
+                if file_name == "Pasted image.webp" && mime_type == "image/webp"
+        ));
+
+        clipboard.script_image("image/gif", b"not a gif".to_vec());
+        assert!(paste_image_from_clipboard(&clipboard, directory.path()).is_err());
+        clipboard.script_image(
+            "image/webp",
+            vec![0; usize::try_from(MAX_IMAGE_BYTES).unwrap() + 1],
+        );
+        assert!(paste_image_from_clipboard(&clipboard, directory.path()).is_err());
+        clipboard.script_types(vec!["image/gif".to_owned()]);
+        clipboard.fail_read("selection disappeared");
+        assert!(matches!(
+            paste_image_from_clipboard(&clipboard, directory.path()).unwrap(),
+            PasteOutcome::Empty
+        ));
     }
 
     #[test]
