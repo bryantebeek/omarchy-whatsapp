@@ -128,7 +128,8 @@ fi
 
 systemctl --user daemon-reload
 systemctl --user disable --now omarchy-whatsapp-native.service >/dev/null 2>&1 || true
-systemctl --user enable omarchy-whatsapp.service
+# reenable drops the default.target link that older installs created.
+systemctl --user reenable omarchy-whatsapp.service
 systemctl --user restart omarchy-whatsapp.service
 rm -f -- "$HOME/.config/systemd/user/omarchy-whatsapp-native.service"
 systemctl --user daemon-reload

@@ -1,8 +1,11 @@
 [Unit]
 Description=Omarchy WhatsApp linked-device daemon
 Documentation=https://github.com/bryantebeek/omarchy-whatsapp
-After=network-online.target
+# Clipboard paste runs wl-paste, which needs the WAYLAND_DISPLAY that the
+# compositor exports only once the graphical session is up.
+After=network-online.target graphical-session.target
 Wants=network-online.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -46,4 +49,4 @@ MemoryMax=512M
 UMask=0077
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
