@@ -20,6 +20,12 @@ commons_qmldir="$omarchy_root/shell/Commons/qmldir"
 ui_qmldir="$omarchy_root/shell/Ui/qmldir"
 
 if [[ -r $commons_qmldir && -r $ui_qmldir ]]; then
+  # Qt 6.12 added a check against block-scoped `var`, which this codebase uses
+  # throughout; older qmllint versions reject the unknown option.
+  extra_options=()
+  if [[ $("$qmllint_command" --help) == *--block-scope-var-declaration* ]]; then
+    extra_options+=(--block-scope-var-declaration disable)
+  fi
   # Omarchy injects shell/service objects dynamically, so qmllint cannot infer
   # those properties or qualify their members. Keep every other category strict.
   "$qmllint_command" \
@@ -30,6 +36,7 @@ if [[ -r $commons_qmldir && -r $ui_qmldir ]]; then
     --signal-handler-parameters disable \
     --unused-imports warning \
     --max-warnings 0 \
+    "${extra_options[@]}" \
     "${qml_files[@]}"
   echo "QML lint passed with the installed Omarchy type definitions."
   exit 0
