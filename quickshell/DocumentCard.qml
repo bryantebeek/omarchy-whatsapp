@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 import "Model.js" as Model
 
@@ -12,9 +13,9 @@ Item {
   property var media: null
   property real devicePixelRatio: 1
   property string fontFamily: Style.font.family
-  property color foreground: Color.foreground
-  property color muted: Color.muted
-  property color accent: Color.accent
+  property color foreground: Commons.Color.foreground
+  property color muted: Commons.Color.muted
+  property color accent: Commons.Color.accent
   readonly property alias openButton: documentOpenButton
   readonly property alias saveButton: documentSaveButton
 

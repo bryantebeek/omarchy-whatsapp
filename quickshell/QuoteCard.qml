@@ -1,11 +1,12 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 Rectangle {
   id: root
   property var quote: null
   implicitHeight: quote ? content.implicitHeight + Style.space(12) : 0
-  color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12)
+  color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.12)
   radius: Style.cornerRadius
   Accessible.role: Accessible.StaticText
   Accessible.name: quote ? "Reply to " + author.text + ": " + preview.text : ""
@@ -13,7 +14,7 @@ Rectangle {
   Rectangle {
     width: Style.space(3)
     height: parent.height
-    color: Color.accent
+    color: Commons.Color.accent
   }
   Column {
     id: content
@@ -26,7 +27,7 @@ Rectangle {
       width: parent.width
       text: root.quote ? String(root.quote.sender_name || root.quote.sender_jid || "Unknown sender") : ""
       textFormat: Text.PlainText
-      color: Color.accent
+      color: Commons.Color.accent
       font.family: Style.font.family
       font.pixelSize: Style.font.caption
       font.bold: true
@@ -37,7 +38,7 @@ Rectangle {
       width: parent.width
       text: root.quote ? String(root.quote.text || "Message") : ""
       textFormat: Text.PlainText
-      color: Color.foreground
+      color: Commons.Color.foreground
       font.family: Style.font.family
       font.pixelSize: Style.font.caption
       maximumLineCount: 2

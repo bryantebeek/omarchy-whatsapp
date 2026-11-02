@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Effects
 import qs.Commons
+import qs.Commons as Commons
 
 import "Model.js" as Model
 
@@ -17,8 +18,8 @@ DevicePixelBorderSurface {
   property real size: Style.space(34)
   property real initialsPixelSize: Style.font.caption
   property string fontFamily: Style.font.family
-  property color foreground: Color.foreground
-  property color accent: Color.accent
+  property color foreground: Commons.Color.foreground
+  property color accent: Commons.Color.accent
   property string imageObjectName: ""
   // Poll voters are not part of any chat snapshot, so their previews have to
   // be requested by the card that renders them.

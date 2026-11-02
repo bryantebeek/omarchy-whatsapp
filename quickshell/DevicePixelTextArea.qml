@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as QQC
 import qs.Commons
+import qs.Commons as Commons
 
 // Wrapping counterpart of DevicePixelTextField with the same kit styling.
 // Enter emits accepted() like a TextField; Shift+Enter inserts a newline.
@@ -8,8 +9,8 @@ QQC.TextArea {
   id: root
 
   property real devicePixelRatio: 1
-  property color foreground: Color.foreground
-  property color accent: Color.accent
+  property color foreground: Commons.Color.foreground
+  property color accent: Commons.Color.accent
 
   readonly property real singleLineHeight: implicitHeight - contentHeight
     + contentHeight / Math.max(1, lineCount)

@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as QQC
 import qs.Commons
+import qs.Commons as Commons
 
 // Six quick reactions plus a hand-off to Omarchy's emoji picker. The picker
 // runs in another shell surface and can only give an emoji back by pasting it,
@@ -13,14 +14,14 @@ QQC.Popup {
   property real devicePixelRatio: 1
   property string fontFamily: Style.font.family
   property real metaFontSize: Style.font.caption
-  property color foreground: Color.foreground
-  property color muted: Color.muted
-  property color accent: Color.accent
+  property color foreground: Commons.Color.foreground
+  property color muted: Commons.Color.muted
+  property color accent: Commons.Color.accent
   property bool waitingForEmojiPicker: false
   readonly property alias pasteTarget: emojiPasteTarget
   readonly property var popupBorderSpec:
     Border.localOrSurfaceSpec("popups", "border",
-      Color.popups.border, Color.popups.border,
+      Commons.Color.popups.border, Commons.Color.popups.border,
       Math.max(1, Style.normalBorderWidth))
 
   property bool replyEnabled: false
@@ -66,7 +67,7 @@ QQC.Popup {
   onClosed: waitingForEmojiPicker = false
 
   background: DevicePixelBorderSurface {
-    color: Color.popups.background
+    color: Commons.Color.popups.background
     sourceBorderSpec: root.popupBorderSpec
     devicePixelRatio: root.devicePixelRatio
     radius: Style.cornerRadius + Style.space(4)
@@ -82,7 +83,7 @@ QQC.Popup {
       width: parent.width
       text: "Reply"
       iconText: ""
-      foreground: Color.popups.text
+      foreground: Commons.Color.popups.text
       accent: root.accent
       devicePixelRatio: root.devicePixelRatio
       onClicked: { root.close(); root.replyChosen() }
@@ -97,7 +98,7 @@ QQC.Popup {
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
         text: "React to message"
-        color: Color.popups.text
+        color: Commons.Color.popups.text
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         font.bold: true
@@ -203,7 +204,7 @@ QQC.Popup {
         text: root.waitingForEmojiPicker
           ? "Choose an emoji…" : "Choose any emoji"
         tooltipText: "Open the Omarchy emoji picker"
-        foreground: Color.popups.text
+        foreground: Commons.Color.popups.text
         accent: root.accent
         bordered: true
         devicePixelRatio: root.devicePixelRatio

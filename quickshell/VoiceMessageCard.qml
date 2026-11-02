@@ -1,6 +1,7 @@
 import QtQuick
 import QtMultimedia
 import qs.Commons
+import qs.Commons as Commons
 
 import "Model.js" as Model
 
@@ -21,9 +22,9 @@ Item {
   property real devicePixelRatio: 1
   property string fontFamily: Style.font.family
   property real metaFontSize: Style.font.caption
-  property color foreground: Color.foreground
-  property color accent: Color.accent
-  property color timestamp: Color.foreground
+  property color foreground: Commons.Color.foreground
+  property color accent: Commons.Color.accent
+  property color timestamp: Commons.Color.foreground
   readonly property alias playButton: voiceMessageButton
   readonly property bool downloaded: media ? media.downloaded === true : false
   readonly property string mediaPath: media ? String(media.path || "") : ""

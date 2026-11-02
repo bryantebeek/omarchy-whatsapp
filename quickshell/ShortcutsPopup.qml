@@ -1,19 +1,20 @@
 import QtQuick
 import QtQuick.Controls as QQC
 import qs.Commons
+import qs.Commons as Commons
 
 QQC.Popup {
   id: root
 
   property real devicePixelRatio: 1
 
-  readonly property color accent: Color.accent
+  readonly property color accent: Commons.Color.accent
   readonly property string fontFamily: Style.font.family
-  readonly property color mutedText: Qt.rgba(Color.popups.text.r,
-    Color.popups.text.g, Color.popups.text.b, Color.popups.text.a * 0.72)
+  readonly property color mutedText: Qt.rgba(Commons.Color.popups.text.r,
+    Commons.Color.popups.text.g, Commons.Color.popups.text.b, Commons.Color.popups.text.a * 0.72)
   readonly property var popupBorderSpec:
     Border.localOrSurfaceSpec("popups", "border",
-      Color.popups.border, Color.popups.border,
+      Commons.Color.popups.border, Commons.Color.popups.border,
       Math.max(1, Style.normalBorderWidth))
   readonly property var sections: [
     { title: "Conversations", shortcuts: [
@@ -68,7 +69,7 @@ QQC.Popup {
   onOpened: Qt.callLater(function() { root.contentItem.forceActiveFocus() })
 
   background: CrispBorderSurface {
-    color: Color.popups.background
+    color: Commons.Color.popups.background
     sourceBorderSpec: root.popupBorderSpec
     radius: Style.cornerRadius + Style.space(4)
   }
@@ -88,7 +89,7 @@ QQC.Popup {
         anchors.leftMargin: Style.space(18)
         anchors.verticalCenter: parent.verticalCenter
         text: "Keyboard shortcuts"
-        color: Color.popups.text
+        color: Commons.Color.popups.text
         font.family: root.fontFamily
         font.pixelSize: Style.font.title
         font.bold: true
@@ -99,7 +100,7 @@ QQC.Popup {
         anchors.rightMargin: Style.space(10)
         anchors.verticalCenter: parent.verticalCenter
         iconText: "󰅖"
-        foreground: Color.popups.text
+        foreground: Commons.Color.popups.text
         accent: root.accent
         tooltipText: "Close shortcuts"
         onClicked: root.close()
@@ -109,7 +110,7 @@ QQC.Popup {
     Rectangle {
       width: parent.width
       height: Math.max(1, Style.normalBorderWidth)
-      color: Color.popups.border
+      color: Commons.Color.popups.border
     }
 
     Column {
@@ -152,7 +153,7 @@ QQC.Popup {
                 anchors.rightMargin: Style.space(12)
                 anchors.verticalCenter: parent.verticalCenter
                 text: modelData.action
-                color: Color.popups.text
+                color: Commons.Color.popups.text
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 elide: Text.ElideRight

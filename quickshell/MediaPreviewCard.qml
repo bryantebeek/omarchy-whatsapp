@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Effects
 import qs.Commons
+import qs.Commons as Commons
 
 import "Model.js" as Model
 
@@ -25,9 +26,9 @@ Item {
   property string downloadButtonObjectName: ""
   property string hdBadgeObjectName: ""
   property string fontFamily: Style.font.family
-  property color foreground: Color.foreground
-  property color muted: Color.muted
-  property color accent: Color.accent
+  property color foreground: Commons.Color.foreground
+  property color muted: Commons.Color.muted
+  property color accent: Commons.Color.accent
   readonly property bool isImage: media && media.kind === "image"
   readonly property bool isVideo: media && media.kind === "video"
   readonly property bool isGif: isVideo && media.gif_playback === true

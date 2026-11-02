@@ -3,6 +3,7 @@ import QtTest
 import QtMultimedia
 import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 
 import "../../quickshell" as Whatsapp
 import "../../quickshell/Model.js" as Model
@@ -710,7 +711,7 @@ TestCase {
     compare(receiptTooltip.delay, 400)
     compare(receiptTooltip.timeout, -1)
     compare(receiptTooltip.padding, 0)
-    compare(receiptTooltip.background.color, Color.tooltip.background)
+    compare(receiptTooltip.background.color, Commons.Color.tooltip.background)
     compare(receiptTooltip.background.radius, 0)
     compare(receiptTooltip.contentItem.groups.length, 2)
     compare(receiptTooltip.contentItem.groups[0].label, "Read")
@@ -721,9 +722,9 @@ TestCase {
       "Bob · " + panel.messageReceiptTimestamp(102))
     compare(receiptTooltip.contentItem.groupSpacing, Style.space(6))
     compare(receiptTooltip.contentItem.headerColor, Qt.rgba(
-      Color.tooltip.text.r, Color.tooltip.text.g, Color.tooltip.text.b,
-      Color.tooltip.text.a * 0.72))
-    compare(receiptTooltip.contentItem.detailColor, Color.tooltip.text)
+      Commons.Color.tooltip.text.r, Commons.Color.tooltip.text.g, Commons.Color.tooltip.text.b,
+      Commons.Color.tooltip.text.a * 0.72))
+    compare(receiptTooltip.contentItem.detailColor, Commons.Color.tooltip.text)
     compare(receiptTooltip.contentItem.contentFontFamily, panel.fontFamily)
     compare(receiptTooltip.contentItem.contentFontSize, Style.font.bodySmall)
     compare(receiptTooltip.contentItem.leftInset,

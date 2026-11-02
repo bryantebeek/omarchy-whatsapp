@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // Stickers render from the private media cache. Lottie stickers keep their
 // embedded raster preview because Qt Lottie trusts its input while message
@@ -17,8 +18,8 @@ Item {
   property string imageObjectName: ""
   property string fontFamily: Style.font.family
   property real metaFontSize: Style.font.caption
-  property color foreground: Color.foreground
-  property color muted: Color.muted
+  property color foreground: Commons.Color.foreground
+  property color muted: Commons.Color.muted
   readonly property bool downloaded: media ? media.downloaded === true : false
   readonly property bool lottie: media ? media.lottie === true : false
   readonly property string mediaPath: media ? String(media.path || "") : ""

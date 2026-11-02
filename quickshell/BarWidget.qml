@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Effects
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 import "Model.js" as Model
@@ -50,7 +51,7 @@ BarWidget {
           visible: root.showCount && root.unread > 0
           anchors.verticalCenter: parent.verticalCenter
           text: root.unreadLabel
-          color: Color.accent
+          color: Commons.Color.accent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           font.bold: true
@@ -69,7 +70,7 @@ BarWidget {
           layer.smooth: true
           layer.effect: MultiEffect {
             colorization: 1
-            colorizationColor: root.unread > 0 ? Color.accent : button.foreground
+            colorizationColor: root.unread > 0 ? Commons.Color.accent : button.foreground
           }
         }
       }

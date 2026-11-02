@@ -5,6 +5,7 @@ import QtMultimedia
 import QtQml.Models
 import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 import "DevicePixel.js" as DevicePixel
@@ -68,10 +69,10 @@ Item {
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "io.github.bryantebeek.whatsapp"
-  readonly property color foreground: Color.foreground
-  readonly property color background: Color.background
-  readonly property color accent: Color.accent
-  readonly property color muted: Color.muted
+  readonly property color foreground: Commons.Color.foreground
+  readonly property color background: Commons.Color.background
+  readonly property color accent: Commons.Color.accent
+  readonly property color muted: Commons.Color.muted
   readonly property color timestamp: Qt.rgba(foreground.r, foreground.g,
     foreground.b, foreground.a * 0.72)
   readonly property color sidebarSecondary: Qt.rgba(foreground.r, foreground.g,
@@ -1349,8 +1350,8 @@ Item {
           + "pinned, archived, and muted state from WhatsApp. Your linked account, "
           + "messages, media, and local history stay intact."
         confirmText: "Resync"
-        background: Color.popups.background
-        foreground: Color.popups.text
+        background: Commons.Color.popups.background
+        foreground: Commons.Color.popups.text
         selectedText: root.accent
 
         onOpenedChanged: if (opened) selectedIndex = 0
@@ -1368,8 +1369,8 @@ Item {
         message: "Log out and unlink this workstation?\n\nThis clears its local "
           + "WhatsApp account data. You’ll need to scan a new QR code to use it again."
         confirmText: "Log out"
-        background: Color.popups.background
-        foreground: Color.popups.text
+        background: Commons.Color.popups.background
+        foreground: Commons.Color.popups.text
         selectedText: root.accent
 
         onOpenedChanged: if (opened) selectedIndex = 0
@@ -1631,7 +1632,7 @@ Item {
           && root.service && root.service.pollCreateRequestId === 0
         readonly property var popupBorderSpec:
           Border.localOrSurfaceSpec("popups", "border",
-            Color.popups.border, Color.popups.border,
+            Commons.Color.popups.border, Commons.Color.popups.border,
             Math.max(1, Style.normalBorderWidth))
 
         parent: focusScope
@@ -1647,7 +1648,7 @@ Item {
         onOpened: Qt.callLater(function() { pollQuestion.forceActiveFocus() })
 
         background: CrispBorderSurface {
-          color: Color.popups.background
+          color: Commons.Color.popups.background
           sourceBorderSpec: createPollPopup.popupBorderSpec
           radius: Style.cornerRadius + Style.space(4)
         }
@@ -1658,7 +1659,7 @@ Item {
           Text {
             width: parent.width
             text: "Create poll"
-            color: Color.popups.text
+            color: Commons.Color.popups.text
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
             font.bold: true
@@ -1674,7 +1675,7 @@ Item {
           Text {
             width: parent.width
             text: "Options — one per line (2–12)"
-            color: Color.popups.text
+            color: Commons.Color.popups.text
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
@@ -1684,20 +1685,20 @@ Item {
             objectName: "pollOptions"
             width: parent.width
             height: Style.space(220)
-            color: Color.popups.text
+            color: Commons.Color.popups.text
             placeholderText: "First option\nSecond option"
-            placeholderTextColor: Qt.rgba(Color.popups.text.r,
-              Color.popups.text.g, Color.popups.text.b, 0.55)
+            placeholderTextColor: Qt.rgba(Commons.Color.popups.text.r,
+              Commons.Color.popups.text.g, Commons.Color.popups.text.b, 0.55)
             selectionColor: root.accent
-            selectedTextColor: Color.popups.background
+            selectedTextColor: Commons.Color.popups.background
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             wrapMode: TextEdit.Wrap
             padding: Style.space(10)
             background: CrispBorderSurface {
-              color: Style.normalFillFor(Color.popups.text, root.accent)
+              color: Style.normalFillFor(Commons.Color.popups.text, root.accent)
               sourceBorderSpec: Border.flat(
-                Style.normalBorderFor(Color.popups.text, root.accent),
+                Style.normalBorderFor(Commons.Color.popups.text, root.accent),
                 Math.max(1, Style.normalBorderWidth))
               radius: Style.cornerRadius
             }
@@ -1713,7 +1714,7 @@ Item {
                 ? "✓ Multiple answers" : "Multiple answers"
               bordered: true
               selected: createPollPopup.multipleAnswers
-              foreground: Color.popups.text
+              foreground: Commons.Color.popups.text
               onClicked: createPollPopup.multipleAnswers
                 = !createPollPopup.multipleAnswers
             }
@@ -1728,7 +1729,7 @@ Item {
               id: cancelPollButton
               text: "Cancel"
               bordered: true
-              foreground: Color.popups.text
+              foreground: Commons.Color.popups.text
               onClicked: createPollPopup.close()
             }
 
@@ -1740,7 +1741,7 @@ Item {
               bordered: true
               active: createPollPopup.valid
               enabled: createPollPopup.valid
-              foreground: Color.popups.text
+              foreground: Commons.Color.popups.text
               onClicked: root.submitPoll()
             }
           }
@@ -1830,7 +1831,7 @@ Item {
                 objectName: "headerMenu"
                 readonly property var popupBorderSpec:
                   Border.localOrSurfaceSpec("popups", "border",
-                    Color.popups.border, Color.popups.border,
+                    Commons.Color.popups.border, Commons.Color.popups.border,
                     Math.max(1, Style.normalBorderWidth))
 
                 parent: headerMoreButton
@@ -1851,7 +1852,7 @@ Item {
                   | QQC.Popup.CloseOnPressOutsideParent
 
                 background: CrispBorderSurface {
-                  color: Color.popups.background
+                  color: Commons.Color.popups.background
                   sourceBorderSpec: headerMenu.popupBorderSpec
                   radius: Style.cornerRadius + Style.space(2)
                 }
@@ -1868,7 +1869,7 @@ Item {
                     width: parent.width
                     menuIconText: ""
                     menuText: "Licenses"
-                    foreground: Color.popups.text
+                    foreground: Commons.Color.popups.text
                     accent: root.accent
                     focusable: true
                     onClicked: {
@@ -1882,7 +1883,7 @@ Item {
                     width: parent.width
                     menuIconText: "󰌌"
                     menuText: "Keyboard shortcuts"
-                    foreground: Color.popups.text
+                    foreground: Commons.Color.popups.text
                     accent: root.accent
                     focusable: true
                     onClicked: {
@@ -1903,7 +1904,7 @@ Item {
                     menuText: root.service
                       && root.service.chatStateResyncBusy === true
                       ? "Resyncing chat state…" : "Resync chat state"
-                    foreground: Color.popups.text
+                    foreground: Commons.Color.popups.text
                     accent: root.accent
                     focusable: true
                     onClicked: {
@@ -1923,7 +1924,7 @@ Item {
                       ? String(root.service.chatStateResyncMessage || "") : ""
                     color: root.service
                       && root.service.chatStateResyncStatus === "failed"
-                      ? Color.urgent : (root.service
+                      ? Commons.Color.urgent : (root.service
                         && root.service.chatStateResyncStatus === "succeeded"
                         ? root.accent : root.muted)
                     font.family: root.fontFamily
@@ -1940,8 +1941,8 @@ Item {
                     visible: root.paired
                     menuIconText: "󰍃"
                     menuText: "Log out"
-                    foreground: Color.popups.text
-                    accent: Color.urgent
+                    foreground: Commons.Color.popups.text
+                    accent: Commons.Color.urgent
                     focusable: true
                     onClicked: {
                       headerMenu.close()
@@ -1955,7 +1956,7 @@ Item {
                     width: parent.width
                     menuIconText: "󰅖"
                     menuText: "Close"
-                    foreground: Color.popups.text
+                    foreground: Commons.Color.popups.text
                     accent: root.accent
                     focusable: true
                     onClicked: {
@@ -2348,7 +2349,7 @@ Item {
                           + String(modelData.jid || "")
                         readonly property var popupBorderSpec:
                           Border.localOrSurfaceSpec("popups", "border",
-                            Color.popups.border, Color.popups.border,
+                            Commons.Color.popups.border, Commons.Color.popups.border,
                             Math.max(1, Style.normalBorderWidth))
 
                         parent: chatDelegate
@@ -2367,7 +2368,7 @@ Item {
                           | QQC.Popup.CloseOnPressOutsideParent
 
                         background: CrispBorderSurface {
-                          color: Color.popups.background
+                          color: Commons.Color.popups.background
                           sourceBorderSpec: chatContextMenu.popupBorderSpec
                           radius: Style.cornerRadius + Style.space(2)
                         }
@@ -2381,7 +2382,7 @@ Item {
                           menuIconText: "󰐃"
                           menuText: modelData.pinned === true
                             ? "Unpin conversation" : "Pin conversation"
-                          foreground: Color.popups.text
+                          foreground: Commons.Color.popups.text
                           accent: root.accent
                           focusable: true
                           onClicked: {
@@ -3750,7 +3751,7 @@ Item {
                         elide: Text.ElideRight
                         color: root.textOutboxEntry
                           && root.textOutboxEntry.status === "failed"
-                          ? Color.urgent : root.foreground
+                          ? Commons.Color.urgent : root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
                         width: Math.max(0, parent.width - textRetryButton.width
@@ -3809,7 +3810,7 @@ Item {
                         }
                         color: root.voiceOutboxEntry
                           && root.voiceOutboxEntry.status === "failed"
-                          ? Color.urgent : root.foreground
+                          ? Commons.Color.urgent : root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
                       }
@@ -3875,7 +3876,7 @@ Item {
                         anchors.verticalCenter: parent.verticalCenter
                         text: "●  " + Model.mediaDuration(
                           Math.floor(root.voiceRecordingDurationMs / 1000))
-                        color: Color.urgent
+                        color: Commons.Color.urgent
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
                       }
@@ -4089,8 +4090,8 @@ Item {
             anchors.bottomMargin: Style.space(12)
             height: Math.max(errorText.implicitHeight, dismissErrorButton.height) + Style.space(16)
             radius: Style.cornerRadius
-            color: Style.selectedFillFor(root.foreground, Color.urgent)
-            sourceBorderSpec: Border.flat(Color.urgent,
+            color: Style.selectedFillFor(root.foreground, Commons.Color.urgent)
+            sourceBorderSpec: Border.flat(Commons.Color.urgent,
               Math.max(1, Style.normalBorderWidth))
             Text {
               id: errorText

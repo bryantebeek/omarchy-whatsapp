@@ -1,6 +1,7 @@
 import QtQuick
 import QtTest
 import qs.Commons
+import qs.Commons as Commons
 
 import "../../quickshell" as Whatsapp
 import "../../quickshell/DevicePixel.js" as DevicePixel
@@ -795,15 +796,15 @@ TestCase {
     compare(tooltip.delay, 400)
     compare(tooltip.timeout, -1)
     compare(tooltip.padding, 0)
-    compare(tooltip.background.color, Color.tooltip.background)
+    compare(tooltip.background.color, Commons.Color.tooltip.background)
     compare(tooltip.background.radius, 0)
     compare(tooltip.contentItem.groups.length, 2)
     compare(tooltip.contentItem.groups[0].label, "Read")
     compare(tooltip.contentItem.groups[1].entries[0], "Bob")
-    compare(tooltip.contentItem.detailColor, Color.tooltip.text)
+    compare(tooltip.contentItem.detailColor, Commons.Color.tooltip.text)
     compare(tooltip.contentItem.headerColor, Qt.rgba(
-      Color.tooltip.text.r, Color.tooltip.text.g, Color.tooltip.text.b,
-      Color.tooltip.text.a * 0.72))
+      Commons.Color.tooltip.text.r, Commons.Color.tooltip.text.g, Commons.Color.tooltip.text.b,
+      Commons.Color.tooltip.text.a * 0.72))
     compare(tooltip.contentItem.leftInset,
       Border.left(tooltip.tooltipBorderSpec) + Style.spacing.controlPaddingX)
     compare(tooltip.contentItem.topInset,

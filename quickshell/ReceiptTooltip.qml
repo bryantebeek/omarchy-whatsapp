@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as QQC
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // Delivery detail for an outgoing message. The plain tooltip text stays the
@@ -11,12 +12,12 @@ QQC.ToolTip {
 
   property var groups: []
   property string fontFamily: Style.font.family
-  readonly property color tooltipBackground: Color.tooltip.background
-  readonly property color tooltipForeground: Color.tooltip.text
-  readonly property color tooltipBorder: Color.tooltip.border
+  readonly property color tooltipBackground: Commons.Color.tooltip.background
+  readonly property color tooltipForeground: Commons.Color.tooltip.text
+  readonly property color tooltipBorder: Commons.Color.tooltip.border
   readonly property var tooltipBorderSpec:
     Border.localOrSurfaceSpec("tooltip", "border",
-      tooltipBorder, Color.tooltip.border,
+      tooltipBorder, Commons.Color.tooltip.border,
       Math.max(1, Style.normalBorderWidth))
 
   delay: 400

@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 import "DevicePixel.js" as DevicePixel
 
@@ -19,9 +20,9 @@ Item {
   property real devicePixelRatio: 1
   property string fontFamily: Style.font.family
   property real metaFontSize: Style.font.caption
-  property color foreground: Color.foreground
-  property color accent: Color.accent
-  property color secondary: Color.foreground
+  property color foreground: Commons.Color.foreground
+  property color accent: Commons.Color.accent
+  property color secondary: Commons.Color.foreground
   readonly property bool ended: Number(media ? media.end_timestamp || 0 : 0) > 0
     && Number(media.end_timestamp) <= (panel ? panel.currentTimestamp : 0)
   readonly property int totalVoters: Number(media ? media.total_voters || 0 : 0)
@@ -242,7 +243,7 @@ Item {
       width: parent.width
       text: root.ended ? "Poll ended"
         : (root.totalVoters === 1 ? "1 vote" : root.totalVoters + " votes")
-      color: root.ended ? Color.urgent : root.secondary
+      color: root.ended ? Commons.Color.urgent : root.secondary
       font.family: root.fontFamily
       font.pixelSize: root.metaFontSize
     }

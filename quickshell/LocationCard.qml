@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 import "Model.js" as Model
 
@@ -18,10 +19,10 @@ Rectangle {
   property string messageTimeFormat: "HH:mm"
   property real devicePixelRatio: 1
   property string fontFamily: Style.font.family
-  property color foreground: Color.foreground
-  property color background: Color.background
-  property color muted: Color.muted
-  property color accent: Color.accent
+  property color foreground: Commons.Color.foreground
+  property color background: Commons.Color.background
+  property color muted: Commons.Color.muted
+  property color accent: Commons.Color.accent
   // WhatsApp stops sending updates at the end of a live share. When the
   // explicit deadline is missing it is reconstructed from the last update and
   // the announced duration.

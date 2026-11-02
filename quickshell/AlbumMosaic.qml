@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Effects
 import qs.Commons
+import qs.Commons as Commons
 
 import "Model.js" as Model
 
@@ -21,8 +22,8 @@ Item {
   property real maskRadius: 0
   property real devicePixelRatio: 1
   property string fontFamily: Style.font.family
-  property color foreground: Color.foreground
-  property color accent: Color.accent
+  property color foreground: Commons.Color.foreground
+  property color accent: Commons.Color.accent
   readonly property int totalCount: Array.isArray(messages) ? messages.length : 0
   readonly property real gap: Style.space(2)
   readonly property real cellSize: (width - gap) / 2
