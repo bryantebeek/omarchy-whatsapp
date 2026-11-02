@@ -44,8 +44,8 @@ mind.
 - **Polls and voice notes:** create single- or multiple-answer polls, see live
   vote totals, and cast or revise a vote. Record Ogg Opus voice notes and retry
   interrupted sends; received voice notes download on demand and play inline.
-- **Media:** paste clipboard images or drag image files and documents onto a
-  conversation, preview them, and send with optional captions and participant
+- **Media:** paste clipboard images or files copied in a file manager, or drag
+  image files and documents onto a conversation, preview them, and send with optional captions and participant
   mentions; render encrypted images and videos with
   in-app preview or playback, voice and regular audio, documents with open/save
   actions, static locations and final snapshots of live-location shares, and
@@ -89,6 +89,8 @@ live-deployment work required by this repository's quality gates.
   and participant mentions.
 - [x] Drag and drop PNG/JPEG images and documents (up to 100 MiB) onto a
   conversation to stage and send them.
+- [x] Paste files copied in a file manager, and clipboard GIF/WebP images as
+  documents.
 - [ ] Pick files to send from a file dialog.
 - [ ] Upload and send videos, GIFs, and regular audio as native media rather
   than documents.
