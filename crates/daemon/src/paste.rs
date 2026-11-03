@@ -231,13 +231,87 @@ pub(crate) fn first_copied_file(uri_list: &str) -> Option<String> {
         })
 }
 
-/// Whether bytes carry the signature of a GIF or `WebP` clipboard image.
+/// Whether bytes carry the signature of a GIF, `WebP`, or HEIF clipboard image.
 fn matches_document_image(bytes: &[u8], mime_type: &str) -> bool {
     match mime_type {
         "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
         "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
-        _ => false,
+        // The paste loop only asks about GIF, WebP, and the HEIF types.
+        _ => is_heif(bytes),
     }
+}
+
+/// Whether bytes are an HEIF still image, such as an iPhone `.heic` photo.
+fn is_heif(bytes: &[u8]) -> bool {
+    bytes.get(4..8) == Some(b"ftyp")
+        && matches!(
+            bytes.get(8..12),
+            Some(b"heic" | b"heix" | b"heim" | b"heis" | b"mif1")
+        )
+}
+
+/// JPEG conversion of HEIF bytes, since `WhatsApp` image messages only carry
+/// PNG and JPEG. Anything else, or HEIF that `ffmpeg` cannot convert, yields
+/// `None` and stays a document.
+// The ffmpeg process boundary is verified by live paste checks; the HEIF
+// detection it relies on stays coverage-instrumented.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn heif_as_jpeg(media_dir: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
+    if !is_heif(bytes) {
+        return None;
+    }
+    convert_heif_to_jpeg(media_dir, bytes)
+        .inspect_err(|error| warn!(%error, "could not convert HEIC; sending it as a document"))
+        .ok()
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn convert_heif_to_jpeg(media_dir: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
+    let source = stage_pasted_image(media_dir, bytes, ".heic")?;
+    let target = source.with_extension("jpg");
+    let converted = (|| {
+        let mut child = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+            .arg(&source)
+            .args([
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+                "-c:v",
+                "mjpeg",
+                "-f",
+                "image2",
+            ])
+            .arg(&target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("starting ffmpeg to convert a HEIC image")?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("timed out converting a HEIC image");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        ensure!(status.success(), "ffmpeg could not convert the HEIC image");
+        let jpeg = std::fs::read(&target).context("reading the converted HEIC image")?;
+        ensure!(
+            sniff_image_mime(&jpeg) == Some("image/jpeg"),
+            "ffmpeg did not produce a JPEG image"
+        );
+        Ok(jpeg)
+    })();
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&target);
+    converted
 }
 
 /// Sniffs pasted bytes back to a supported image type.
@@ -411,6 +485,8 @@ pub(crate) fn paste_image_from_clipboard(
         return stage_local_file(media_dir, &path).map(PasteOutcome::Staged);
     }
     for (mime_type, file_name) in [
+        ("image/heic", "Pasted image.heic"),
+        ("image/heif", "Pasted image.heif"),
         ("image/gif", "Pasted image.gif"),
         ("image/webp", "Pasted image.webp"),
     ] {
@@ -475,6 +551,8 @@ pub(crate) fn document_mime(file_name: &str) -> &'static str {
         "ods" => "application/vnd.oasis.opendocument.spreadsheet",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
         "mp3" => "audio/mpeg",
         "mp4" => "video/mp4",
         _ => "application/octet-stream",
@@ -507,9 +585,12 @@ pub(crate) fn stage_local_file(media_dir: &Path, source: &str) -> Result<StagedF
     stage_bytes(media_dir, &bytes, file_name)
 }
 
-/// PNG and JPEG bytes become staged images; everything else is staged as a
-/// document under `file_name`.
+/// PNG and JPEG bytes become staged images, and HEIF bytes become JPEG
+/// images; everything else, including HEIF that cannot be converted, is
+/// staged as a document under `file_name`.
 fn stage_bytes(media_dir: &Path, bytes: &[u8], file_name: String) -> Result<StagedFile> {
+    let converted = heif_as_jpeg(media_dir, bytes);
+    let bytes = converted.as_deref().unwrap_or(bytes);
     if let Some(mime_type) = sniff_image_mime(bytes)
         && validate_pasted_bytes(bytes, mime_type).is_ok()
         && let Ok((width, height)) = pasted_image_dimensions(bytes, mime_type)
@@ -892,6 +973,20 @@ mod tests {
             paste_image_from_clipboard(&clipboard, directory.path()).unwrap(),
             PasteOutcome::Empty
         ));
+    }
+
+    #[test]
+    fn heif_detection_reads_the_ftyp_brand() {
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic";
+        assert!(is_heif(heic));
+        assert!(is_heif(b"\0\0\0\x18ftypmif1"));
+        assert!(matches_document_image(heic, "image/heic"));
+        assert!(matches_document_image(heic, "image/heif"));
+        assert!(!is_heif(b"\0\0\0\x18ftypisom"));
+        assert!(!is_heif(b"\0\0\0\x18ftyp"));
+        assert!(!matches_document_image(b"GIF89a", "image/heic"));
+        assert_eq!(document_mime("IMG_1.HEIC"), "image/heic");
+        assert_eq!(document_mime("photo.heif"), "image/heif");
     }
 
     #[test]

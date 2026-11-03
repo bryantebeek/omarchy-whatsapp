@@ -91,6 +91,8 @@ live-deployment work required by this repository's quality gates.
   conversation to stage and send them.
 - [x] Paste files copied in a file manager, and clipboard GIF/WebP images as
   documents.
+- [x] Send pasted, copied, or dropped HEIC/HEIF photos as images, converted to
+  JPEG with `ffmpeg`.
 - [ ] Pick files to send from a file dialog.
 - [ ] Upload and send videos, GIFs, and regular audio as native media rather
   than documents.
